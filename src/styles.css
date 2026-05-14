@@ -25,9 +25,12 @@ body {
   background:
     linear-gradient(rgba(156, 255, 87, 0.04) 1px, transparent 1px),
     linear-gradient(90deg, rgba(156, 255, 87, 0.025) 1px, transparent 1px),
-    radial-gradient(circle at top left, rgba(99, 216, 255, 0.12), transparent 36rem),
-    var(--bg);
-  background-size: 34px 34px, 34px 34px, auto, auto;
+    radial-gradient(circle at top left, rgba(99, 216, 255, 0.12), transparent 36rem), var(--bg);
+  background-size:
+    34px 34px,
+    34px 34px,
+    auto,
+    auto;
   color: var(--text);
 }
 
@@ -182,7 +185,9 @@ button.active {
 .table-head,
 .project {
   display: grid;
-  grid-template-columns: minmax(280px, 1.7fr) minmax(110px, 0.55fr) minmax(150px, 0.7fr) minmax(90px, 0.45fr) minmax(140px, 0.6fr);
+  grid-template-columns:
+    minmax(280px, 1.7fr) minmax(110px, 0.55fr) minmax(150px, 0.7fr) minmax(90px, 0.45fr)
+    minmax(140px, 0.6fr);
   gap: 0;
   align-items: stretch;
 }
@@ -197,14 +202,36 @@ button.active {
   text-transform: uppercase;
 }
 
-.table-head span,
+.table-head button,
 .project > div {
   min-width: 0;
   padding: 14px;
   border-right: 1px solid var(--line);
 }
 
-.table-head span:last-child,
+.table-head button {
+  min-height: auto;
+  border-width: 0 1px 0 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font-size: inherit;
+  text-align: left;
+  text-transform: inherit;
+}
+
+.table-head button:hover,
+.table-head button[aria-current="true"] {
+  color: var(--green);
+}
+
+.table-head button[aria-current="true"]::after {
+  content: " " attr(data-direction);
+  color: var(--muted);
+  text-transform: lowercase;
+}
+
+.table-head button:last-child,
 .project > div:last-child {
   border-right: 0;
 }

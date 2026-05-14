@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": false,
+    "declaration": false,
+    "noEmit": false,
+    "outDir": "node_modules/.cache/releasedeck-build",
+    "rootDir": ".",
+    "sourceMap": false
+  },
+  "include": ["scripts/**/*.ts", "src/types.ts"]
+}

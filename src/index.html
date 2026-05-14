@@ -1,12 +1,12 @@
 <!doctype html>
 <html lang="en">
   <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
-    <meta name="description" content="Release freshness dashboard for open source maintainers.">
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="Release freshness dashboard for open source maintainers." />
     <title>ReleaseDeck</title>
-    <link rel="stylesheet" href="./styles.css">
+    <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <main class="shell">
@@ -24,7 +24,13 @@
       <section class="console" aria-label="Project search and metrics">
         <div class="prompt">
           <span class="mark">$</span>
-          <input id="search" type="search" autocomplete="off" spellcheck="false" placeholder="search repos, languages, owners, versions">
+          <input
+            id="search"
+            type="search"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="search repos, languages, owners, versions"
+          />
         </div>
         <div class="metrics">
           <div>
@@ -56,11 +62,11 @@
 
       <section class="table-wrap" aria-label="Repositories">
         <div class="table-head">
-          <span>repo</span>
-          <span>version</span>
-          <span>release</span>
-          <span>since</span>
-          <span>activity</span>
+          <button data-sort="repo" type="button">repo</button>
+          <button data-sort="version" type="button">version</button>
+          <button data-sort="release" type="button">release</button>
+          <button data-sort="since" type="button">since</button>
+          <button data-sort="activity" type="button" aria-current="true">activity</button>
         </div>
         <div id="projects" class="projects"></div>
       </section>

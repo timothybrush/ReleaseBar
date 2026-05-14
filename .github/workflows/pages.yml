@@ -24,7 +24,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
       - uses: actions/configure-pages@v5
+      - run: npm ci
+      - run: npm run check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - run: npm run build
         env:
           GITHUB_TOKEN: ${{ github.token }}

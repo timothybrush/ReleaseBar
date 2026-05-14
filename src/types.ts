@@ -15,6 +15,16 @@ export type ReleaseDeckConfig = {
 
 export type Freshness = "fresh" | "warm" | "busy" | "hot";
 
+export type CiState =
+  | "success"
+  | "failure"
+  | "running"
+  | "pending"
+  | "cancelled"
+  | "skipped"
+  | "neutral"
+  | "unknown";
+
 export type Project = {
   owner: string;
   name: string;
@@ -26,6 +36,9 @@ export type Project = {
   stars: number;
   forks: number;
   openIssues: number;
+  openPullRequests: number;
+  issuesUrl: string;
+  pullRequestsUrl: string;
   archived: boolean;
   pushedAt: string | null;
   updatedAt: string | null;
@@ -37,6 +50,12 @@ export type Project = {
   releaseDate: string | null;
   commitsSinceRelease: number | null;
   compareUrl: string | null;
+  ciState: CiState;
+  ciStatus: string | null;
+  ciConclusion: string | null;
+  ciWorkflow: string | null;
+  ciUrl: string | null;
+  ciRunDate: string | null;
   freshness: Freshness;
 };
 

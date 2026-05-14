@@ -3,6 +3,7 @@ import path from "node:path";
 import ts from "typescript";
 
 import type {
+  CiState,
   DashboardPayload,
   Freshness,
   Owner,
@@ -72,9 +73,31 @@ type GitHubCompare = {
   html_url?: string;
 };
 
-async function github<T>(pathname: string): Promise<T | null> {
+type GitHubCheckRun = {
+  name: string | null;
+  html_url: string;
+  status: string | null;
+  conclusion: string | null;
+  completed_at: string | null;
+  started_at: string | null;
+};
+
+type GitHubCheckRuns = {
+  check_runs?: GitHubCheckRun[];
+};
+
+type CiDetails = {
+  state: CiState;
+  status: string | null;
+  conclusion: string | null;
+  workflow: string | null;
+  url: string | null;
+  runDate: string | null;
+};
+
+async function github<T>(pathname: string, ignoreStatuses: number[] = [404]): Promise<T | null> {
   const response = await fetch(`https://api.github.com${pathname}`, { headers });
-  if (response.status === 404) {
+  if (ignoreStatuses.includes(response.status)) {
     return null;
   }
   if (!response.ok) {
@@ -102,6 +125,27 @@ async function githubPages<T>(pathname: string): Promise<T[]> {
   return items;
 }
 
+async function githubCount(pathname: string): Promise<number> {
+  const joiner = pathname.includes("?") ? "&" : "?";
+  const response = await fetch(`https://api.github.com${pathname}${joiner}per_page=1`, { headers });
+  if (response.status === 404) {
+    return 0;
+  }
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`GitHub API ${response.status} for ${pathname}: ${body.slice(0, 500)}`);
+  }
+
+  const link = response.headers.get("link");
+  const lastPage = link?.match(/[?&]page=(\d+)>;\s*rel="last"/)?.[1];
+  if (lastPage) {
+    return Number(lastPage);
+  }
+
+  const items = (await response.json()) as unknown[];
+  return items.length;
+}
+
 async function ownerRepos(owner: Owner): Promise<GitHubRepo[]> {
   const base = owner.type === "org" ? `/orgs/${owner.login}/repos` : `/users/${owner.login}/repos`;
   return githubPages<GitHubRepo>(`${base}?type=public&sort=pushed&direction=desc`);
@@ -112,6 +156,61 @@ async function latestRelease(repo: GitHubRepo): Promise<GitHubRelease | null> {
   return (
     releases?.find((release) => release.tag_name && !release.draft && release.published_at) ?? null
   );
+}
+
+async function checkRuns(repo: GitHubRepo, ref: string): Promise<GitHubCheckRun[]> {
+  const runs = await github<GitHubCheckRuns>(
+    `/repos/${repo.full_name}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100`,
+    [404, 403, 409],
+  );
+  return runs?.check_runs ?? [];
+}
+
+function ciDetails(runs: GitHubCheckRun[]): CiDetails {
+  if (runs.length === 0) {
+    return {
+      state: "unknown",
+      status: null,
+      conclusion: null,
+      workflow: null,
+      url: null,
+      runDate: null,
+    };
+  }
+
+  const failure = runs.find((run) =>
+    ["failure", "timed_out", "action_required"].includes(run.conclusion ?? ""),
+  );
+  const active = runs.find((run) => run.status && run.status !== "completed");
+  const cancelled = runs.find((run) => run.conclusion === "cancelled");
+  const successCount = runs.filter((run) => run.conclusion === "success").length;
+  const neutralCount = runs.filter((run) => run.conclusion === "neutral").length;
+  const skippedCount = runs.filter((run) => run.conclusion === "skipped").length;
+  const selected = failure ?? active ?? cancelled ?? runs[0];
+
+  let state: CiState = "unknown";
+  if (failure) {
+    state = "failure";
+  } else if (active) {
+    state = active.status === "in_progress" ? "running" : "pending";
+  } else if (cancelled) {
+    state = "cancelled";
+  } else if (successCount > 0) {
+    state = "success";
+  } else if (neutralCount > 0) {
+    state = "neutral";
+  } else if (skippedCount > 0) {
+    state = "skipped";
+  }
+
+  return {
+    state,
+    status: selected.status,
+    conclusion: selected.conclusion,
+    workflow: state === "success" ? `${successCount}/${runs.length} checks` : selected.name,
+    url: selected.html_url,
+    runDate: selected.completed_at ?? selected.started_at,
+  };
 }
 
 function repoAllowed(repo: GitHubRepo): boolean {
@@ -139,11 +238,17 @@ async function repoSummary(repo: GitHubRepo): Promise<Omit<Project, "freshness">
 
   let commitsSinceRelease: number | null = null;
   let compareUrl: string | null = null;
-  const compare = await github<GitHubCompare>(
-    `/repos/${repo.full_name}/compare/${encodeURIComponent(release.tag_name)}...${encodeURIComponent(repo.default_branch)}`,
-  );
+  const latestRef = latestCommit?.sha ?? repo.default_branch;
+  const [compare, openPullRequests, checks] = await Promise.all([
+    github<GitHubCompare>(
+      `/repos/${repo.full_name}/compare/${encodeURIComponent(release.tag_name)}...${encodeURIComponent(repo.default_branch)}`,
+    ),
+    githubCount(`/repos/${repo.full_name}/pulls?state=open`),
+    checkRuns(repo, latestRef),
+  ]);
   commitsSinceRelease = compare?.total_commits ?? null;
   compareUrl = compare?.html_url ?? null;
+  const ci = ciDetails(checks);
 
   return {
     owner: repo.owner.login,
@@ -155,7 +260,10 @@ async function repoSummary(repo: GitHubRepo): Promise<Omit<Project, "freshness">
     language: repo.language,
     stars: repo.stargazers_count,
     forks: repo.forks_count,
-    openIssues: repo.open_issues_count,
+    openIssues: Math.max(repo.open_issues_count - openPullRequests, 0),
+    openPullRequests,
+    issuesUrl: `${repo.html_url}/issues`,
+    pullRequestsUrl: `${repo.html_url}/pulls`,
     archived: repo.archived,
     pushedAt: repo.pushed_at,
     updatedAt: repo.updated_at,
@@ -167,6 +275,12 @@ async function repoSummary(repo: GitHubRepo): Promise<Omit<Project, "freshness">
     releaseDate: release.published_at,
     commitsSinceRelease,
     compareUrl,
+    ciState: ci.state,
+    ciStatus: ci.status,
+    ciConclusion: ci.conclusion,
+    ciWorkflow: ci.workflow,
+    ciUrl: ci.url,
+    ciRunDate: ci.runDate,
   };
 }
 

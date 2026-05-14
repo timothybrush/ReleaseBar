@@ -155,8 +155,35 @@ input::placeholder {
 .filters {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
   margin: 18px 0;
+}
+
+.dev-toggle {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 10px;
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.dev-toggle input {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--green);
+  cursor: pointer;
+}
+
+.dev-toggle:has(input:checked) {
+  border-color: var(--cyan);
+  color: var(--text);
 }
 
 button {
@@ -190,6 +217,21 @@ button.active {
     minmax(140px, 0.6fr);
   gap: 0;
   align-items: stretch;
+}
+
+body.dev-mode .table-head,
+body.dev-mode .project {
+  grid-template-columns:
+    minmax(250px, 1.45fr) minmax(100px, 0.48fr) minmax(140px, 0.62fr) minmax(78px, 0.34fr)
+    minmax(125px, 0.52fr) minmax(74px, 0.32fr) minmax(64px, 0.28fr) minmax(110px, 0.5fr);
+}
+
+.dev-only {
+  display: none;
+}
+
+body.dev-mode .dev-only {
+  display: block;
 }
 
 .table-head {
@@ -288,7 +330,8 @@ button.active {
 }
 
 .release-cell span,
-.activity-cell span {
+.activity-cell span,
+.ci-cell span {
   display: block;
   margin-top: 6px;
   color: var(--muted);
@@ -299,6 +342,46 @@ button.active {
 .since-cell {
   color: var(--amber);
   font-size: 28px;
+}
+
+.issues-cell a,
+.prs-cell a,
+.ci-cell,
+.ci-cell a {
+  color: var(--cyan);
+}
+
+.issues-cell a,
+.prs-cell a {
+  font-size: 24px;
+}
+
+.ci-cell {
+  font-size: 13px;
+}
+
+.ci-cell a {
+  display: block;
+  font-size: 15px;
+}
+
+.ci-cell[data-ci="success"],
+.ci-cell[data-ci="success"] a {
+  color: var(--green);
+}
+
+.ci-cell[data-ci="failure"],
+.ci-cell[data-ci="failure"] a,
+.ci-cell[data-ci="cancelled"],
+.ci-cell[data-ci="cancelled"] a {
+  color: var(--red);
+}
+
+.ci-cell[data-ci="running"],
+.ci-cell[data-ci="running"] a,
+.ci-cell[data-ci="pending"],
+.ci-cell[data-ci="pending"] a {
+  color: var(--amber);
 }
 
 .project[data-freshness="fresh"] .since-cell,
@@ -338,6 +421,11 @@ button.active {
     border-top: 1px solid var(--line);
   }
 
+  .dev-toggle {
+    width: 100%;
+    margin-left: 0;
+  }
+
   .table-head {
     display: none;
   }
@@ -358,7 +446,10 @@ button.active {
   .version-cell::before,
   .release-cell::before,
   .since-cell::before,
-  .activity-cell::before {
+  .activity-cell::before,
+  .issues-cell::before,
+  .prs-cell::before,
+  .ci-cell::before {
     display: block;
     margin-bottom: 8px;
     color: var(--muted);
@@ -380,5 +471,17 @@ button.active {
 
   .activity-cell::before {
     content: "activity";
+  }
+
+  .issues-cell::before {
+    content: "issues";
+  }
+
+  .prs-cell::before {
+    content: "prs";
+  }
+
+  .ci-cell::before {
+    content: "ci";
   }
 }

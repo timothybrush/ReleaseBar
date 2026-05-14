@@ -57,6 +57,10 @@
         <button data-filter="hot" type="button">hot</button>
         <button data-filter="busy" type="button">busy</button>
         <button data-filter="fresh" type="button">fresh</button>
+        <label class="dev-toggle">
+          <input id="devMode" type="checkbox" />
+          <span>dev</span>
+        </label>
       </nav>
 
       <section class="table-wrap" aria-label="Repositories">
@@ -66,6 +70,9 @@
           <button data-sort="release" type="button">release</button>
           <button data-sort="since" type="button">since</button>
           <button data-sort="activity" type="button" aria-current="true">activity</button>
+          <button class="dev-only" data-sort="issues" type="button">issues</button>
+          <button class="dev-only" data-sort="prs" type="button">prs</button>
+          <button class="dev-only" data-sort="ci" type="button">ci</button>
         </div>
         <div id="projects" class="projects"></div>
       </section>
@@ -82,6 +89,9 @@
         <div class="release-cell"></div>
         <div class="since-cell"></div>
         <div class="activity-cell"></div>
+        <div class="issues-cell dev-only"></div>
+        <div class="prs-cell dev-only"></div>
+        <div class="ci-cell dev-only"></div>
       </article>
     </template>
 

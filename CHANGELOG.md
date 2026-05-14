@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added a dev mode toggle for open issues, open pull requests, and latest CI status.
 - Skipped repositories that do not have any GitHub releases.
 - Added CI for static checks, Pages deploys, and dependency updates.
 - Added TypeScript sources, Oxlint/Oxfmt checks, sortable dashboard columns, and day-level relative dates.

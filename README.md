@@ -1,6 +1,6 @@
 # ReleaseDeck
 
-ReleaseDeck is a static dashboard for maintainer release freshness: latest version, latest release date, commits since release, activity, stars, language, and quick search. Repositories without any GitHub releases are skipped.
+ReleaseDeck is a static dashboard for maintainer release freshness: latest version, latest release date, commits since release, activity, stars, language, and quick search. Repositories without any GitHub releases are skipped. Dev mode adds open issue counts, open PR counts, and latest CI status.
 
 ## Configure
 

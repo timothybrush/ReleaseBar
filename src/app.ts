@@ -1,6 +1,6 @@
-import type { DashboardPayload, Freshness, Project } from "./types.js";
+import type { CiState, DashboardPayload, Freshness, Project } from "./types.js";
 
-type SortKey = "repo" | "version" | "release" | "since" | "activity";
+type SortKey = "repo" | "version" | "release" | "since" | "activity" | "issues" | "prs" | "ci";
 type SortDirection = "asc" | "desc";
 
 const state = {
@@ -9,6 +9,7 @@ const state = {
   filter: "all" as Freshness | "all",
   sortKey: "activity" as SortKey,
   sortDirection: "desc" as SortDirection,
+  devMode: localStorage.getItem("releasedeck:dev-mode") === "true",
 };
 
 const numberFormat = new Intl.NumberFormat("en", { notation: "compact" });
@@ -26,6 +27,7 @@ const elements = {
   commitCount: query<HTMLSpanElement>("#commitCount"),
   staleCount: query<HTMLSpanElement>("#staleCount"),
   search: query<HTMLInputElement>("#search"),
+  devMode: query<HTMLInputElement>("#devMode"),
   projects: query<HTMLDivElement>("#projects"),
   template: query<HTMLTemplateElement>("#projectRow"),
   sortButtons: document.querySelectorAll<HTMLButtonElement>("[data-sort]"),
@@ -71,6 +73,8 @@ function matches(project: Project): boolean {
     project.language,
     project.version,
     project.freshness,
+    project.ciState,
+    project.ciWorkflow,
   ]
     .filter(Boolean)
     .join(" ")
@@ -89,6 +93,20 @@ function timestamp(value: string | null): number {
   return value ? Date.parse(value) : 0;
 }
 
+function ciRank(project: Project): number {
+  const rank: Record<CiState, number> = {
+    failure: 7,
+    cancelled: 6,
+    running: 5,
+    pending: 4,
+    unknown: 3,
+    skipped: 2,
+    neutral: 1,
+    success: 0,
+  };
+  return rank[project.ciState];
+}
+
 function sortValue(project: Project, sortKey: SortKey): string | number {
   switch (sortKey) {
     case "repo":
@@ -101,6 +119,12 @@ function sortValue(project: Project, sortKey: SortKey): string | number {
       return project.commitsSinceRelease ?? -1;
     case "activity":
       return timestamp(project.latestCommitDate || project.pushedAt);
+    case "issues":
+      return project.openIssues;
+    case "prs":
+      return project.openPullRequests;
+    case "ci":
+      return ciRank(project);
   }
 }
 
@@ -127,6 +151,25 @@ function updateSortButtons(): void {
     }
     button.dataset.direction = active ? state.sortDirection : "";
   });
+}
+
+function issueLink(url: string, count: number): HTMLAnchorElement {
+  const link = document.createElement("a");
+  link.href = url;
+  link.target = "_blank";
+  link.rel = "noreferrer";
+  link.textContent = String(count);
+  return link;
+}
+
+function ciLabel(project: Project): string {
+  if (project.ciState === "unknown") {
+    return "no ci";
+  }
+  if (project.ciState === "failure") {
+    return "fail";
+  }
+  return project.ciState;
 }
 
 function renderProject(project: Project): DocumentFragment {
@@ -202,6 +245,39 @@ function renderProject(project: Project): DocumentFragment {
   }
   activity.innerHTML = `<strong>${relativeDate(project.latestCommitDate || project.pushedAt)}</strong><span>${project.latestCommitSha || project.defaultBranch}</span>`;
 
+  const issues = fragment.querySelector<HTMLDivElement>(".issues-cell");
+  if (!issues) {
+    throw new Error("Project template is missing .issues-cell");
+  }
+  issues.append(issueLink(project.issuesUrl, project.openIssues));
+
+  const prs = fragment.querySelector<HTMLDivElement>(".prs-cell");
+  if (!prs) {
+    throw new Error("Project template is missing .prs-cell");
+  }
+  prs.append(issueLink(project.pullRequestsUrl, project.openPullRequests));
+
+  const ci = fragment.querySelector<HTMLDivElement>(".ci-cell");
+  if (!ci) {
+    throw new Error("Project template is missing .ci-cell");
+  }
+  ci.dataset.ci = project.ciState;
+  if (project.ciUrl) {
+    const ciLink = document.createElement("a");
+    ciLink.href = project.ciUrl;
+    ciLink.target = "_blank";
+    ciLink.rel = "noreferrer";
+    ciLink.textContent = ciLabel(project);
+    ci.append(ciLink);
+  } else {
+    ci.textContent = ciLabel(project);
+  }
+  if (project.ciWorkflow || project.ciRunDate) {
+    const detail = document.createElement("span");
+    detail.textContent = project.ciWorkflow || relativeDate(project.ciRunDate);
+    ci.append(detail);
+  }
+
   return fragment;
 }
 
@@ -211,6 +287,7 @@ function render(): void {
   }
 
   const projects: Project[] = sortProjects(state.data.projects.filter(matches));
+  document.body.classList.toggle("dev-mode", state.devMode);
   elements.projects.replaceChildren(...projects.map(renderProject));
   elements.repoCount.textContent = numberFormat.format(projects.length);
   elements.releasedCount.textContent = numberFormat.format(
@@ -230,11 +307,22 @@ async function boot(): Promise<void> {
   state.data = (await response.json()) as DashboardPayload;
   document.title = state.data.title;
   elements.generated.textContent = `updated ${relativeDate(state.data.generatedAt)}`;
+  elements.devMode.checked = state.devMode;
   render();
 }
 
 elements.search.addEventListener("input", () => {
   state.query = elements.search.value.trim().toLowerCase();
+  render();
+});
+
+elements.devMode.addEventListener("change", () => {
+  state.devMode = elements.devMode.checked;
+  if (!state.devMode && ["issues", "prs", "ci"].includes(state.sortKey)) {
+    state.sortKey = "activity";
+    state.sortDirection = "desc";
+  }
+  localStorage.setItem("releasedeck:dev-mode", String(state.devMode));
   render();
 });
 

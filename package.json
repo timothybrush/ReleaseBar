@@ -7,7 +7,9 @@
   "scripts": {
     "build": "npm run build:script && node node_modules/.cache/releasedeck-build/scripts/build.js",
     "build:script": "tsc -p tsconfig.build.json",
-    "check": "npm run typecheck && npm run lint && npm run format:check && npm run build:script && node node_modules/.cache/releasedeck-build/scripts/build.js --check",
+    "check": "npm run check:static && npm run check:data",
+    "check:data": "node node_modules/.cache/releasedeck-build/scripts/build.js --check",
+    "check:static": "npm run typecheck && npm run lint && npm run format:check && npm run build:script",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint .",

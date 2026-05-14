@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="description" content="Release freshness dashboard for open source maintainers.">
+    <title>ReleaseDeck</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topline">
+        <div>
+          <p class="eyebrow">steipete / openclaw</p>
+          <h1>ReleaseDeck</h1>
+        </div>
+        <div class="status" aria-live="polite">
+          <span class="pulse"></span>
+          <span id="generated">loading</span>
+        </div>
+      </header>
+
+      <section class="console" aria-label="Project search and metrics">
+        <div class="prompt">
+          <span class="mark">$</span>
+          <input id="search" type="search" autocomplete="off" spellcheck="false" placeholder="search repos, languages, owners, versions">
+        </div>
+        <div class="metrics">
+          <div>
+            <span id="repoCount">--</span>
+            <label>repos</label>
+          </div>
+          <div>
+            <span id="releasedCount">--</span>
+            <label>released</label>
+          </div>
+          <div>
+            <span id="commitCount">--</span>
+            <label>commits since release</label>
+          </div>
+          <div>
+            <span id="staleCount">--</span>
+            <label>need attention</label>
+          </div>
+        </div>
+      </section>
+
+      <nav class="filters" aria-label="Filters">
+        <button class="active" data-filter="all" type="button">all</button>
+        <button data-filter="hot" type="button">hot</button>
+        <button data-filter="busy" type="button">busy</button>
+        <button data-filter="unreleased" type="button">unreleased</button>
+        <button data-filter="fresh" type="button">fresh</button>
+      </nav>
+
+      <section class="table-wrap" aria-label="Repositories">
+        <div class="table-head">
+          <span>repo</span>
+          <span>version</span>
+          <span>release</span>
+          <span>since</span>
+          <span>activity</span>
+        </div>
+        <div id="projects" class="projects"></div>
+      </section>
+    </main>
+
+    <template id="projectRow">
+      <article class="project">
+        <div class="repo-cell">
+          <a class="repo-link" target="_blank" rel="noreferrer"></a>
+          <p class="description"></p>
+          <div class="tags"></div>
+        </div>
+        <div class="version-cell"></div>
+        <div class="release-cell"></div>
+        <div class="since-cell"></div>
+        <div class="activity-cell"></div>
+      </article>
+    </template>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

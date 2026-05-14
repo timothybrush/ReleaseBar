@@ -1,0 +1,14 @@
+{
+  "name": "releasedeck",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Release freshness dashboard for open source maintainers.",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "node scripts/build.mjs --check"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

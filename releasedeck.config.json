@@ -1,0 +1,20 @@
+{
+  "title": "ReleaseDeck",
+  "subtitle": "Open source release freshness across steipete and OpenClaw.",
+  "canonicalDomain": "releasedeck.dev",
+  "owners": [
+    {
+      "type": "user",
+      "login": "steipete"
+    },
+    {
+      "type": "org",
+      "login": "openclaw"
+    }
+  ],
+  "includeForks": false,
+  "includeArchived": true,
+  "excludeRepos": [
+    "steipete/steipete"
+  ]
+}

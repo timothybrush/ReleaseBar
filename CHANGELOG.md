@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Updated the header owner label to `@steipete`.
 - Added a dev mode toggle for open issues, open pull requests, and latest CI status.
 - Skipped repositories that do not have any GitHub releases.
 - Added CI for static checks, Pages deploys, and dependency updates.

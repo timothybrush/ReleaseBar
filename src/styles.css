@@ -316,10 +316,6 @@ button.active {
   color: var(--red);
 }
 
-.project[data-freshness="unreleased"] .version-cell {
-  color: var(--violet);
-}
-
 @media (max-width: 860px) {
   .shell {
     width: min(100vw - 20px, 720px);

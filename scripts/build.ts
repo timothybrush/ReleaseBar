@@ -54,6 +54,7 @@ type GitHubRelease = {
   tag_name: string;
   name: string | null;
   html_url: string;
+  draft?: boolean;
   published_at: string | null;
 };
 
@@ -106,6 +107,13 @@ async function ownerRepos(owner: Owner): Promise<GitHubRepo[]> {
   return githubPages<GitHubRepo>(`${base}?type=public&sort=pushed&direction=desc`);
 }
 
+async function latestRelease(repo: GitHubRepo): Promise<GitHubRelease | null> {
+  const releases = await github<GitHubRelease[]>(`/repos/${repo.full_name}/releases?per_page=10`);
+  return (
+    releases?.find((release) => release.tag_name && !release.draft && release.published_at) ?? null
+  );
+}
+
 function repoAllowed(repo: GitHubRepo): boolean {
   const fullName = repo.full_name;
   if (!config.includeForks && repo.fork) {
@@ -120,21 +128,22 @@ function repoAllowed(repo: GitHubRepo): boolean {
   return !repo.private;
 }
 
-async function repoSummary(repo: GitHubRepo): Promise<Omit<Project, "freshness">> {
+async function repoSummary(repo: GitHubRepo): Promise<Omit<Project, "freshness"> | null> {
   const [release, latestCommit] = await Promise.all([
-    github<GitHubRelease>(`/repos/${repo.full_name}/releases/latest`),
+    latestRelease(repo),
     github<GitHubCommit>(`/repos/${repo.full_name}/commits/${repo.default_branch}`),
   ]);
+  if (!release?.tag_name) {
+    return null;
+  }
 
   let commitsSinceRelease: number | null = null;
   let compareUrl: string | null = null;
-  if (release?.tag_name) {
-    const compare = await github<GitHubCompare>(
-      `/repos/${repo.full_name}/compare/${encodeURIComponent(release.tag_name)}...${encodeURIComponent(repo.default_branch)}`,
-    );
-    commitsSinceRelease = compare?.total_commits ?? null;
-    compareUrl = compare?.html_url ?? null;
-  }
+  const compare = await github<GitHubCompare>(
+    `/repos/${repo.full_name}/compare/${encodeURIComponent(release.tag_name)}...${encodeURIComponent(repo.default_branch)}`,
+  );
+  commitsSinceRelease = compare?.total_commits ?? null;
+  compareUrl = compare?.html_url ?? null;
 
   return {
     owner: repo.owner.login,
@@ -152,19 +161,16 @@ async function repoSummary(repo: GitHubRepo): Promise<Omit<Project, "freshness">
     updatedAt: repo.updated_at,
     latestCommitSha: latestCommit?.sha?.slice(0, 7) ?? null,
     latestCommitDate: latestCommit?.commit?.committer?.date ?? null,
-    version: release?.tag_name ?? null,
-    releaseName: release?.name ?? null,
-    releaseUrl: release?.html_url ?? null,
-    releaseDate: release?.published_at ?? null,
+    version: release.tag_name,
+    releaseName: release.name,
+    releaseUrl: release.html_url,
+    releaseDate: release.published_at,
     commitsSinceRelease,
     compareUrl,
   };
 }
 
 function freshness(project: Omit<Project, "freshness">): Freshness {
-  if (!project.version) {
-    return "unreleased";
-  }
   if (project.commitsSinceRelease === 0) {
     return "fresh";
   }
@@ -191,6 +197,10 @@ async function main() {
   for (const [index, repo] of uniqueRepos.entries()) {
     process.stdout.write(`fetch ${index + 1}/${uniqueRepos.length} ${repo.full_name}\n`);
     const project = await repoSummary(repo);
+    if (!project) {
+      process.stdout.write(`skip ${repo.full_name}: no releases\n`);
+      continue;
+    }
     projects.push({ ...project, freshness: freshness(project) });
   }
 
@@ -209,8 +219,8 @@ async function main() {
     owners: config.owners,
     totals: {
       repos: projects.length,
-      released: projects.filter((project) => project.version).length,
-      unreleased: projects.filter((project) => !project.version).length,
+      released: projects.length,
+      unreleased: 0,
       commitsSinceRelease: projects.reduce(
         (sum, project) => sum + (project.commitsSinceRelease || 0),
         0,

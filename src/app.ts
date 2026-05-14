@@ -167,17 +167,12 @@ function renderProject(project: Project): DocumentFragment {
   if (!version) {
     throw new Error("Project template is missing .version-cell");
   }
-  if (project.releaseUrl) {
-    const versionLink = document.createElement("a");
-    versionLink.href = project.releaseUrl;
-    versionLink.target = "_blank";
-    versionLink.rel = "noreferrer";
-    versionLink.textContent = project.version ?? "release";
-    version.append(versionLink);
-  } else {
-    version.textContent = "unreleased";
-    version.classList.add("muted");
-  }
+  const versionLink = document.createElement("a");
+  versionLink.href = project.releaseUrl;
+  versionLink.target = "_blank";
+  versionLink.rel = "noreferrer";
+  versionLink.textContent = project.version;
+  version.append(versionLink);
 
   const release = fragment.querySelector<HTMLDivElement>(".release-cell");
   if (!release) {
@@ -225,7 +220,7 @@ function render(): void {
     projects.reduce((sum, project) => sum + (project.commitsSinceRelease || 0), 0),
   );
   elements.staleCount.textContent = numberFormat.format(
-    projects.filter((project) => ["hot", "busy", "unreleased"].includes(project.freshness)).length,
+    projects.filter((project) => ["hot", "busy"].includes(project.freshness)).length,
   );
   updateSortButtons();
 }

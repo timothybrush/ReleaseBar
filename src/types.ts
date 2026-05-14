@@ -13,7 +13,7 @@ export type ReleaseDeckConfig = {
   excludeRepos?: string[];
 };
 
-export type Freshness = "fresh" | "warm" | "busy" | "hot" | "unreleased";
+export type Freshness = "fresh" | "warm" | "busy" | "hot";
 
 export type Project = {
   owner: string;
@@ -31,9 +31,9 @@ export type Project = {
   updatedAt: string | null;
   latestCommitSha: string | null;
   latestCommitDate: string | null;
-  version: string | null;
+  version: string;
   releaseName: string | null;
-  releaseUrl: string | null;
+  releaseUrl: string;
   releaseDate: string | null;
   commitsSinceRelease: number | null;
   compareUrl: string | null;

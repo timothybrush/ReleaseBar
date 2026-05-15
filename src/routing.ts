@@ -79,12 +79,12 @@ export function dashboardRoute(
 
   if (!owner) {
     const custom = extraOwners.length > 0 || repos.length > 0;
-    const apiPath = custom ? `/api/dashboard${suffix}` : `./data/projects.json${suffix}`;
+    const apiPath = custom ? `/api/dashboard${suffix}` : `/api/_hot${suffix}`;
     return {
       owner: null,
-      apiPath: `${custom ? apiOrigin : ""}${apiPath}`,
-      fallbackApiPath: custom && apiOrigin === "" ? `${workersDevApiOrigin}${apiPath}` : null,
-      label: custom ? "custom deck" : "@steipete",
+      apiPath: `${apiOrigin}${apiPath}`,
+      fallbackApiPath: apiOrigin === "" ? `${workersDevApiOrigin}${apiPath}` : null,
+      label: custom ? "custom deck" : "ReleaseBar Hot",
       isDefault: !custom,
       extraOwners,
       repos,

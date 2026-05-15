@@ -12,12 +12,18 @@ import type {
   AuthUser,
   DashboardPayload,
   Owner,
+  Project,
 } from "../src/types.js";
 
 type KVNamespace = {
   get(key: string): Promise<string | null>;
   put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
   delete?(key: string): Promise<void>;
+  list?(options?: { prefix?: string; limit?: number; cursor?: string }): Promise<{
+    keys: Array<{ name: string }>;
+    list_complete: boolean;
+    cursor?: string;
+  }>;
 };
 
 type Env = {
@@ -41,8 +47,16 @@ const fullTtlMs = 60 * 60 * 1000;
 const staleTtlSeconds = 3 * 24 * 60 * 60;
 const coldBuildWaitMs = 15 * 1000;
 const repoLimit = 8;
+const hotLimit = 50;
+const hotOwnerLimit = 3;
+const hotSourceLimit = 24;
+const hotIndexLimit = 100;
+const hotCacheTtlMs = 5 * 60 * 1000;
 const maxCustomSources = 8;
 const schemaVersion = 1;
+const dashboardCachePrefix = `dashboard:v${schemaVersion}:`;
+const hotCacheKey = `hot:v${schemaVersion}`;
+const hotIndexKey = `hot:index:v${schemaVersion}`;
 const sessionCookie = "rd_session";
 const installReturnCookie = "rd_install_return";
 const sessionMaxAgeSeconds = 30 * 24 * 60 * 60;
@@ -411,7 +425,7 @@ function socialLabel(url: URL): string {
   if (repos.length === 1) {
     return repos[0] ?? "custom deck";
   }
-  return repos.length > 1 ? `custom deck +${repos.length}` : "@steipete";
+  return repos.length > 1 ? `custom deck +${repos.length}` : "ReleaseBar Hot";
 }
 
 function socialImage(label: string): Response {
@@ -996,15 +1010,16 @@ function withCacheState(
   state: NonNullable<DashboardPayload["cache"]>["state"],
   message?: string,
 ): DashboardPayload {
+  const cacheMessage = message ?? payload.cache?.message;
   return {
     ...payload,
     cache: {
       state,
       stale: state !== "fresh",
       capped: payload.cache?.capped ?? false,
-      repoLimit: payload.cache?.repoLimit ?? repoLimit,
+      repoLimit: payload.cache ? payload.cache.repoLimit : repoLimit,
       generatedAt: payload.generatedAt,
-      ...(message ? { message } : {}),
+      ...(cacheMessage ? { message: cacheMessage } : {}),
     },
   };
 }
@@ -1015,6 +1030,33 @@ function optionsFromUrl(url: URL) {
     includeArchived: url.searchParams.get("archived") === "true",
     includeUnreleased: url.searchParams.get("unreleased") === "true",
   };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isGitHubRateLimit(error: unknown): boolean {
+  return /rate limit|secondary rate|api rate limit exceeded|shared api quota|quota .*exhausted/i.test(
+    errorMessage(error),
+  );
+}
+
+function dashboardErrorMessage(error: unknown): string {
+  if (isGitHubRateLimit(error)) {
+    return "GitHub shared API quota is exhausted. Connect GitHub and install the app for this account to use dedicated quota, or try again after the shared quota resets.";
+  }
+
+  const message = errorMessage(error);
+  const githubMatch = message.match(/^GitHub API (\d+) for ([^:]+):/);
+  if (githubMatch) {
+    return `GitHub API ${githubMatch[1]} while loading ${githubMatch[2]}.`;
+  }
+  return message;
+}
+
+function errorStatus(error: unknown): number {
+  return isGitHubRateLimit(error) ? 429 : 502;
 }
 
 async function readCached(env: Env, key: string): Promise<DashboardPayload | null> {
@@ -1031,6 +1073,167 @@ async function writeCached(
   await env.DASHBOARD_CACHE?.put(key, JSON.stringify(payload), {
     expirationTtl: ttlSeconds,
   });
+}
+
+function projectActivityDate(project: Project): string | null {
+  return project.latestCommitDate || project.pushedAt || project.updatedAt;
+}
+
+function daysSince(value: string | null): number | null {
+  if (!value) return null;
+  const time = Date.parse(value);
+  if (Number.isNaN(time)) return null;
+  return Math.max(0, Math.round((Date.now() - time) / 86400000));
+}
+
+function hotScore(project: Project): number {
+  const commits = project.commitsSinceRelease ?? 0;
+  const stars = Math.log1p(project.stars) * 6;
+  const activityDays = daysSince(projectActivityDate(project));
+  const recency =
+    activityDays === null ? 0 : (Math.max(0, 30 - Math.min(activityDays, 30)) / 30) * 20;
+  const prs = Math.log1p(project.openPullRequests) * 2;
+  const ci = project.ciState === "failure" ? 15 : project.ciState === "running" ? 5 : 0;
+  return commits * 4 + stars + recency + prs + ci;
+}
+
+async function readCachedDashboards(env: Env): Promise<DashboardPayload[]> {
+  if (!env.DASHBOARD_CACHE) return [];
+
+  const dashboards: DashboardPayload[] = [];
+  let keys = await readHotIndex(env);
+  if (keys.length < hotSourceLimit && env.DASHBOARD_CACHE.list) {
+    const page = await env.DASHBOARD_CACHE.list({
+      prefix: dashboardCachePrefix,
+      limit: hotSourceLimit,
+    });
+    keys = [...new Set([...keys, ...page.keys.map((key) => key.name)])];
+  }
+
+  for (const key of keys.slice(0, hotSourceLimit)) {
+    const raw = await env.DASHBOARD_CACHE.get(key);
+    if (!raw) continue;
+    try {
+      const payload = JSON.parse(raw) as DashboardPayload;
+      if (
+        payload.cache?.state === "error" ||
+        payload.options?.includeForks ||
+        payload.projects.length === 0
+      ) {
+        continue;
+      }
+      dashboards.push(payload);
+    } catch {
+      continue;
+    }
+  }
+
+  return dashboards;
+}
+
+async function readHotIndex(env: Env): Promise<string[]> {
+  const raw = await env.DASHBOARD_CACHE?.get(hotIndexKey);
+  if (!raw) return [];
+  try {
+    const keys = JSON.parse(raw) as unknown;
+    return Array.isArray(keys)
+      ? keys.filter(
+          (key): key is string => typeof key === "string" && key.startsWith(dashboardCachePrefix),
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+async function rememberHotDashboard(
+  env: Env,
+  key: string,
+  payload: DashboardPayload,
+): Promise<void> {
+  if (payload.options?.includeForks) return;
+  const keys = await readHotIndex(env);
+  const next = [key, ...keys.filter((existing) => existing !== key)].slice(0, hotIndexLimit);
+  await env.DASHBOARD_CACHE?.put(hotIndexKey, JSON.stringify(next), {
+    expirationTtl: staleTtlSeconds,
+  });
+}
+
+function hotDashboardPayload(
+  dashboards: DashboardPayload[],
+  env: Env,
+  generatedAt = new Date().toISOString(),
+): DashboardPayload {
+  const candidates = new Map<string, Project>();
+  for (const dashboard of dashboards) {
+    for (const project of dashboard.projects) {
+      if (project.archived || !project.releaseDate || project.commitsSinceRelease === null) {
+        continue;
+      }
+      const existing = candidates.get(project.fullName.toLowerCase());
+      if (!existing || hotScore(project) > hotScore(existing)) {
+        candidates.set(project.fullName.toLowerCase(), project);
+      }
+    }
+  }
+
+  const ownerCounts = new Map<string, number>();
+  const projects = [...candidates.values()]
+    .sort((a, b) => hotScore(b) - hotScore(a))
+    .filter((project) => {
+      const owner = project.owner.toLowerCase();
+      const count = ownerCounts.get(owner) ?? 0;
+      if (count >= hotOwnerLimit) return false;
+      ownerCounts.set(owner, count + 1);
+      return true;
+    })
+    .slice(0, hotLimit);
+  const totalCommits = projects.reduce(
+    (sum, project) => sum + (project.commitsSinceRelease ?? 0),
+    0,
+  );
+  const omitted = candidates.size > projects.length;
+
+  return {
+    title: "ReleaseBar Hot",
+    subtitle: "Release debt across recently requested public dashboards.",
+    canonicalDomain: env.RELEASEDECK_CANONICAL_DOMAIN ?? "release.bar",
+    generatedAt,
+    owners: [],
+    options: {
+      includeForks: false,
+      includeArchived: false,
+      includeUnreleased: false,
+      repoLimit: null,
+    },
+    cache: {
+      state: "fresh",
+      stale: false,
+      capped: omitted,
+      repoLimit: null,
+      generatedAt,
+      message: `built from ${dashboards.length} cached dashboard${dashboards.length === 1 ? "" : "s"}`,
+    },
+    totals: {
+      repos: projects.length,
+      released: projects.filter((project) => project.releaseDate).length,
+      unreleased: projects.filter((project) => !project.releaseDate).length,
+      commitsSinceRelease: totalCommits,
+    },
+    projects,
+  };
+}
+
+async function hotResponse(env: Env): Promise<Response> {
+  const cached = await readCached(env, hotCacheKey);
+  const ageMs = cached ? Date.now() - Date.parse(cached.generatedAt) : Number.POSITIVE_INFINITY;
+  if (cached && ageMs < hotCacheTtlMs) {
+    return jsonResponse(withCacheState(cached, "fresh"));
+  }
+
+  const payload = hotDashboardPayload(await readCachedDashboards(env), env);
+  await writeCached(env, hotCacheKey, payload);
+  return jsonResponse(payload);
 }
 
 async function rebuild(dashboard: DashboardRequest, env: Env): Promise<DashboardPayload> {
@@ -1052,6 +1255,7 @@ async function rebuild(dashboard: DashboardRequest, env: Env): Promise<Dashboard
       fetch: workerFetch,
     });
     await writeCached(env, dashboard.key, payload);
+    await rememberHotDashboard(env, dashboard.key, payload);
     return payload;
   })();
 
@@ -1067,6 +1271,20 @@ function errorPayload(dashboard: DashboardRequest, env: Env, message: string): D
   return statusPayload(dashboard, env, "error", message, new Date().toISOString());
 }
 
+function unresolvedDashboardRequest(
+  ownerSlugs: string[],
+  includeRepos: string[],
+  key: string,
+  url: URL,
+): DashboardRequest {
+  return dashboardRequest(
+    ownerSlugs.map((login) => ({ type: "user", login })),
+    includeRepos,
+    key,
+    url,
+  );
+}
+
 function rebuildingPayload(dashboard: DashboardRequest, env: Env): DashboardPayload {
   return statusPayload(
     dashboard,
@@ -1078,8 +1296,12 @@ function rebuildingPayload(dashboard: DashboardRequest, env: Env): DashboardPayl
 }
 
 function cacheBuildError(dashboard: DashboardRequest, env: Env, error: unknown): Promise<void> {
-  const message = error instanceof Error ? error.message : String(error);
-  return writeCached(env, dashboard.key, errorPayload(dashboard, env, message), 5 * 60);
+  return writeCached(
+    env,
+    dashboard.key,
+    errorPayload(dashboard, env, dashboardErrorMessage(error)),
+    5 * 60,
+  );
 }
 
 function statusPayload(
@@ -1162,7 +1384,7 @@ async function ownerResponse(
           return rebuild(dashboard, env).catch((error) => cacheBuildError(dashboard, env, error));
         }),
     );
-    return jsonResponse(cached, 502, {
+    return jsonResponse(cached, errorStatus(cached.cache.message ?? ""), {
       "cache-control": "no-store",
     });
   }
@@ -1188,7 +1410,10 @@ async function ownerResponse(
   try {
     owners = await resolveOwners(ownerSlugs, env, token);
   } catch (error) {
-    return jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 502, {
+    const dashboard = unresolvedDashboardRequest(ownerSlugs, includeRepos, key, url);
+    const payload = errorPayload(dashboard, env, dashboardErrorMessage(error));
+    await writeCached(env, key, payload, 5 * 60);
+    return jsonResponse(payload, errorStatus(error), {
       "cache-control": "no-store",
     });
   }
@@ -1215,13 +1440,9 @@ async function ownerResponse(
     }
     return jsonResponse(payload);
   } catch (error) {
-    const payload = errorPayload(
-      dashboard,
-      env,
-      error instanceof Error ? error.message : String(error),
-    );
+    const payload = errorPayload(dashboard, env, dashboardErrorMessage(error));
     await writeCached(env, key, payload, 5 * 60);
-    return jsonResponse(payload, 502, {
+    return jsonResponse(payload, errorStatus(error), {
       "cache-control": "no-store",
     });
   }
@@ -1293,6 +1514,9 @@ async function routeRequest(
   }
   if (url.pathname.startsWith("/api/auth/")) {
     return authResponse(request, env);
+  }
+  if (url.pathname === "/api/_hot") {
+    return hotResponse(env);
   }
   if (url.pathname.startsWith("/api/")) {
     return ownerResponse(request, env, context);

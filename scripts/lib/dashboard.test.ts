@@ -18,6 +18,7 @@ import {
   workerApiOrigin,
   workersDevApiOrigin,
 } from "../../src/routing.js";
+import type { DashboardPayload, Project } from "../../src/types.js";
 import worker from "../../worker/index.js";
 
 const textEncoder = new TextEncoder();
@@ -30,6 +31,18 @@ function kvStore(initial: Record<string, string> = {}) {
     },
     async put(key: string, value: string) {
       values.set(key, value);
+    },
+    async delete(key: string) {
+      values.delete(key);
+    },
+    async list(options: { prefix?: string; limit?: number; cursor?: string } = {}) {
+      const names = [...values.keys()]
+        .filter((key) => !options.prefix || key.startsWith(options.prefix))
+        .sort();
+      return {
+        keys: names.map((name) => ({ name })),
+        list_complete: true,
+      };
     },
   };
 }
@@ -55,13 +68,87 @@ async function signedJson(secret: string, value: unknown): Promise<string> {
   return `${payload}.${base64Url(new Uint8Array(signature))}`;
 }
 
-test("owner route parsing keeps root static and owners API-backed", () => {
+function testProject(overrides: Partial<Project> & Pick<Project, "owner" | "name">): Project {
+  const { owner, name, ...rest } = overrides;
+  const fullName = `${owner}/${name}`;
+  return {
+    owner,
+    name,
+    fullName,
+    description: null,
+    url: `https://github.com/${fullName}`,
+    defaultBranch: "main",
+    language: null,
+    stars: 1,
+    forks: 0,
+    openIssues: 0,
+    openPullRequests: 0,
+    issuesUrl: `https://github.com/${fullName}/issues`,
+    pullRequestsUrl: `https://github.com/${fullName}/pulls`,
+    archived: false,
+    pushedAt: "2026-05-15T00:00:00Z",
+    updatedAt: "2026-05-15T00:00:00Z",
+    latestCommitSha: "abcdef1",
+    latestCommitDate: "2026-05-15T00:00:00Z",
+    version: "v1.0.0",
+    releaseName: null,
+    releaseUrl: `https://github.com/${fullName}/releases/tag/v1.0.0`,
+    releaseDate: "2026-05-01T00:00:00Z",
+    commitsSinceRelease: 0,
+    compareUrl: `https://github.com/${fullName}/compare/v1.0.0...main`,
+    ciState: "success",
+    ciStatus: null,
+    ciConclusion: null,
+    ciWorkflow: null,
+    ciUrl: null,
+    ciRunDate: null,
+    freshness: "fresh",
+    ...rest,
+  };
+}
+
+function testDashboard(owner: string, projects: Project[]): DashboardPayload {
+  return {
+    title: "ReleaseBar",
+    subtitle: `Release freshness for @${owner}.`,
+    canonicalDomain: "release.bar",
+    generatedAt: "2026-05-15T12:00:00Z",
+    owners: [{ type: "user", login: owner }],
+    options: {
+      includeForks: false,
+      includeArchived: false,
+      includeUnreleased: false,
+      repoLimit: 8,
+    },
+    cache: {
+      state: "fresh",
+      stale: false,
+      capped: false,
+      repoLimit: 8,
+      generatedAt: "2026-05-15T12:00:00Z",
+    },
+    totals: {
+      repos: projects.length,
+      released: projects.filter((project) => project.releaseDate).length,
+      unreleased: projects.filter((project) => !project.releaseDate).length,
+      commitsSinceRelease: projects.reduce(
+        (sum, project) => sum + (project.commitsSinceRelease ?? 0),
+        0,
+      ),
+    },
+    projects,
+  };
+}
+
+test("owner route parsing keeps root hot board and owners API-backed", () => {
   assert.equal(ownerFromPath("/"), null);
   assert.equal(ownerFromPath("/index.html"), null);
   assert.equal(ownerFromPath("/OpenClaw"), "OpenClaw");
   assert.equal(ownerFromPath("/bad_owner"), null);
 
   assert.deepEqual(dashboardRoute("/", "").isDefault, true);
+  assert.equal(dashboardRoute("/", "").apiPath, `${workerApiOrigin}/api/_hot`);
+  assert.equal(dashboardRoute("/", "").fallbackApiPath, `${workersDevApiOrigin}/api/_hot`);
   assert.equal(dashboardRoute("/openclaw", "").apiPath, `${workerApiOrigin}/api/openclaw`);
   assert.equal(
     dashboardRoute("/openclaw", "?forks=true&archived=true&unreleased=true").apiPath,
@@ -79,6 +166,180 @@ test("owner route parsing keeps root static and owners API-backed", () => {
     dashboardRoute("/", "?owners=openclaw").fallbackApiPath,
     `${workersDevApiOrigin}/api/dashboard?owners=openclaw`,
   );
+});
+
+test("worker builds root hot dashboard from cached dashboards", async () => {
+  const alphaKey = dashboardCacheKey({ owner: "alpha", schemaVersion: 1 });
+  const betaKey = dashboardCacheKey({ owner: "beta", schemaVersion: 1 });
+  const forksKey = dashboardCacheKey({ owner: "forks", includeForks: true, schemaVersion: 1 });
+  const env = {
+    DASHBOARD_CACHE: kvStore({
+      "hot:index:v1": JSON.stringify([alphaKey]),
+      [alphaKey]: JSON.stringify(
+        testDashboard("alpha", [
+          testProject({
+            owner: "alpha",
+            name: "hot",
+            commitsSinceRelease: 100,
+            freshness: "hot",
+          }),
+          testProject({ owner: "alpha", name: "second", commitsSinceRelease: 80 }),
+          testProject({ owner: "alpha", name: "third", commitsSinceRelease: 60 }),
+          testProject({ owner: "alpha", name: "fourth", commitsSinceRelease: 40 }),
+          testProject({
+            owner: "alpha",
+            name: "archived",
+            archived: true,
+            commitsSinceRelease: 120,
+          }),
+        ]),
+      ),
+      [betaKey]: JSON.stringify(
+        testDashboard("beta", [
+          testProject({
+            owner: "beta",
+            name: "popular",
+            stars: 500,
+            commitsSinceRelease: 20,
+          }),
+          testProject({
+            owner: "beta",
+            name: "unreleased",
+            releaseDate: null,
+            commitsSinceRelease: null,
+          }),
+        ]),
+      ),
+      [forksKey]: JSON.stringify({
+        ...testDashboard("forks", [
+          testProject({
+            owner: "forks",
+            name: "cached-fork",
+            commitsSinceRelease: 500,
+            freshness: "hot",
+          }),
+        ]),
+        options: {
+          includeForks: true,
+          includeArchived: false,
+          includeUnreleased: false,
+          repoLimit: 8,
+        },
+      }),
+      [dashboardCacheKey({ owner: "gamma", schemaVersion: 1 })]: JSON.stringify(
+        testDashboard("gamma", [
+          testProject({
+            owner: "gamma",
+            name: "from-list",
+            commitsSinceRelease: 30,
+          }),
+        ]),
+      ),
+    }),
+  };
+
+  const response = await worker.fetch(new Request("https://release.bar/api/_hot"), env, {
+    waitUntil: () => undefined,
+  });
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as DashboardPayload;
+  assert.equal(body.title, "ReleaseBar Hot");
+  assert.deepEqual(body.owners, []);
+  assert.equal(body.projects[0]?.fullName, "alpha/hot");
+  assert.equal(
+    body.projects.some((project) => project.fullName === "alpha/archived"),
+    false,
+  );
+  assert.equal(
+    body.projects.some((project) => project.fullName === "beta/unreleased"),
+    false,
+  );
+  assert.equal(
+    body.projects.some((project) => project.fullName === "forks/cached-fork"),
+    false,
+  );
+  assert.equal(
+    body.projects.some((project) => project.fullName === "gamma/from-list"),
+    true,
+  );
+  assert.equal(body.projects.filter((project) => project.owner === "alpha").length <= 3, true);
+  assert.match(body.cache?.message ?? "", /cached dashboards/);
+
+  const cachedResponse = await worker.fetch(new Request("https://release.bar/api/_hot"), env, {
+    waitUntil: () => undefined,
+  });
+  const cachedBody = (await cachedResponse.json()) as DashboardPayload;
+  assert.equal(cachedBody.cache?.repoLimit, null);
+  assert.match(cachedBody.cache?.message ?? "", /cached dashboards/);
+});
+
+test("worker keeps hot owner route distinct from root hot API", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/users/hot") {
+      return Response.json({ login: "hot", type: "User" });
+    }
+    if (url.pathname === "/users/hot/repos") {
+      return Response.json([]);
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/hot"),
+      { DASHBOARD_CACHE: kvStore() },
+      { waitUntil: () => undefined },
+    );
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(response.status, 200);
+    assert.equal(body.owners[0]?.login, "hot");
+    assert.notEqual(body.title, "ReleaseBar Hot");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker returns dashboard-shaped rate-limit errors without raw GitHub JSON", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/users/vincentkoc") {
+      return Response.json(
+        {
+          message: "API rate limit exceeded for user ID 58493",
+          documentation_url: "https://docs.github.com/rest/overview/rate-limits-for-the-rest-api",
+          status: "403",
+        },
+        { status: 403 },
+      );
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const env = {
+    DASHBOARD_CACHE: kvStore(),
+    GITHUB_TOKEN: "shared-token",
+  };
+  try {
+    const response = await worker.fetch(new Request("https://release.bar/api/vincentkoc"), env, {
+      waitUntil: () => undefined,
+    });
+    assert.equal(response.status, 429);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.cache?.state, "error");
+    assert.equal(body.owners[0]?.login, "vincentkoc");
+    assert.deepEqual(body.projects, []);
+    assert.match(body.cache?.message ?? "", /shared API quota is exhausted/);
+    assert.doesNotMatch(body.cache?.message ?? "", /58493|documentation_url|request ID/i);
+
+    const cached = await worker.fetch(new Request("https://release.bar/api/vincentkoc"), env, {
+      waitUntil: () => undefined,
+    });
+    assert.equal(cached.status, 429);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("worker rejects oversized custom source requests", async () => {

@@ -4,12 +4,14 @@ import { dashboardRoute, validRepoSlug } from "./routing.js";
 type SortKey = "repo" | "version" | "release" | "since" | "activity" | "issues" | "prs" | "ci";
 type SortDirection = "asc" | "desc";
 
+const initialRoute = dashboardRoute(location.pathname, location.search);
+
 const state = {
   data: null as DashboardPayload | null,
   auth: null as AuthPayload | null,
   query: "",
   filter: "all" as Freshness | "all",
-  sortKey: "activity" as SortKey,
+  sortKey: (initialRoute.isDefault ? "since" : "activity") as SortKey,
   sortDirection: "desc" as SortDirection,
   devMode: localStorage.getItem("releasedeck:dev-mode") === "true",
   hiddenOwners: new Set<string>(
@@ -18,7 +20,7 @@ const state = {
   hiddenRepos: new Set<string>(
     JSON.parse(localStorage.getItem("releasedeck:hidden-repos") || "[]") as string[],
   ),
-  route: dashboardRoute(location.pathname, location.search),
+  route: initialRoute,
 };
 
 const numberFormat = new Intl.NumberFormat("en", { notation: "compact" });
@@ -67,6 +69,9 @@ function query<T extends Element>(selector: string): T {
 }
 
 function ownerLabel(data: DashboardPayload): string {
+  if (state.route.isDefault) {
+    return data.title || "ReleaseBar Hot";
+  }
   if (data.owners.length > 0) {
     const [first] = data.owners;
     const extraCount = data.owners.length - 1 + state.route.repos.length;
@@ -75,7 +80,9 @@ function ownerLabel(data: DashboardPayload): string {
   if (state.route.repos.length === 1) {
     return state.route.repos[0] ?? "custom deck";
   }
-  return state.route.repos.length > 1 ? `custom deck +${state.route.repos.length}` : "@steipete";
+  return state.route.repos.length > 1
+    ? `custom deck +${state.route.repos.length}`
+    : state.route.label;
 }
 
 function daysAgo(value: string | null): number | null {

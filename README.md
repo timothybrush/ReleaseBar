@@ -22,7 +22,7 @@ Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token
 
 ## Generic Dashboards
 
-- `/` loads the checked-in static snapshot from `data/projects.json`
+- `/` loads `ReleaseBar Hot`, a cached board built from recently requested public dashboards
 - `/:owner` loads the Worker API for that owner
 - query options: `forks=true`, `archived=true`, `unreleased=true`
 - add public sources with `owners=openclaw,steipete` or `repos=owner/name`
@@ -34,7 +34,7 @@ Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token
 - GitHub App installation gives ReleaseBar dedicated GitHub API quota for the selected account/repositories; public dashboards still fall back to the shared server token and cache
 - private orgs still need the GitHub App installed on the target account/repositories; login alone only identifies the user
 
-The Worker in `worker/index.ts` serves both the static app shell and the generic owner API. It validates public GitHub owners, builds a capped public dashboard from the 8 most recently pushed public repos, stores it in KV, serves fresh cache for 1h, and serves stale cache while revalidating. Configure `DASHBOARD_CACHE` and `GITHUB_TOKEN` before deploying the Worker. GitHub Pages builds fall back to the workers.dev API origin while DNS is still cached away from Cloudflare.
+The Worker in `worker/index.ts` serves both the static app shell and the generic owner API. It validates public GitHub owners, builds a capped public dashboard from the 8 most recently pushed public repos, stores it in KV, serves fresh cache for 1h, serves stale cache while revalidating, and builds the root hot board from existing cached dashboards. Configure `DASHBOARD_CACHE` and `GITHUB_TOKEN` before deploying the Worker. GitHub Pages builds fall back to the workers.dev API origin while DNS is still cached away from Cloudflare.
 
 ### GitHub App Login
 

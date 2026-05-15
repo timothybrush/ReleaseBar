@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added a `need attention` dashboard filter for hot and busy repositories, with the metric tile acting as a shortcut.
 - Migrated the app shell to Svelte/Vite with keyboard-accessible account dropdowns, a Cmd-K command palette, and tighter ReleaseBar-themed controls.
 - Hardened GitHub auth, cache, and rate-limit handling with validated API payloads, cached installation tokens, scoped visibility settings, and PR commit linting.
 - Raised owner dashboard builds from 8 to 200 public released repositories and made capped dashboards show the cap size.

@@ -209,13 +209,15 @@ input::placeholder {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
-.metrics div {
+.metrics div,
+.metrics .metric-action {
   min-width: 0;
   padding: 18px;
   border-right: 1px solid var(--line);
 }
 
-.metrics div:last-child {
+.metrics div:last-child,
+.metrics .metric-action:last-child {
   border-right: 0;
 }
 
@@ -230,6 +232,29 @@ input::placeholder {
   margin-top: 6px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.metric-action {
+  min-height: auto;
+  border-width: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.metric-action:hover,
+.metric-action:focus-visible,
+.metric-action.active {
+  background: rgba(156, 255, 87, 0.045);
+  color: inherit;
+  outline: 0;
+}
+
+.metric-action:hover small,
+.metric-action:focus-visible small,
+.metric-action.active small {
+  color: var(--text);
 }
 
 .filters {
@@ -290,27 +315,29 @@ button:focus-visible {
 /* Account menu */
 
 .account-button {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   width: var(--account-width);
   max-width: calc(100vw - 32px);
   flex: 0 0 auto;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
   border-color: var(--line-strong);
   padding: 0 14px;
   color: var(--text);
 }
 
 .account-label {
+  grid-column: 2;
   min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .account-caret {
-  flex: 0 0 auto;
+  grid-column: 3;
+  justify-self: end;
   width: 0;
   height: 0;
   border-top: 4px solid currentColor;
@@ -785,13 +812,20 @@ body.dev-mode .dev-only {
 }
 
 .command-key {
-  min-width: 32px;
+  display: inline-flex;
+  min-width: 46px;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
   border: 1px solid var(--line-strong);
-  border-radius: 5px;
+  border-radius: 7px;
+  padding: 0 10px;
   background: var(--panel-menu);
   color: var(--green);
-  font-size: 11px;
+  font-size: 15px;
+  line-height: 1;
   text-align: center;
+  box-shadow: inset 0 0 0 1px rgba(156, 255, 87, 0.08);
 }
 
 /* Responsive */
@@ -826,7 +860,8 @@ body.dev-mode .dev-only {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .metrics div {
+  .metrics div,
+  .metrics .metric-action {
     border-top: 1px solid var(--line);
   }
 

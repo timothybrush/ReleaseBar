@@ -13,19 +13,21 @@
 
   type SortKey = "repo" | "version" | "release" | "since" | "activity" | "issues" | "prs" | "ci";
   type SortDirection = "asc" | "desc";
+  type DashboardFilter = Freshness | "all" | "attention";
 
   const initialRoute = dashboardRoute(location.pathname, location.search);
   const routeScope = initialRoute.owner ?? "default";
   const hiddenOwnersKey = `releasedeck:${routeScope}:hidden-owners`;
   const hiddenReposKey = `releasedeck:${routeScope}:hidden-repos`;
-  const filterOptions: Array<Freshness | "all"> = ["all", "hot", "busy", "fresh"];
+  const filterOptions: DashboardFilter[] = ["all", "attention", "hot", "busy", "fresh"];
+  const attentionFreshness: Freshness[] = ["hot", "busy"];
   const sortOptions: SortKey[] = ["repo", "version", "release", "since", "activity"];
   const devSortOptions: SortKey[] = ["issues", "prs", "ci"];
 
   let data: DashboardPayload | null = null;
   let auth: AuthPayload | null = null;
   let query = "";
-  let filter: Freshness | "all" = "all";
+  let filter: DashboardFilter = "all";
   let sortKey: SortKey = initialRoute.isDefault ? "since" : "activity";
   let sortDirection: SortDirection = "desc";
   let devMode = localStorage.getItem("releasedeck:dev-mode") === "true";
@@ -51,7 +53,17 @@
 
   $: label = data ? ownerLabel(data) : initialRoute.label;
   $: subtitle = data?.subtitle ?? "Release debt across recently requested public dashboards.";
-  $: filteredProjects = data ? sortProjects(data.projects.filter(matches)) : [];
+  $: includeArchived = data?.options?.includeArchived === true;
+  $: visibleProjects = data
+    ? data.projects.filter((project) =>
+        matchesBase(project, query, hiddenOwners, hiddenRepos, includeArchived),
+      )
+    : [];
+  $: filteredProjects = sortProjects(
+    visibleProjects.filter((project) => matchesFilter(project, filter)),
+    sortKey,
+    sortDirection,
+  );
   $: ownerToggles = data
     ? [...new Set(data.projects.map((project) => project.owner.toLowerCase()))].sort()
     : [];
@@ -119,12 +131,32 @@
     return relativeFormat.format(Math.round(months / 12), "year");
   }
 
-  function matches(project: Project): boolean {
-    if (project.archived && !data?.options?.includeArchived) return false;
-    if (hiddenOwners.has(project.owner.toLowerCase())) return false;
-    if (hiddenRepos.has(project.fullName.toLowerCase())) return false;
-    if (filter !== "all" && project.freshness !== filter) return false;
-    if (!query) return true;
+  function filterLabel(value: DashboardFilter): string {
+    return value === "attention" ? "need attention" : value;
+  }
+
+  function needsAttention(project: Project): boolean {
+    return attentionFreshness.includes(project.freshness);
+  }
+
+  function matchesFilter(project: Project, value: DashboardFilter): boolean {
+    if (value === "all") return true;
+    if (value === "attention") return needsAttention(project);
+    return project.freshness === value;
+  }
+
+  function matchesBase(
+    project: Project,
+    searchQuery: string,
+    hiddenOwnerSet: Set<string>,
+    hiddenRepoSet: Set<string>,
+    includeArchived: boolean,
+  ): boolean {
+    if (project.archived && !includeArchived) return false;
+    if (hiddenOwnerSet.has(project.owner.toLowerCase())) return false;
+    if (hiddenRepoSet.has(project.fullName.toLowerCase())) return false;
+    const normalizedQuery = searchQuery.trim().toLowerCase();
+    if (!normalizedQuery) return true;
     const haystack = [
       project.fullName,
       project.description,
@@ -137,7 +169,7 @@
       .filter(Boolean)
       .join(" ")
       .toLowerCase();
-    return haystack.includes(query);
+    return haystack.includes(normalizedQuery);
   }
 
   function persistVisibility(nextOwners = hiddenOwners, nextRepos = hiddenRepos): void {
@@ -269,11 +301,15 @@
     }
   }
 
-  function sortProjects(projects: Project[]): Project[] {
-    const direction = sortDirection === "asc" ? 1 : -1;
+  function sortProjects(
+    projects: Project[],
+    activeSortKey: SortKey,
+    activeSortDirection: SortDirection,
+  ): Project[] {
+    const direction = activeSortDirection === "asc" ? 1 : -1;
     return [...projects].sort((a, b) => {
-      const aValue = sortValue(a, sortKey);
-      const bValue = sortValue(b, sortKey);
+      const aValue = sortValue(a, activeSortKey);
+      const bValue = sortValue(b, activeSortKey);
       if (typeof aValue === "string" && typeof bValue === "string") {
         return aValue.localeCompare(bValue) * direction;
       }
@@ -396,13 +432,13 @@
     };
   }
 
-  function filterCommand(value: Freshness | "all"): CommandAction {
+  function filterCommand(value: DashboardFilter): CommandAction {
     return {
       actionId: `filter:${value}`,
-      title: `Show ${value}`,
+      title: `Show ${filterLabel(value)}`,
       subTitle: filter === value ? "current filter" : "filter dashboard",
       group: "View",
-      keywords: ["filter", value],
+      keywords: ["filter", value, filterLabel(value)],
       onRun: () => {
         filter = value;
       },
@@ -486,7 +522,7 @@
     devEnabled: boolean,
     activeSortKey: SortKey,
     activeSortDirection: SortDirection,
-    activeFilter: Freshness | "all",
+    activeFilter: DashboardFilter,
     currentSettingsSummary: string,
   ): CommandAction[] {
     const rawTyped = typedText.trim();
@@ -748,36 +784,38 @@
     </div>
     <div class="metrics">
       <div>
-        <span>{numberFormat.format(filteredProjects.length)}</span>
+        <span>{numberFormat.format(visibleProjects.length)}</span>
         <small>repos</small>
       </div>
       <div>
-        <span>{numberFormat.format(filteredProjects.filter((project) => project.releaseDate).length)}</span>
+        <span>{numberFormat.format(visibleProjects.filter((project) => project.releaseDate).length)}</span>
         <small>released</small>
       </div>
       <div>
         <span>
           {numberFormat.format(
-            filteredProjects.reduce((sum, project) => sum + (project.commitsSinceRelease || 0), 0),
+            visibleProjects.reduce((sum, project) => sum + (project.commitsSinceRelease || 0), 0),
           )}
         </span>
         <small>commits since release</small>
       </div>
-      <div>
-        <span>
-          {numberFormat.format(
-            filteredProjects.filter((project) => ["hot", "busy"].includes(project.freshness)).length,
-          )}
-        </span>
+      <button
+        class="metric-action"
+        class:active={filter === "attention"}
+        type="button"
+        aria-pressed={filter === "attention"}
+        onclick={() => (filter = filter === "attention" ? "all" : "attention")}
+      >
+        <span>{numberFormat.format(visibleProjects.filter(needsAttention).length)}</span>
         <small>need attention</small>
-      </div>
+      </button>
     </div>
   </section>
 
   <nav class="filters" aria-label="Filters">
     {#each filterOptions as option}
       <button class:active={filter === option} type="button" onclick={() => (filter = option)}>
-        {option}
+        {filterLabel(option)}
       </button>
     {/each}
     <label class="dev-toggle">

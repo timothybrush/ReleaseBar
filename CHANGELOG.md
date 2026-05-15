@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Hardened GitHub auth, cache, and rate-limit handling with validated API payloads, cached installation tokens, scoped visibility settings, and PR commit linting.
 - Raised owner dashboard builds from 8 to 200 public released repositories and made capped dashboards show the cap size.
 - Filtered GitHub App selected repositories to public repos before auth state, coverage checks, or dashboards can use them.
 - Fixed GitHub App install redirects to use the real `releasebar-app` app slug while keeping `release.bar` OAuth callbacks.

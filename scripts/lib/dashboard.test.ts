@@ -7,6 +7,7 @@ import {
   dashboardCacheKey,
   filterRepo,
   freshness,
+  GitHubRateLimitError,
   normalizeBuildOptions,
   validOwnerSlug,
   validRepoSlug,
@@ -717,6 +718,169 @@ test("worker uses GitHub App installation token for cold owner dashboards", asyn
   }
 });
 
+test("worker logout deletes the stored session and clears the cookie", async () => {
+  const sessionId = "session-logout";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "octocat",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/octocat",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+  });
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: cache,
+    GITHUB_APP_CLIENT_ID: "Iv123",
+    GITHUB_APP_CLIENT_SECRET: "client-secret",
+    GITHUB_APP_SLUG: "releasebar-app",
+  };
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/auth/logout?returnTo=/openclaw", {
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    env,
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 302);
+  assert.equal(response.headers.get("location"), "/openclaw");
+  assert.match(response.headers.get("set-cookie") ?? "", /rd_session=;.*Max-Age=0/);
+  assert.equal(await cache.get(`auth:session:${sessionId}`), null);
+});
+
+test("worker login returns 503 when GitHub App is not configured", async () => {
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/auth/login"),
+    { DASHBOARD_CACHE: kvStore() },
+    { waitUntil: () => undefined },
+  );
+  assert.equal(response.status, 503);
+});
+
+test("safeReturnTo accepts the current request origin, including workers.dev", async () => {
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: kvStore(),
+    GITHUB_APP_CLIENT_ID: "Iv123",
+    GITHUB_APP_CLIENT_SECRET: "client-secret",
+    GITHUB_APP_SLUG: "releasebar-app",
+  };
+  const ctx = { waitUntil: () => undefined };
+
+  const workersDevLogin = await worker.fetch(
+    new Request(
+      "https://releasedeck-api.steipete.workers.dev/api/auth/login?returnTo=https%3A%2F%2Freleasedeck-api.steipete.workers.dev%2Fopenclaw",
+    ),
+    env,
+    ctx,
+  );
+  assert.equal(workersDevLogin.status, 302);
+  assert.match(
+    workersDevLogin.headers.get("location") ?? "",
+    /redirect_uri=https%3A%2F%2Freleasedeck-api.steipete.workers.dev%2Fapi%2Fauth%2Fcallback/,
+  );
+
+  const evilOriginLogout = await worker.fetch(
+    new Request(
+      "https://release.bar/api/auth/logout?returnTo=https%3A%2F%2Fevil.example.com%2Fattack",
+    ),
+    env,
+    ctx,
+  );
+  assert.equal(evilOriginLogout.headers.get("location"), "/");
+});
+
+test("worker reuses cached installation tokens across requests", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs1", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const sessionId = "session-token-cache";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: kvStore({
+      [`auth:session:${sessionId}`]: JSON.stringify({
+        user: {
+          id: 1,
+          login: "octocat",
+          name: null,
+          avatarUrl: "https://avatars.githubusercontent.com/u/1",
+          url: "https://github.com/octocat",
+        },
+        accessToken: "user-token",
+        iat: exp - 600,
+        exp,
+      }),
+    }),
+    GITHUB_APP_CLIENT_ID: "Iv123",
+    GITHUB_APP_CLIENT_SECRET: "client-secret",
+    GITHUB_APP_ID: "123",
+    GITHUB_APP_PRIVATE_KEY: privateKey,
+    GITHUB_APP_SLUG: "releasebar-app",
+  };
+  const originalFetch = globalThis.fetch;
+  let tokenMintCount = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/user/installations") {
+      return Response.json({
+        installations: [
+          {
+            id: 1,
+            account: {
+              login: "openclaw",
+              type: "Organization",
+              avatar_url: "https://avatars.githubusercontent.com/u/2",
+              html_url: "https://github.com/openclaw",
+            },
+            html_url: "https://github.com/organizations/openclaw/settings/installations/1",
+            repository_selection: "all",
+            target_type: "Organization",
+          },
+        ],
+      });
+    }
+    if (url.pathname === "/app/installations/1/access_tokens") {
+      tokenMintCount += 1;
+      return Response.json({ token: "installation-token" });
+    }
+    if (url.pathname === "/users/openclaw") {
+      return Response.json({ login: "openclaw", type: "Organization" });
+    }
+    if (url.pathname === "/orgs/openclaw/repos") {
+      return Response.json([]);
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const headers = { cookie: `rd_session=${authCookie}` };
+    await worker.fetch(new Request("https://release.bar/api/openclaw", { headers }), env, {
+      waitUntil: () => undefined,
+    });
+    await worker.fetch(
+      new Request("https://release.bar/api/openclaw?archived=true", { headers }),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(tokenMintCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("query options are explicit booleans", () => {
   assert.deepEqual(optionsFromSearch("?forks=true&archived=false&unreleased=true"), {
     includeForks: true,
@@ -866,6 +1030,83 @@ test("dashboard build skips empty unreleased repositories without failing", asyn
   });
 
   assert.equal(payload.totals.repos, 0);
+});
+
+test("dashboard build treats ignored 403 check-run rate limits as quota errors", async () => {
+  await assert.rejects(
+    buildDashboard({
+      title: "ReleaseBar",
+      subtitle: "test",
+      canonicalDomain: "example.com",
+      owners: [{ type: "user", login: "owner" }],
+      includeForks: false,
+      includeArchived: false,
+      fetch: async (url) => {
+        const path = new URL(String(url)).pathname;
+        if (path === "/users/owner/repos") {
+          return Response.json([
+            {
+              owner: { login: "owner" },
+              name: "repo",
+              full_name: "owner/repo",
+              description: null,
+              html_url: "https://github.com/owner/repo",
+              default_branch: "main",
+              language: null,
+              stargazers_count: 0,
+              forks_count: 0,
+              open_issues_count: 0,
+              archived: false,
+              pushed_at: null,
+              updated_at: null,
+              fork: false,
+              private: false,
+            },
+          ]);
+        }
+        if (path === "/repos/owner/repo/releases") {
+          return Response.json([
+            {
+              tag_name: "v1.0.0",
+              name: null,
+              html_url: "https://github.com/owner/repo/releases/v1.0.0",
+              draft: false,
+              published_at: "2026-01-01T00:00:00Z",
+            },
+          ]);
+        }
+        if (path === "/repos/owner/repo/commits/main") {
+          return Response.json({
+            sha: "abcdef123456",
+            commit: { committer: { date: "2026-01-02T00:00:00Z" } },
+          });
+        }
+        if (path === "/repos/owner/repo/compare/v1.0.0...main") {
+          return Response.json({
+            total_commits: 0,
+            html_url: "https://github.com/owner/repo/compare/v1.0.0...main",
+          });
+        }
+        if (path === "/repos/owner/repo/pulls") {
+          return Response.json([]);
+        }
+        if (path === "/repos/owner/repo/commits/abcdef123456/check-runs") {
+          return Response.json(
+            { message: "API rate limit exceeded" },
+            {
+              status: 403,
+              headers: {
+                "x-ratelimit-remaining": "0",
+                "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 60),
+              },
+            },
+          );
+        }
+        throw new Error(`unexpected ${path}`);
+      },
+    }),
+    GitHubRateLimitError,
+  );
 });
 
 test("dashboard build can add explicit public repositories without an owner scan", async () => {

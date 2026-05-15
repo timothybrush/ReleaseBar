@@ -5,6 +5,9 @@ type SortKey = "repo" | "version" | "release" | "since" | "activity" | "issues" 
 type SortDirection = "asc" | "desc";
 
 const initialRoute = dashboardRoute(location.pathname, location.search);
+const routeScope = initialRoute.owner ?? "default";
+const hiddenOwnersKey = `releasedeck:${routeScope}:hidden-owners`;
+const hiddenReposKey = `releasedeck:${routeScope}:hidden-repos`;
 
 const state = {
   data: null as DashboardPayload | null,
@@ -15,10 +18,10 @@ const state = {
   sortDirection: "desc" as SortDirection,
   devMode: localStorage.getItem("releasedeck:dev-mode") === "true",
   hiddenOwners: new Set<string>(
-    JSON.parse(localStorage.getItem("releasedeck:hidden-owners") || "[]") as string[],
+    JSON.parse(localStorage.getItem(hiddenOwnersKey) || "[]") as string[],
   ),
   hiddenRepos: new Set<string>(
-    JSON.parse(localStorage.getItem("releasedeck:hidden-repos") || "[]") as string[],
+    JSON.parse(localStorage.getItem(hiddenReposKey) || "[]") as string[],
   ),
   route: initialRoute,
 };
@@ -130,8 +133,8 @@ function matches(project: Project): boolean {
 }
 
 function persistVisibility(): void {
-  localStorage.setItem("releasedeck:hidden-owners", JSON.stringify([...state.hiddenOwners]));
-  localStorage.setItem("releasedeck:hidden-repos", JSON.stringify([...state.hiddenRepos]));
+  localStorage.setItem(hiddenOwnersKey, JSON.stringify([...state.hiddenOwners]));
+  localStorage.setItem(hiddenReposKey, JSON.stringify([...state.hiddenRepos]));
 }
 
 function addSource(value: string): void {

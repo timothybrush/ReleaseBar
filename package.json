@@ -16,6 +16,9 @@
     "test": "npm run build:script && node node_modules/.cache/releasedeck-build/scripts/lib/dashboard.test.js",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "valibot": "^1.4.0"
+  },
   "devDependencies": {
     "@types/node": "^25.8.0",
     "oxfmt": "^0.49.0",

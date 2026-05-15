@@ -1,11 +1,26 @@
 import {
   buildDashboard,
   dashboardCacheKey,
+  GitHubRateLimitError,
   resolveOwnerType,
   slugOwner,
   validOwnerSlug,
   validRepoSlug,
 } from "../scripts/lib/dashboard.js";
+import type { GenericSchema, InferOutput } from "valibot";
+import {
+  gitHubInstallationListSchema,
+  gitHubInstallationRepositoryListSchema,
+  gitHubInstallationTokenSchema,
+  gitHubOAuthTokenSchema,
+  gitHubOAuthUserSchema,
+  hotIndexSchema,
+  parseGitHubResponse,
+  safeJsonParse,
+  storedAuthSessionSchema,
+  tryJsonParse,
+  type GitHubInstallationRepository,
+} from "./schemas.js";
 import type {
   AuthInstallation,
   AuthPayload,
@@ -45,6 +60,7 @@ type ExecutionContext = {
 
 const fullTtlMs = 60 * 60 * 1000;
 const staleTtlSeconds = 3 * 24 * 60 * 60;
+const installationTokenTtlSeconds = 50 * 60;
 const coldBuildWaitMs = 15 * 1000;
 const repoLimit = 200;
 const hotLimit = 50;
@@ -97,58 +113,12 @@ type StoredAuthSession = {
   exp: number;
 };
 
-type GitHubOAuthToken = {
-  access_token?: string;
-  error?: string;
-  error_description?: string;
-};
-
-type GitHubOAuthUser = {
-  id: number;
-  login: string;
-  name: string | null;
-  avatar_url: string;
-  html_url: string;
-};
-
-type GitHubInstallation = {
-  id: number;
-  account: {
-    login: string;
-    avatar_url: string;
-    html_url: string;
-    type: string;
-  } | null;
-  html_url: string;
-  repository_selection: "all" | "selected";
-  target_type: string;
-};
-
-type GitHubInstallationList = {
-  installations?: GitHubInstallation[];
-};
-
-type GitHubInstallationRepository = {
-  full_name: string;
-  private?: boolean;
-  visibility?: string;
-};
-
-type GitHubInstallationRepositoryList = {
-  repositories?: GitHubInstallationRepository[];
-};
-
 function isPublicInstallationRepository(repo: GitHubInstallationRepository): boolean {
   if (repo.private === true) {
     return false;
   }
   return repo.private === false || repo.visibility === "public";
 }
-
-type GitHubInstallationToken = {
-  token?: string;
-  message?: string;
-};
 
 type TokenSources = {
   owners: string[];
@@ -235,11 +205,11 @@ function randomNonce(): string {
   return base64Url(bytes);
 }
 
-function safeReturnTo(value: string | null): string {
+function safeReturnTo(value: string | null, origin: string): string {
   if (!value || value.startsWith("//")) return "/";
   try {
-    const url = new URL(value, "https://release.bar");
-    if (url.origin !== "https://release.bar") return "/";
+    const url = new URL(value, origin);
+    if (url.origin !== origin) return "/";
     return `${url.pathname}${url.search}${url.hash}`;
   } catch {
     return "/";
@@ -305,7 +275,8 @@ async function currentSession(request: Request, env: Env): Promise<StoredAuthSes
 
   const stored = await env.DASHBOARD_CACHE?.get(`auth:session:${pointer.id}`);
   if (stored) {
-    const session = JSON.parse(stored) as StoredAuthSession;
+    const session = safeJsonParse(storedAuthSessionSchema, stored, "auth session");
+    if (!session) return null;
     return session.exp < Math.floor(Date.now() / 1000) ? null : session;
   }
 
@@ -519,7 +490,7 @@ async function meResponse(request: Request, env: Env): Promise<Response> {
 
 function currentReturnTo(url: URL): string {
   const value = url.searchParams.get("returnTo");
-  return safeReturnTo(value) || "/";
+  return safeReturnTo(value, url.origin) || "/";
 }
 
 async function loginResponse(request: Request, env: Env): Promise<Response> {
@@ -530,7 +501,7 @@ async function loginResponse(request: Request, env: Env): Promise<Response> {
   }
   const url = new URL(request.url);
   const state = await signedJson(env.AUTH_COOKIE_SECRET, {
-    returnTo: safeReturnTo(url.searchParams.get("returnTo")),
+    returnTo: safeReturnTo(url.searchParams.get("returnTo"), url.origin),
     iat: Math.floor(Date.now() / 1000),
     nonce: randomNonce(),
   });
@@ -565,7 +536,7 @@ async function exchangeCode(url: URL, env: Env): Promise<string> {
       redirect_uri: `${url.origin}/api/auth/callback`,
     }),
   });
-  const token = (await response.json()) as GitHubOAuthToken;
+  const token = parseGitHubResponse(gitHubOAuthTokenSchema, await response.json(), "oauth token");
   if (!response.ok || !token.access_token) {
     throw new Error(token.error_description || token.error || "GitHub OAuth exchange failed");
   }
@@ -584,7 +555,7 @@ async function githubUser(accessToken: string): Promise<AuthUser> {
   if (!response.ok) {
     throw new Error(`GitHub user lookup failed: ${response.status}`);
   }
-  const user = (await response.json()) as GitHubOAuthUser;
+  const user = parseGitHubResponse(gitHubOAuthUserSchema, await response.json(), "oauth user");
   return {
     id: user.id,
     login: user.login,
@@ -594,7 +565,12 @@ async function githubUser(accessToken: string): Promise<AuthUser> {
   };
 }
 
-async function githubJson<T>(accessToken: string, pathname: string): Promise<T> {
+async function githubJson<TSchema extends GenericSchema>(
+  accessToken: string,
+  pathname: string,
+  schema: TSchema,
+  context: string,
+): Promise<InferOutput<TSchema>> {
   const response = await workerFetch(`https://api.github.com${pathname}`, {
     headers: {
       accept: "application/vnd.github+json",
@@ -606,13 +582,15 @@ async function githubJson<T>(accessToken: string, pathname: string): Promise<T> 
   if (!response.ok) {
     throw new Error(`GitHub request failed: ${response.status}`);
   }
-  return (await response.json()) as T;
+  return parseGitHubResponse(schema, await response.json(), context);
 }
 
 async function githubInstallations(accessToken: string): Promise<AuthInstallation[]> {
-  const result = await githubJson<GitHubInstallationList>(
+  const result = await githubJson(
     accessToken,
     "/user/installations?per_page=100",
+    gitHubInstallationListSchema,
+    "installation list",
   );
   const installations = result.installations ?? [];
   return Promise.all(
@@ -646,9 +624,11 @@ async function githubInstallationRepositories(
 ): Promise<string[]> {
   const repositories: string[] = [];
   for (let page = 1; page <= 10; page += 1) {
-    const result = await githubJson<GitHubInstallationRepositoryList>(
+    const result = await githubJson(
       accessToken,
       `/user/installations/${installationId}/repositories?per_page=100&page=${page}`,
+      gitHubInstallationRepositoryListSchema,
+      "installation repositories",
     );
     const batch = result.repositories ?? [];
     repositories.push(
@@ -765,7 +745,11 @@ async function githubInstallationToken(env: Env, installationId: number): Promis
       },
     },
   );
-  const result = (await response.json()) as GitHubInstallationToken;
+  const result = parseGitHubResponse(
+    gitHubInstallationTokenSchema,
+    await response.json(),
+    "installation token",
+  );
   if (!response.ok || !result.token) {
     throw new Error(result.message || `GitHub installation token failed: ${response.status}`);
   }
@@ -803,6 +787,19 @@ function matchingInstallation(
   );
 }
 
+async function cachedInstallationToken(env: Env, installationId: number): Promise<string | null> {
+  const cacheKey = `auth:installation-token:${installationId}`;
+  const cached = await env.DASHBOARD_CACHE?.get(cacheKey);
+  if (cached) return cached;
+  const token = await githubInstallationToken(env, installationId);
+  if (token) {
+    await env.DASHBOARD_CACHE?.put(cacheKey, token, {
+      expirationTtl: installationTokenTtlSeconds,
+    });
+  }
+  return token;
+}
+
 async function requestInstallationToken(
   request: Request,
   env: Env,
@@ -813,7 +810,7 @@ async function requestInstallationToken(
   if (!session) return null;
   const installations = await githubInstallations(session.accessToken);
   const installation = matchingInstallation(installations, sources);
-  return installation ? githubInstallationToken(env, installation.id) : null;
+  return installation ? cachedInstallationToken(env, installation.id) : null;
 }
 
 function sourceAccounts(sources: TokenSources): string[] {
@@ -976,7 +973,7 @@ async function logoutResponse(request: Request, env: Env): Promise<Response> {
       await env.DASHBOARD_CACHE?.delete?.(`auth:session:${session.id}`);
     }
   }
-  return redirectResponse(safeReturnTo(url.searchParams.get("returnTo")), {
+  return redirectResponse(safeReturnTo(url.searchParams.get("returnTo"), url.origin), {
     "set-cookie": authCookie("", 0),
   });
 }
@@ -1000,7 +997,7 @@ async function installResponse(request: Request, env: Env): Promise<Response> {
   }
 
   const state = await signedJson(env.AUTH_COOKIE_SECRET, {
-    returnTo: safeReturnTo(url.searchParams.get("returnTo")),
+    returnTo: safeReturnTo(url.searchParams.get("returnTo"), url.origin),
     iat: Math.floor(Date.now() / 1000),
     nonce: randomNonce(),
   });
@@ -1052,9 +1049,21 @@ function errorMessage(error: unknown): string {
 }
 
 function isGitHubRateLimit(error: unknown): boolean {
+  if (error instanceof GitHubRateLimitError) return true;
   return /rate limit|secondary rate|api rate limit exceeded|shared api quota|quota .*exhausted/i.test(
     errorMessage(error),
   );
+}
+
+function retryAfterSeconds(error: unknown): number | null {
+  return error instanceof GitHubRateLimitError ? error.retryAfterSeconds : null;
+}
+
+function retryAfterHeaders(error: unknown): Record<string, string> {
+  const seconds = retryAfterSeconds(error);
+  return seconds === null
+    ? { "cache-control": "no-store" }
+    : { "cache-control": "no-store", "retry-after": String(seconds) };
 }
 
 function dashboardErrorMessage(error: unknown): string {
@@ -1076,7 +1085,7 @@ function errorStatus(error: unknown): number {
 
 async function readCached(env: Env, key: string): Promise<DashboardPayload | null> {
   const raw = await env.DASHBOARD_CACHE?.get(key);
-  return raw ? (JSON.parse(raw) as DashboardPayload) : null;
+  return raw ? tryJsonParse<DashboardPayload>(raw, `dashboard ${key}`) : null;
 }
 
 async function writeCached(
@@ -1128,19 +1137,16 @@ async function readCachedDashboards(env: Env): Promise<DashboardPayload[]> {
   for (const key of keys.slice(0, hotSourceLimit)) {
     const raw = await env.DASHBOARD_CACHE.get(key);
     if (!raw) continue;
-    try {
-      const payload = JSON.parse(raw) as DashboardPayload;
-      if (
-        payload.cache?.state === "error" ||
-        payload.options?.includeForks ||
-        payload.projects.length === 0
-      ) {
-        continue;
-      }
-      dashboards.push(payload);
-    } catch {
+    const payload = tryJsonParse<DashboardPayload>(raw, `dashboard ${key}`);
+    if (!payload) continue;
+    if (
+      payload.cache?.state === "error" ||
+      payload.options?.includeForks ||
+      payload.projects.length === 0
+    ) {
       continue;
     }
+    dashboards.push(payload);
   }
 
   return dashboards;
@@ -1149,16 +1155,8 @@ async function readCachedDashboards(env: Env): Promise<DashboardPayload[]> {
 async function readHotIndex(env: Env): Promise<string[]> {
   const raw = await env.DASHBOARD_CACHE?.get(hotIndexKey);
   if (!raw) return [];
-  try {
-    const keys = JSON.parse(raw) as unknown;
-    return Array.isArray(keys)
-      ? keys.filter(
-          (key): key is string => typeof key === "string" && key.startsWith(dashboardCachePrefix),
-        )
-      : [];
-  } catch {
-    return [];
-  }
+  const keys = safeJsonParse(hotIndexSchema, raw, "hot index");
+  return keys ? keys.filter((key) => key.startsWith(dashboardCachePrefix)) : [];
 }
 
 async function rememberHotDashboard(
@@ -1428,9 +1426,7 @@ async function ownerResponse(
     const dashboard = unresolvedDashboardRequest(ownerSlugs, includeRepos, key, url);
     const payload = errorPayload(dashboard, env, dashboardErrorMessage(error));
     await writeCached(env, key, payload, 5 * 60);
-    return jsonResponse(payload, errorStatus(error), {
-      "cache-control": "no-store",
-    });
+    return jsonResponse(payload, errorStatus(error), retryAfterHeaders(error));
   }
   if (!owners) {
     return jsonResponse({ error: "owner not found" }, 404, {
@@ -1457,9 +1453,7 @@ async function ownerResponse(
   } catch (error) {
     const payload = errorPayload(dashboard, env, dashboardErrorMessage(error));
     await writeCached(env, key, payload, 5 * 60);
-    return jsonResponse(payload, errorStatus(error), {
-      "cache-control": "no-store",
-    });
+    return jsonResponse(payload, errorStatus(error), retryAfterHeaders(error));
   }
 }
 

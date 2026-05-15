@@ -95,6 +95,35 @@ type GitHubClient = {
   headers: Record<string, string>;
 };
 
+export class GitHubRateLimitError extends Error {
+  readonly retryAfterSeconds: number | null;
+  constructor(message: string, retryAfterSeconds: number | null) {
+    super(message);
+    this.name = "GitHubRateLimitError";
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+function rateLimitFromResponse(response: Response, pathname: string): GitHubRateLimitError | null {
+  const remaining = response.headers.get("x-ratelimit-remaining");
+  const retryAfter = response.headers.get("retry-after");
+  const isRateLimited =
+    response.status === 429 ||
+    (response.status === 403 && remaining === "0") ||
+    retryAfter !== null;
+  if (!isRateLimited) return null;
+  const reset = response.headers.get("x-ratelimit-reset");
+  const retryAfterSeconds = retryAfter
+    ? Number(retryAfter)
+    : reset
+      ? Math.max(0, Number(reset) - Math.floor(Date.now() / 1000))
+      : null;
+  return new GitHubRateLimitError(
+    `GitHub rate limit hit for ${pathname}`,
+    Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : null,
+  );
+}
+
 export function normalizeBuildOptions(
   config: ReleaseBarConfig,
   overrides: Partial<DashboardBuildOptions> = {},
@@ -205,6 +234,8 @@ async function github<T>(
   const response = await client.fetch(`https://api.github.com${pathname}`, {
     headers: client.headers,
   });
+  const rateLimit = rateLimitFromResponse(response, pathname);
+  if (rateLimit) throw rateLimit;
   if (ignoreStatuses.includes(response.status)) {
     return null;
   }
@@ -246,6 +277,8 @@ async function githubCount(client: GitHubClient, pathname: string): Promise<numb
     return 0;
   }
   if (!response.ok) {
+    const rateLimit = rateLimitFromResponse(response, pathname);
+    if (rateLimit) throw rateLimit;
     const body = await response.text();
     throw new Error(`GitHub API ${response.status} for ${pathname}: ${body.slice(0, 500)}`);
   }

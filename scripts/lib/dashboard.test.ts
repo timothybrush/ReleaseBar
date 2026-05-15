@@ -99,7 +99,7 @@ test("worker exposes GitHub App auth endpoints", async () => {
     DASHBOARD_CACHE: kvStore(),
     GITHUB_APP_CLIENT_ID: "Iv123",
     GITHUB_APP_CLIENT_SECRET: "client-secret",
-    GITHUB_APP_SLUG: "releasedeck",
+    GITHUB_APP_SLUG: "releasebar",
   };
   const context = { waitUntil: () => undefined };
 
@@ -115,7 +115,7 @@ test("worker exposes GitHub App auth endpoints", async () => {
     loginUrl: "https://release.bar/api/auth/login",
     logoutUrl: "https://release.bar/api/auth/logout",
     installUrl: "https://release.bar/api/auth/install",
-    appUrl: "https://github.com/apps/releasedeck",
+    appUrl: "https://github.com/apps/releasebar",
   });
 
   const login = await worker.fetch(
@@ -144,7 +144,7 @@ test("worker exposes GitHub App auth endpoints", async () => {
   assert.equal(install.status, 302);
   assert.equal(
     install.headers.get("location"),
-    "https://github.com/apps/releasedeck/installations/new",
+    "https://github.com/apps/releasebar/installations/new",
   );
 });
 

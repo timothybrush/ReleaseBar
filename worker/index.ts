@@ -34,6 +34,7 @@ const corsHeaders = {
   "access-control-allow-methods": "GET, OPTIONS",
   "access-control-allow-headers": "content-type",
 };
+const workerFetch: typeof fetch = (input, init) => fetch(input, init);
 
 function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body, null, 2), {
@@ -104,7 +105,7 @@ async function rebuild(owner: Owner, env: Env, key: string, url: URL): Promise<D
       ...optionsFromUrl(url),
       repoLimit,
       token: env.GITHUB_TOKEN,
-      fetch,
+      fetch: workerFetch,
     });
     await writeCached(env, key, payload);
     return payload;
@@ -225,7 +226,7 @@ async function ownerResponse(
   let resolvedOwner: Owner | null;
   try {
     resolvedOwner = await resolveOwnerType(owner, {
-      fetch,
+      fetch: workerFetch,
       token: env.GITHUB_TOKEN,
     });
   } catch (error) {

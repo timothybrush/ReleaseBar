@@ -478,6 +478,96 @@ test("worker reports GitHub App installation coverage for signed-in users", asyn
   }
 });
 
+test("worker only exposes public selected installation repositories", async () => {
+  const sessionId = "session-public-repos";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: kvStore({
+      [`auth:session:${sessionId}`]: JSON.stringify({
+        user: {
+          id: 1,
+          login: "octocat",
+          name: null,
+          avatarUrl: "https://avatars.githubusercontent.com/u/1",
+          url: "https://github.com/octocat",
+        },
+        accessToken: "user-token",
+        iat: exp - 600,
+        exp,
+      }),
+    }),
+    GITHUB_APP_CLIENT_ID: "Iv123",
+    GITHUB_APP_CLIENT_SECRET: "client-secret",
+    GITHUB_APP_ID: "123",
+    GITHUB_APP_PRIVATE_KEY: "private-key",
+    GITHUB_APP_SLUG: "releasebar-app",
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/user/installations") {
+      return Response.json({
+        installations: [
+          {
+            id: 1,
+            account: {
+              login: "steipete",
+              type: "User",
+              avatar_url: "https://avatars.githubusercontent.com/u/58493",
+              html_url: "https://github.com/steipete",
+            },
+            html_url: "https://github.com/settings/installations/1",
+            repository_selection: "selected",
+            target_type: "User",
+          },
+        ],
+      });
+    }
+    if (url.pathname === "/user/installations/1/repositories") {
+      return Response.json({
+        repositories: [
+          {
+            full_name: "steipete/public-repo",
+            private: false,
+            visibility: "public",
+          },
+          {
+            full_name: "steipete/private-repo",
+            private: true,
+            visibility: "private",
+          },
+          {
+            full_name: "steipete/contradictory-private-repo",
+            private: true,
+            visibility: "public",
+          },
+        ],
+      });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request(
+        `https://release.bar/api/me?returnTo=${encodeURIComponent("/?repos=steipete/public-repo")}`,
+        {
+          headers: { cookie: `rd_session=${authCookie}` },
+        },
+      ),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.deepEqual(body.installations[0].repositories, ["steipete/public-repo"]);
+    assert.equal(body.installNeeded, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("worker surfaces mixed-account dashboards as shared-quota", async () => {
   const sessionId = "session-2";
   const exp = Math.floor(Date.now() / 1000) + 600;
@@ -843,6 +933,49 @@ test("dashboard build can add explicit public repositories without an owner scan
 
   assert.equal(payload.totals.repos, 1);
   assert.equal(payload.projects[0]?.fullName, "other/repo");
+});
+
+test("dashboard build ignores explicit private repositories", async () => {
+  let releaseFetched = false;
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [],
+    includeForks: false,
+    includeArchived: false,
+    includeRepos: ["other/private"],
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      if (path === "/repos/other/private") {
+        return Response.json({
+          owner: { login: "other" },
+          name: "private",
+          full_name: "other/private",
+          description: null,
+          html_url: "https://github.com/other/private",
+          default_branch: "main",
+          language: null,
+          stargazers_count: 0,
+          forks_count: 0,
+          open_issues_count: 0,
+          archived: false,
+          pushed_at: null,
+          updated_at: null,
+          fork: false,
+          private: true,
+        });
+      }
+      if (path === "/repos/other/private/releases") {
+        releaseFetched = true;
+        return Response.json([]);
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+  });
+
+  assert.equal(payload.totals.repos, 0);
+  assert.equal(releaseFetched, false);
 });
 
 test("dashboard cache cap only marks omitted repos as capped", async () => {

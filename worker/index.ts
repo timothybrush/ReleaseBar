@@ -128,9 +128,22 @@ type GitHubInstallationList = {
   installations?: GitHubInstallation[];
 };
 
-type GitHubInstallationRepositoryList = {
-  repositories?: Array<{ full_name: string }>;
+type GitHubInstallationRepository = {
+  full_name: string;
+  private?: boolean;
+  visibility?: string;
 };
+
+type GitHubInstallationRepositoryList = {
+  repositories?: GitHubInstallationRepository[];
+};
+
+function isPublicInstallationRepository(repo: GitHubInstallationRepository): boolean {
+  if (repo.private === true) {
+    return false;
+  }
+  return repo.private === false || repo.visibility === "public";
+}
 
 type GitHubInstallationToken = {
   token?: string;
@@ -638,7 +651,9 @@ async function githubInstallationRepositories(
       `/user/installations/${installationId}/repositories?per_page=100&page=${page}`,
     );
     const batch = result.repositories ?? [];
-    repositories.push(...batch.map((repo) => repo.full_name.toLowerCase()));
+    repositories.push(
+      ...batch.filter(isPublicInstallationRepository).map((repo) => repo.full_name.toLowerCase()),
+    );
     if (batch.length < 100) break;
   }
   return repositories;

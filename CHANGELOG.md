@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Filtered GitHub App selected repositories to public repos before auth state, coverage checks, or dashboards can use them.
 - Fixed GitHub App install redirects to use the real `releasebar-app` app slug while keeping `release.bar` OAuth callbacks.
 - Changed the root dashboard to `ReleaseBar Hot`, built from cached public dashboards instead of the maintainer snapshot.
 - Replaced raw GitHub rate-limit failures with dashboard-shaped quota guidance.

@@ -34,7 +34,7 @@ Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token
 - GitHub App login uses `/api/auth/login`, `/api/auth/callback`, `/api/auth/install`, `/api/auth/logout`, and `/api/me`
 - `Connect GitHub` signs the user in, checks GitHub App installations, and sends them to install the app when the current dashboard source is not covered
 - GitHub App installation gives ReleaseBar dedicated GitHub API quota for the selected account/repositories; public dashboards still fall back to the shared server token and cache
-- private orgs still need the GitHub App installed on the target account/repositories; login alone only identifies the user
+- private repositories are ignored even when selected in GitHub App installation; ReleaseBar only stores and renders public repository metadata
 
 The Worker in `worker/index.ts` serves both the static app shell and the generic owner API. It validates public GitHub owners, builds a capped public dashboard from the 8 most recently pushed public repos, stores it in KV, serves fresh cache for 1h, serves stale cache while revalidating, and builds the root hot board from existing cached dashboards. Configure `DASHBOARD_CACHE` and `GITHUB_TOKEN` before deploying the Worker. GitHub Pages builds fall back to the workers.dev API origin while DNS is still cached away from Cloudflare.
 

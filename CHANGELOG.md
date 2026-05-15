@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added Worker static-asset hosting so owner routes can return the app shell with HTTP 200 once the domain is proxied through Cloudflare.
 - Added route-aware owner dashboards, local visibility settings, and a cached Worker API for generic public GitHub dashboards.
 - Added favicon and social preview card assets.
 - Prevented cached dashboard data from showing archived repositories.

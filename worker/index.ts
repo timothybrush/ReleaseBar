@@ -13,6 +13,7 @@ type KVNamespace = {
 };
 
 type Env = {
+  ASSETS?: { fetch(request: Request): Promise<Response> };
   DASHBOARD_CACHE?: KVNamespace;
   GITHUB_TOKEN?: string;
   RELEASEDECK_CANONICAL_DOMAIN?: string;
@@ -35,6 +36,31 @@ const corsHeaders = {
   "access-control-allow-headers": "content-type",
 };
 const workerFetch: typeof fetch = (input, init) => fetch(input, init);
+
+function shouldServeAppShell(url: URL): boolean {
+  if (url.pathname.endsWith("/")) return true;
+  const leaf = url.pathname.split("/").pop() ?? "";
+  return !leaf.includes(".");
+}
+
+async function assetResponse(request: Request, env: Env): Promise<Response> {
+  if (!env.ASSETS) {
+    return jsonResponse({ error: "not found" }, 404);
+  }
+
+  const url = new URL(request.url);
+  if (shouldServeAppShell(url)) {
+    url.pathname = "/index.html";
+    return env.ASSETS.fetch(new Request(url, request));
+  }
+
+  const asset = await env.ASSETS.fetch(request);
+  if (asset.status !== 404) {
+    return asset;
+  }
+
+  return asset;
+}
 
 function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body, null, 2), {
@@ -283,6 +309,6 @@ export default {
     if (url.pathname.startsWith("/api/")) {
       return ownerResponse(request, env, context);
     }
-    return jsonResponse({ error: "not found" }, 404);
+    return assetResponse(request, env);
   },
 };

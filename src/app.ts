@@ -399,11 +399,15 @@ function updateStatus(): void {
   elements.generated.textContent = `updated ${relativeDate(state.data.generatedAt)}${cacheState ? ` · ${cacheState}` : ""}${stale}${capped}`;
 }
 
-async function loadDashboard(attempt = 0): Promise<void> {
-  const joiner = state.route.apiPath.includes("?") ? "&" : "?";
-  const response = await fetch(`${state.route.apiPath}${joiner}v=${Date.now()}`, {
+async function fetchPayload(apiPath: string): Promise<Response> {
+  const joiner = apiPath.includes("?") ? "&" : "?";
+  return fetch(`${apiPath}${joiner}v=${Date.now()}`, {
     cache: "no-store",
   });
+}
+
+async function loadDashboard(attempt = 0): Promise<void> {
+  let response = await fetchPayload(state.route.apiPath);
   if (!response.ok) {
     const body = (await response.json().catch(() => null)) as
       | DashboardPayload
@@ -416,6 +420,16 @@ async function loadDashboard(attempt = 0): Promise<void> {
       render();
       elements.projects.textContent = body.cache?.message || "dashboard error";
       return;
+    }
+    if (state.route.fallbackApiPath) {
+      response = await fetchPayload(state.route.fallbackApiPath);
+      if (response.ok) {
+        state.data = (await response.json()) as DashboardPayload;
+        document.title = state.data.title;
+        updateStatus();
+        render();
+        return;
+      }
     }
     const message =
       body && "error" in body ? body.error : `dashboard fetch failed: ${response.status}`;

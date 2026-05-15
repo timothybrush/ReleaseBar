@@ -7,6 +7,12 @@ workers_dev = true
 [build]
 command = "npm run build:script"
 
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+html_handling = "none"
+run_worker_first = true
+
 [[kv_namespaces]]
 binding = "DASHBOARD_CACHE"
 id = "fd8ec8720e9c46d388a36a8856f04804"

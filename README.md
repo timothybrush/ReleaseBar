@@ -10,7 +10,7 @@ Edit `releasedeck.config.json`:
 - `includeForks`: include forked repositories
 - `includeArchived`: include archived repositories
 - `excludeRepos`: full `owner/name` entries to hide
-- `canonicalDomain`: primary GitHub Pages custom domain
+- `canonicalDomain`: primary public dashboard domain
 
 ## Build
 
@@ -27,9 +27,16 @@ Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token
 - query options: `forks=true`, `archived=true`, `unreleased=true`
 - settings can hide visible owners or repos locally without changing the shared cache
 
-The Worker API in `worker/index.ts` validates public GitHub owners, builds a capped public dashboard from the 8 most recently pushed public repos, stores it in KV, serves fresh cache for 1h, and serves stale cache while revalidating. Configure `DASHBOARD_CACHE` and `GITHUB_TOKEN` before deploying the Worker. Until `releasedeck.dev` is proxied through Cloudflare, owner dashboards call the workers.dev API origin directly.
+The Worker in `worker/index.ts` serves both the static app shell and the generic owner API. It validates public GitHub owners, builds a capped public dashboard from the 8 most recently pushed public repos, stores it in KV, serves fresh cache for 1h, and serves stale cache while revalidating. Configure `DASHBOARD_CACHE` and `GITHUB_TOKEN` before deploying the Worker. Until `releasedeck.dev` is proxied through Cloudflare, GitHub Pages builds fall back to the workers.dev API origin.
 
 ## Deploy
 
 GitHub Pages is deployed by `.github/workflows/pages.yml`.
-The optional owner dashboard API Worker is deployed separately with Wrangler once `wrangler.toml` has production KV ids.
+The combined app/API Worker deploys with Wrangler:
+
+```sh
+npm run build
+wrangler deploy
+```
+
+`wrangler.toml` binds `dist` as Worker static assets and runs the Worker first so `/api/*` stays dynamic and owner routes like `/openclaw` return the app shell with HTTP 200.

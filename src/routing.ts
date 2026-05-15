@@ -1,6 +1,7 @@
 export type DashboardRoute = {
   owner: string | null;
   apiPath: string;
+  fallbackApiPath: string | null;
   label: string;
   isDefault: boolean;
 };
@@ -11,7 +12,8 @@ export type RouteOptions = {
   includeUnreleased: boolean;
 };
 
-export const workerApiOrigin = "https://releasedeck-api.services-91b.workers.dev";
+export const workerApiOrigin = "";
+export const workersDevApiOrigin = "https://releasedeck-api.services-91b.workers.dev";
 
 export function ownerFromPath(pathname: string): string | null {
   const [first] = pathname.split("/").filter(Boolean);
@@ -51,14 +53,17 @@ export function dashboardRoute(
     return {
       owner: null,
       apiPath: `./data/projects.json${suffix}`,
+      fallbackApiPath: null,
       label: "@steipete",
       isDefault: true,
     };
   }
 
+  const ownerPath = `/api/${encodeURIComponent(owner)}${suffix}`;
   return {
     owner,
-    apiPath: `${apiOrigin}/api/${encodeURIComponent(owner)}${suffix}`,
+    apiPath: `${apiOrigin}${ownerPath}`,
+    fallbackApiPath: apiOrigin === "" ? `${workersDevApiOrigin}${ownerPath}` : null,
     label: `@${owner}`,
     isDefault: false,
   };

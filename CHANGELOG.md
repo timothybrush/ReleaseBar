@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Removed the always-on GitHub App install action from the account menu and tightened account menu styling.
 - Moved GitHub login state into a top-right account menu with settings and logout actions.
 - Added GitHub App login endpoints and settings UI state for signed-in users and app installation.
 - Added customizable public dashboard sources for extra owners and explicit repositories, plus dynamic owner social preview cards.

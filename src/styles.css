@@ -1,19 +1,31 @@
 :root {
   color-scheme: dark;
+
+  /* Palette */
   --bg: #080908;
   --panel: #10130f;
   --panel-2: #151914;
+  --panel-menu: #0d100c;
   --text: #e8f4df;
   --muted: #899180;
   --line: #293126;
+  --line-strong: #33402d;
   --green: #9cff57;
   --cyan: #63d8ff;
   --amber: #ffcc66;
   --red: #ff6b6b;
   --violet: #b59cff;
+
+  /* Shape */
+  --radius: 8px;
+  --control-height: 36px;
+  --account-width: clamp(136px, 18vw, 220px);
   --shadow: 0 18px 80px rgba(0, 0, 0, 0.45);
+
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 }
+
+/* Foundation */
 
 * {
   box-sizing: border-box;
@@ -49,6 +61,8 @@ a:hover {
   padding: 40px 0;
 }
 
+/* Header */
+
 .topline {
   display: flex;
   align-items: flex-end;
@@ -83,10 +97,16 @@ h1 {
 .status {
   display: flex;
   align-items: center;
+  min-width: 0;
   gap: 10px;
   color: var(--muted);
   font-size: 13px;
   white-space: nowrap;
+}
+
+.status span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .top-actions {
@@ -104,9 +124,11 @@ h1 {
   box-shadow: 0 0 18px var(--green);
 }
 
+/* Console */
+
 .console {
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius);
   background: rgba(16, 19, 15, 0.86);
   box-shadow: var(--shadow);
   overflow: hidden;
@@ -175,14 +197,16 @@ input::placeholder {
   margin: 18px 0;
 }
 
+/* Controls */
+
 .dev-toggle {
   display: inline-flex;
-  min-height: 36px;
+  min-height: var(--control-height);
   align-items: center;
   gap: 8px;
   margin-left: auto;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius);
   padding: 0 10px;
   background: var(--panel);
   color: var(--muted);
@@ -202,12 +226,14 @@ input::placeholder {
 }
 
 button {
-  min-height: 36px;
+  min-height: var(--control-height);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius);
+  padding: 0 12px;
   background: var(--panel);
   color: var(--muted);
   font: inherit;
+  line-height: 1.2;
   cursor: pointer;
 }
 
@@ -217,31 +243,43 @@ button.active {
   color: var(--text);
 }
 
+/* Account menu */
+
 .account-menu {
   position: relative;
+  width: var(--account-width);
+  max-width: calc(100vw - 32px);
+  flex: 0 0 auto;
 }
 
 .account-button {
-  min-width: 92px;
-  padding: 0 12px;
-  border-color: #33402d;
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-color: var(--line-strong);
+  padding: 0 14px;
   color: var(--text);
+}
+
+.account-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.account-button::after {
-  content: "";
-  display: inline-block;
+.account-caret {
+  flex: 0 0 auto;
   width: 0;
   height: 0;
-  margin-left: 8px;
   border-top: 4px solid currentColor;
   border-right: 4px solid transparent;
   border-left: 4px solid transparent;
-  vertical-align: middle;
 }
 
-.account-button[disabled]::after {
+.account-button[disabled] .account-caret {
   display: none;
 }
 
@@ -251,11 +289,13 @@ button.active {
   right: 0;
   z-index: 10;
   display: grid;
-  min-width: 190px;
+  width: 100%;
+  min-width: 152px;
+  padding: 6px;
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #0d100c;
+  border-radius: var(--radius);
+  background: var(--panel-menu);
   box-shadow: var(--shadow);
 }
 
@@ -265,22 +305,25 @@ button.active {
 
 .menu-action {
   width: 100%;
-  min-height: 38px;
-  border-width: 0 0 1px;
-  border-radius: 0;
-  padding: 0 12px;
+  min-height: 40px;
+  border-width: 0;
+  border-radius: 5px;
+  padding: 0 10px;
   background: transparent;
   color: var(--muted);
   text-align: left;
+  white-space: nowrap;
 }
 
-.menu-action:last-child {
-  border-bottom: 0;
+.menu-action + .menu-action {
+  margin-top: 2px;
 }
 
 .menu-action:hover {
   background: rgba(156, 255, 87, 0.04);
 }
+
+/* Settings */
 
 .settings-panel {
   display: none;
@@ -288,7 +331,7 @@ button.active {
   gap: 18px;
   margin: -8px 0 22px;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius);
   padding: 16px;
   background: rgba(16, 19, 15, 0.92);
 }
@@ -332,11 +375,11 @@ button.active {
 }
 
 .source-form input {
-  min-height: 36px;
+  min-height: var(--control-height);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius);
   padding: 0 10px;
-  background: #0d100c;
+  background: var(--panel-menu);
   font-size: 13px;
 }
 
@@ -351,16 +394,16 @@ button.active {
   align-items: center;
   gap: 7px;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius);
   padding: 0 9px;
-  background: #0d100c;
+  background: var(--panel-menu);
   color: var(--muted);
   font-size: 12px;
   cursor: pointer;
 }
 
 .setting-check:has(input:checked) {
-  border-color: #33402d;
+  border-color: var(--line-strong);
   color: var(--text);
 }
 
@@ -370,9 +413,11 @@ button.active {
   accent-color: var(--green);
 }
 
+/* Project table */
+
 .table-wrap {
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius);
   background: rgba(8, 9, 8, 0.78);
   overflow: hidden;
 }
@@ -406,7 +451,7 @@ body.dev-mode .dev-only {
   position: sticky;
   top: 0;
   z-index: 1;
-  background: #0d100c;
+  background: var(--panel-menu);
   color: var(--muted);
   font-size: 12px;
   text-transform: uppercase;
@@ -485,7 +530,7 @@ body.dev-mode .dev-only {
   display: inline-flex;
   min-height: 22px;
   align-items: center;
-  border: 1px solid #33402d;
+  border: 1px solid var(--line-strong);
   border-radius: 999px;
   padding: 0 8px;
   color: #c7dcbc;
@@ -567,6 +612,8 @@ body.dev-mode .dev-only {
   color: var(--red);
 }
 
+/* Responsive */
+
 @media (max-width: 860px) {
   .shell {
     width: min(100vw - 20px, 720px);
@@ -580,6 +627,7 @@ body.dev-mode .dev-only {
   .top-actions {
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
     margin-top: 18px;
   }
 

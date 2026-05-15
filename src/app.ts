@@ -41,13 +41,13 @@ const elements = {
   devMode: query<HTMLInputElement>("#devMode"),
   accountMenu: query<HTMLDivElement>("#accountMenu"),
   accountButton: query<HTMLButtonElement>("#accountButton"),
+  accountLabel: query<HTMLSpanElement>("#accountLabel"),
   accountDropdown: query<HTMLDivElement>("#accountDropdown"),
   settingsButton: query<HTMLButtonElement>("#settingsButton"),
   settingsPanel: query<HTMLDivElement>("#settingsPanel"),
   settingsSummary: query<HTMLParagraphElement>("#settingsSummary"),
   sourceForm: query<HTMLFormElement>("#sourceForm"),
   sourceInput: query<HTMLInputElement>("#sourceInput"),
-  installButton: query<HTMLButtonElement>("#installButton"),
   logoutButton: query<HTMLButtonElement>("#logoutButton"),
   ownerToggles: query<HTMLDivElement>("#ownerToggles"),
   repoToggles: query<HTMLDivElement>("#repoToggles"),
@@ -233,7 +233,7 @@ function logout(): void {
 function renderAuth(): void {
   const auth = state.auth;
   if (!auth?.configured) {
-    elements.accountButton.textContent = "Login Unavailable";
+    elements.accountLabel.textContent = "Login Unavailable";
     elements.accountButton.disabled = true;
     setAccountMenuOpen(false);
     return;
@@ -241,9 +241,9 @@ function renderAuth(): void {
 
   elements.accountButton.disabled = false;
   if (auth.user) {
-    elements.accountButton.textContent = `@${auth.user.login}`;
+    elements.accountLabel.textContent = `@${auth.user.login}`;
   } else {
-    elements.accountButton.textContent = "Log In";
+    elements.accountLabel.textContent = "Log In";
     setAccountMenuOpen(false);
   }
 }
@@ -587,12 +587,6 @@ elements.sourceInput.addEventListener("input", () => {
 elements.sourceForm.addEventListener("submit", (event) => {
   event.preventDefault();
   addSource(elements.sourceInput.value);
-});
-
-elements.installButton.addEventListener("click", () => {
-  if (state.auth?.installUrl) {
-    location.assign(state.auth.installUrl);
-  }
 });
 
 elements.logoutButton.addEventListener("click", () => {

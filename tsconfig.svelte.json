@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "skipLibCheck": true,
+    "types": ["node", "svelte", "vite/client"]
+  },
+  "include": ["src/**/*.svelte", "src/**/*.ts", "vite.config.ts", "svelte.config.js"]
+}

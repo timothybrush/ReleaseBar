@@ -57,6 +57,7 @@
         <div>
           <strong>dashboard</strong>
           <p id="settingsSummary">all visible</p>
+          <p id="authStatus" class="auth-status">public mode</p>
           <form id="sourceForm" class="source-form">
             <input
               id="sourceInput"
@@ -68,8 +69,9 @@
             <button type="submit">add</button>
           </form>
           <button id="signInButton" class="secondary-action" type="button">
-            sign in for private orgs
+            sign in with GitHub
           </button>
+          <button id="logoutButton" class="secondary-action" type="button" hidden>sign out</button>
         </div>
         <section>
           <h2>owners</h2>

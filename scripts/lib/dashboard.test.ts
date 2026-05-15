@@ -57,6 +57,45 @@ test("worker rejects oversized custom source requests", async () => {
   assert.match(await response.text(), /too many custom sources/);
 });
 
+test("worker exposes GitHub App auth endpoints", async () => {
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    GITHUB_APP_CLIENT_ID: "Iv123",
+    GITHUB_APP_CLIENT_SECRET: "client-secret",
+    GITHUB_APP_SLUG: "releasedeck",
+  };
+  const context = { waitUntil: () => undefined };
+
+  const anonymous = await worker.fetch(new Request("https://releasedeck.dev/api/me"), env, context);
+  assert.equal(anonymous.status, 200);
+  assert.deepEqual(await anonymous.json(), {
+    configured: true,
+    user: null,
+    loginUrl: "https://releasedeck.dev/api/auth/login",
+    logoutUrl: "https://releasedeck.dev/api/auth/logout",
+    installUrl: "https://github.com/apps/releasedeck/installations/new",
+    appUrl: "https://github.com/apps/releasedeck",
+  });
+
+  const login = await worker.fetch(
+    new Request("https://releasedeck.dev/api/auth/login?returnTo=/openclaw?owners=steipete"),
+    env,
+    context,
+  );
+  assert.equal(login.status, 302);
+  const location = login.headers.get("location") ?? "";
+  assert.equal(location.startsWith("https://github.com/login/oauth/authorize?"), true);
+  assert.match(location, /client_id=Iv123/);
+  assert.match(location, /redirect_uri=https%3A%2F%2Freleasedeck.dev%2Fapi%2Fauth%2Fcallback/);
+
+  const badCallback = await worker.fetch(
+    new Request("https://releasedeck.dev/api/auth/callback?code=x&state=bad"),
+    env,
+    context,
+  );
+  assert.equal(badCallback.status, 400);
+});
+
 test("query options are explicit booleans", () => {
   assert.deepEqual(optionsFromSearch("?forks=true&archived=false&unreleased=true"), {
     includeForks: true,

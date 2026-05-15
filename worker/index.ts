@@ -6,7 +6,7 @@ import {
   validOwnerSlug,
   validRepoSlug,
 } from "../scripts/lib/dashboard.js";
-import type { DashboardPayload, Owner } from "../src/types.js";
+import type { AuthPayload, AuthUser, DashboardPayload, Owner } from "../src/types.js";
 
 type KVNamespace = {
   get(key: string): Promise<string | null>;
@@ -15,7 +15,11 @@ type KVNamespace = {
 
 type Env = {
   ASSETS?: { fetch(request: Request): Promise<Response> };
+  AUTH_COOKIE_SECRET?: string;
   DASHBOARD_CACHE?: KVNamespace;
+  GITHUB_APP_CLIENT_ID?: string;
+  GITHUB_APP_CLIENT_SECRET?: string;
+  GITHUB_APP_SLUG?: string;
   GITHUB_TOKEN?: string;
   RELEASEDECK_CANONICAL_DOMAIN?: string;
 };
@@ -30,6 +34,9 @@ const coldBuildWaitMs = 15 * 1000;
 const repoLimit = 8;
 const maxCustomSources = 8;
 const schemaVersion = 1;
+const sessionCookie = "rd_session";
+const sessionMaxAgeSeconds = 30 * 24 * 60 * 60;
+const stateMaxAgeSeconds = 10 * 60;
 const locks = new Map<string, Promise<DashboardPayload>>();
 const buildPending = Symbol("build-pending");
 const corsHeaders = {
@@ -47,6 +54,32 @@ type DashboardRequest = {
   url: URL;
 };
 
+type AuthState = {
+  returnTo: string;
+  iat: number;
+  nonce: string;
+};
+
+type AuthSession = {
+  user: AuthUser;
+  iat: number;
+  exp: number;
+};
+
+type GitHubOAuthToken = {
+  access_token?: string;
+  error?: string;
+  error_description?: string;
+};
+
+type GitHubOAuthUser = {
+  id: number;
+  login: string;
+  name: string | null;
+  avatar_url: string;
+  html_url: string;
+};
+
 function shouldServeAppShell(url: URL): boolean {
   if (url.pathname.endsWith("/")) return true;
   const leaf = url.pathname.split("/").pop() ?? "";
@@ -59,6 +92,128 @@ function escapeHtml(value: string): string {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function base64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function base64UrlJson(value: unknown): string {
+  return base64Url(new TextEncoder().encode(JSON.stringify(value)));
+}
+
+function decodeBase64UrlJson<T>(value: string): T | null {
+  try {
+    const padded = value
+      .replaceAll("-", "+")
+      .replaceAll("_", "/")
+      .padEnd(Math.ceil(value.length / 4) * 4, "=");
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes)) as T;
+  } catch {
+    return null;
+  }
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let index = 0; index < a.length; index += 1) {
+    diff |= a.charCodeAt(index) ^ b.charCodeAt(index);
+  }
+  return diff === 0;
+}
+
+async function hmac(secret: string, value: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
+  return base64Url(new Uint8Array(signature));
+}
+
+async function signedJson(secret: string, value: unknown): Promise<string> {
+  const payload = base64UrlJson(value);
+  return `${payload}.${await hmac(secret, payload)}`;
+}
+
+async function verifySignedJson<T>(secret: string, token: string): Promise<T | null> {
+  const [payload, signature] = token.split(".");
+  if (!payload || !signature) return null;
+  const expected = await hmac(secret, payload);
+  if (!timingSafeEqual(signature, expected)) return null;
+  return decodeBase64UrlJson<T>(payload);
+}
+
+function randomNonce(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return base64Url(bytes);
+}
+
+function safeReturnTo(value: string | null): string {
+  if (!value || value.startsWith("//")) return "/";
+  try {
+    const url = new URL(value, "https://releasedeck.dev");
+    if (url.origin !== "https://releasedeck.dev") return "/";
+    return `${url.pathname}${url.search}${url.hash}`;
+  } catch {
+    return "/";
+  }
+}
+
+function parseCookies(request: Request): Map<string, string> {
+  return new Map(
+    (request.headers.get("cookie") ?? "")
+      .split(";")
+      .map((cookie) => cookie.trim())
+      .filter(Boolean)
+      .map((cookie) => {
+        const [name, ...parts] = cookie.split("=");
+        return [name ?? "", parts.join("=")] as const;
+      }),
+  );
+}
+
+function authConfigured(env: Env): boolean {
+  return Boolean(
+    env.AUTH_COOKIE_SECRET && env.GITHUB_APP_CLIENT_ID && env.GITHUB_APP_CLIENT_SECRET,
+  );
+}
+
+function appSlug(env: Env): string {
+  return env.GITHUB_APP_SLUG || "releasedeck";
+}
+
+function authCookie(value: string, maxAge = sessionMaxAgeSeconds): string {
+  return `${sessionCookie}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
+}
+
+function authUrls(url: URL, env: Env): Omit<AuthPayload, "configured" | "user"> {
+  return {
+    loginUrl: `${url.origin}/api/auth/login`,
+    logoutUrl: `${url.origin}/api/auth/logout`,
+    installUrl: `https://github.com/apps/${appSlug(env)}/installations/new`,
+    appUrl: `https://github.com/apps/${appSlug(env)}`,
+  };
+}
+
+async function currentUser(request: Request, env: Env): Promise<AuthUser | null> {
+  if (!env.AUTH_COOKIE_SECRET) return null;
+  const token = parseCookies(request).get(sessionCookie);
+  if (!token) return null;
+  const session = await verifySignedJson<AuthSession>(env.AUTH_COOKIE_SECRET, token);
+  if (!session || session.exp < Math.floor(Date.now() / 1000)) return null;
+  return session.user;
 }
 
 function ownerListFromUrl(url: URL, primaryOwner?: string): string[] {
@@ -215,6 +370,150 @@ function jsonResponse(body: unknown, status = 200, headers: Record<string, strin
       ...headers,
     },
   });
+}
+
+function redirectResponse(location: string, headers: Record<string, string> = {}): Response {
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location,
+      "cache-control": "no-store",
+      ...headers,
+    },
+  });
+}
+
+async function meResponse(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const body: AuthPayload = {
+    configured: authConfigured(env),
+    user: await currentUser(request, env),
+    ...authUrls(url, env),
+  };
+  return jsonResponse(body, 200, { "cache-control": "no-store" });
+}
+
+async function loginResponse(request: Request, env: Env): Promise<Response> {
+  if (!authConfigured(env) || !env.AUTH_COOKIE_SECRET || !env.GITHUB_APP_CLIENT_ID) {
+    return jsonResponse({ error: "GitHub login is not configured" }, 503, {
+      "cache-control": "no-store",
+    });
+  }
+  const url = new URL(request.url);
+  const state = await signedJson(env.AUTH_COOKIE_SECRET, {
+    returnTo: safeReturnTo(url.searchParams.get("returnTo")),
+    iat: Math.floor(Date.now() / 1000),
+    nonce: randomNonce(),
+  });
+  const github = new URL("https://github.com/login/oauth/authorize");
+  github.searchParams.set("client_id", env.GITHUB_APP_CLIENT_ID);
+  github.searchParams.set("redirect_uri", `${url.origin}/api/auth/callback`);
+  github.searchParams.set("state", state);
+  return redirectResponse(github.toString());
+}
+
+async function exchangeCode(url: URL, env: Env): Promise<string> {
+  const code = url.searchParams.get("code");
+  const stateToken = url.searchParams.get("state");
+  if (!code || !stateToken || !env.AUTH_COOKIE_SECRET) {
+    throw new Error("missing OAuth code or state");
+  }
+  const state = await verifySignedJson<AuthState>(env.AUTH_COOKIE_SECRET, stateToken);
+  const now = Math.floor(Date.now() / 1000);
+  if (!state || now - state.iat > stateMaxAgeSeconds) {
+    throw new Error("invalid OAuth state");
+  }
+  const response = await workerFetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      client_id: env.GITHUB_APP_CLIENT_ID,
+      client_secret: env.GITHUB_APP_CLIENT_SECRET,
+      code,
+      redirect_uri: `${url.origin}/api/auth/callback`,
+    }),
+  });
+  const token = (await response.json()) as GitHubOAuthToken;
+  if (!response.ok || !token.access_token) {
+    throw new Error(token.error_description || token.error || "GitHub OAuth exchange failed");
+  }
+  return token.access_token;
+}
+
+async function githubUser(accessToken: string): Promise<AuthUser> {
+  const response = await workerFetch("https://api.github.com/user", {
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${accessToken}`,
+      "user-agent": "ReleaseDeck",
+      "x-github-api-version": "2022-11-28",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub user lookup failed: ${response.status}`);
+  }
+  const user = (await response.json()) as GitHubOAuthUser;
+  return {
+    id: user.id,
+    login: user.login,
+    name: user.name,
+    avatarUrl: user.avatar_url,
+    url: user.html_url,
+  };
+}
+
+async function callbackResponse(request: Request, env: Env): Promise<Response> {
+  if (!authConfigured(env) || !env.AUTH_COOKIE_SECRET) {
+    return jsonResponse({ error: "GitHub login is not configured" }, 503, {
+      "cache-control": "no-store",
+    });
+  }
+  const url = new URL(request.url);
+  try {
+    const state = await verifySignedJson<AuthState>(
+      env.AUTH_COOKIE_SECRET,
+      url.searchParams.get("state") ?? "",
+    );
+    if (!state || Math.floor(Date.now() / 1000) - state.iat > stateMaxAgeSeconds) {
+      throw new Error("invalid OAuth state");
+    }
+    const accessToken = await exchangeCode(url, env);
+    const user = await githubUser(accessToken);
+    const now = Math.floor(Date.now() / 1000);
+    const session = await signedJson(env.AUTH_COOKIE_SECRET, {
+      user,
+      iat: now,
+      exp: now + sessionMaxAgeSeconds,
+    });
+    return redirectResponse(state.returnTo, {
+      "set-cookie": authCookie(session),
+    });
+  } catch (error) {
+    return jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 400, {
+      "cache-control": "no-store",
+    });
+  }
+}
+
+function logoutResponse(request: Request): Response {
+  const url = new URL(request.url);
+  return redirectResponse(safeReturnTo(url.searchParams.get("returnTo")), {
+    "set-cookie": authCookie("", 0),
+  });
+}
+
+async function authResponse(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  if (url.pathname === "/api/auth/login") return loginResponse(request, env);
+  if (url.pathname === "/api/auth/callback") return callbackResponse(request, env);
+  if (url.pathname === "/api/auth/logout") return logoutResponse(request);
+  if (url.pathname === "/api/auth/install") {
+    return redirectResponse(`https://github.com/apps/${appSlug(env)}/installations/new`);
+  }
+  return jsonResponse({ error: "not found" }, 404);
 }
 
 function withCacheState(
@@ -467,23 +766,45 @@ function dashboardRequest(
 export default {
   async fetch(request: Request, env: Env, context: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    const isHead = request.method === "HEAD";
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
-    if (request.method !== "GET") {
+    if (request.method !== "GET" && !isHead) {
       return jsonResponse({ error: "method not allowed" }, 405, { allow: "GET" });
     }
-    if (url.pathname.startsWith("/og/")) {
-      const label = decodeURIComponent(url.pathname.replace(/^\/og\//, "").replace(/\.svg$/, ""));
-      const title =
-        label.startsWith("@") || label.includes("/") || !validOwnerSlug(label)
-          ? label
-          : `@${label}`;
-      return socialImage(title);
+    const response = await routeRequest(request, env, context, url);
+    if (!isHead) {
+      return response;
     }
-    if (url.pathname.startsWith("/api/")) {
-      return ownerResponse(request, env, context);
-    }
-    return assetResponse(request, env);
+    return new Response(null, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
   },
 };
+
+async function routeRequest(
+  request: Request,
+  env: Env,
+  context: ExecutionContext,
+  url: URL,
+): Promise<Response> {
+  if (url.pathname.startsWith("/og/")) {
+    const label = decodeURIComponent(url.pathname.replace(/^\/og\//, "").replace(/\.svg$/, ""));
+    const title =
+      label.startsWith("@") || label.includes("/") || !validOwnerSlug(label) ? label : `@${label}`;
+    return socialImage(title);
+  }
+  if (url.pathname === "/api/me") {
+    return meResponse(request, env);
+  }
+  if (url.pathname.startsWith("/api/auth/")) {
+    return authResponse(request, env);
+  }
+  if (url.pathname.startsWith("/api/")) {
+    return ownerResponse(request, env, context);
+  }
+  return assetResponse(request, env);
+}

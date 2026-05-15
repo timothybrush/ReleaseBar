@@ -1,4 +1,4 @@
-import type { CiState, DashboardPayload, Freshness, Project } from "./types.js";
+import type { AuthPayload, CiState, DashboardPayload, Freshness, Project } from "./types.js";
 import { dashboardRoute, validRepoSlug } from "./routing.js";
 
 type SortKey = "repo" | "version" | "release" | "since" | "activity" | "issues" | "prs" | "ci";
@@ -6,6 +6,7 @@ type SortDirection = "asc" | "desc";
 
 const state = {
   data: null as DashboardPayload | null,
+  auth: null as AuthPayload | null,
   query: "",
   filter: "all" as Freshness | "all",
   sortKey: "activity" as SortKey,
@@ -41,9 +42,11 @@ const elements = {
   settingsButton: query<HTMLButtonElement>("#settingsButton"),
   settingsPanel: query<HTMLDivElement>("#settingsPanel"),
   settingsSummary: query<HTMLParagraphElement>("#settingsSummary"),
+  authStatus: query<HTMLParagraphElement>("#authStatus"),
   sourceForm: query<HTMLFormElement>("#sourceForm"),
   sourceInput: query<HTMLInputElement>("#sourceInput"),
   signInButton: query<HTMLButtonElement>("#signInButton"),
+  logoutButton: query<HTMLButtonElement>("#logoutButton"),
   ownerToggles: query<HTMLDivElement>("#ownerToggles"),
   repoToggles: query<HTMLDivElement>("#repoToggles"),
   projects: query<HTMLDivElement>("#projects"),
@@ -196,6 +199,33 @@ function renderSettings(): void {
   elements.settingsSummary.textContent = `${sourceCount === 0 ? "default sources" : `${numberFormat.format(sourceCount)} added`} · ${
     hiddenCount === 0 ? "all visible" : `${numberFormat.format(hiddenCount)} hidden`
   }`;
+  renderAuth();
+}
+
+function currentReturnTo(): string {
+  return `${location.pathname}${location.search}${location.hash}`;
+}
+
+function renderAuth(): void {
+  const auth = state.auth;
+  if (!auth?.configured) {
+    elements.authStatus.textContent = "public mode";
+    elements.signInButton.textContent = "GitHub login unavailable";
+    elements.signInButton.disabled = true;
+    elements.logoutButton.hidden = true;
+    return;
+  }
+
+  elements.signInButton.disabled = false;
+  if (auth.user) {
+    elements.authStatus.textContent = `@${auth.user.login} signed in`;
+    elements.signInButton.textContent = "install GitHub App";
+    elements.logoutButton.hidden = false;
+  } else {
+    elements.authStatus.textContent = "public mode";
+    elements.signInButton.textContent = "sign in with GitHub";
+    elements.logoutButton.hidden = true;
+  }
 }
 
 function tag(label: string, tone = ""): HTMLSpanElement {
@@ -446,6 +476,18 @@ async function fetchPayload(apiPath: string): Promise<Response> {
   });
 }
 
+async function loadAuth(): Promise<void> {
+  try {
+    const response = await fetch("/api/me", { cache: "no-store" });
+    if (response.ok) {
+      state.auth = (await response.json()) as AuthPayload;
+    }
+  } catch {
+    state.auth = null;
+  }
+  renderAuth();
+}
+
 async function loadDashboard(attempt = 0): Promise<void> {
   let response = await fetchPayload(state.route.apiPath);
   if (!response.ok) {
@@ -486,7 +528,7 @@ async function loadDashboard(attempt = 0): Promise<void> {
 async function boot(): Promise<void> {
   elements.dashboardTitle.textContent = state.route.label;
   elements.devMode.checked = state.devMode;
-  await loadDashboard();
+  await Promise.all([loadAuth(), loadDashboard()]);
 }
 
 elements.search.addEventListener("input", () => {
@@ -519,10 +561,20 @@ elements.sourceForm.addEventListener("submit", (event) => {
 });
 
 elements.signInButton.addEventListener("click", () => {
-  elements.sourceInput.setCustomValidity(
-    "Private org dashboards need GitHub App login next. Public owners/repos can be added now.",
-  );
-  elements.sourceInput.reportValidity();
+  const auth = state.auth;
+  if (auth?.user) {
+    location.assign(auth.installUrl);
+    return;
+  }
+  const loginUrl = new URL(auth?.loginUrl ?? "/api/auth/login", location.origin);
+  loginUrl.searchParams.set("returnTo", currentReturnTo());
+  location.assign(loginUrl.toString());
+});
+
+elements.logoutButton.addEventListener("click", () => {
+  const logoutUrl = new URL(state.auth?.logoutUrl ?? "/api/auth/logout", location.origin);
+  logoutUrl.searchParams.set("returnTo", currentReturnTo());
+  location.assign(logoutUrl.toString());
 });
 
 document.querySelectorAll("[data-filter]").forEach((button) => {

@@ -22,6 +22,8 @@ async function copyStaticAssets(config: ReleaseDeckConfig): Promise<void> {
     "favicon.svg",
     "apple-touch-icon.png",
     "og-card.png",
+    "github-app-logo.svg",
+    "github-app-logo.png",
   ]) {
     await copyFile(path.join(publicDir, file), path.join(distDir, file));
   }

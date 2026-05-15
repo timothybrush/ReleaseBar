@@ -250,6 +250,10 @@ button.active {
   font-size: 12px;
 }
 
+.settings-panel .auth-status {
+  color: var(--text);
+}
+
 .setting-list {
   display: flex;
   flex-wrap: wrap;

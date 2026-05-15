@@ -60,6 +60,23 @@ export type Project = {
   freshness: Freshness;
 };
 
+export type AuthUser = {
+  id: number;
+  login: string;
+  name: string | null;
+  avatarUrl: string;
+  url: string;
+};
+
+export type AuthPayload = {
+  configured: boolean;
+  user: AuthUser | null;
+  loginUrl: string;
+  logoutUrl: string;
+  installUrl: string;
+  appUrl: string;
+};
+
 export type DashboardPayload = {
   title: string;
   subtitle: string;

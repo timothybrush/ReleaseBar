@@ -1,7 +1,7 @@
 name = "releasedeck-api"
 main = "node_modules/.cache/releasedeck-build/worker/index.js"
 compatibility_date = "2026-05-15"
-account_id = "91b59577e757131d68d55a471fe32aca"
+account_id = "de09342a728de2c25c85cc6b34d68739"
 workers_dev = true
 
 [build]
@@ -15,5 +15,5 @@ run_worker_first = true
 
 [[kv_namespaces]]
 binding = "DASHBOARD_CACHE"
-id = "fd8ec8720e9c46d388a36a8856f04804"
-preview_id = "59c63bf8d32c43c1ac55c8930ac6f2ec"
+id = "687a658593b94897b8cc09d62127d140"
+preview_id = "30e91855eea543e8ad6e0b6f981d529f"

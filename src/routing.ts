@@ -13,7 +13,7 @@ export type RouteOptions = {
 };
 
 export const workerApiOrigin = "";
-export const workersDevApiOrigin = "https://releasedeck-api.services-91b.workers.dev";
+export const workersDevApiOrigin = "https://releasedeck-api.steipete.workers.dev";
 
 export function ownerFromPath(pathname: string): string | null {
   const [first] = pathname.split("/").filter(Boolean);

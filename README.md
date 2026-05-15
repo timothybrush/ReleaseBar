@@ -1,6 +1,8 @@
-# ReleaseBar
+# 📦 ReleaseDeck
 
-ReleaseBar is a release freshness dashboard for public GitHub users and orgs: latest version, latest release date, commits since release, activity, stars, language, and quick search. Repositories without any GitHub releases are skipped unless unreleased repositories are explicitly included. Dev mode adds open issue counts, open PR counts, and latest CI status.
+Release freshness dashboard for public GitHub users and orgs.
+
+ReleaseDeck tracks latest version, latest release date, commits since release, activity, stars, language, and quick search. Repositories without any GitHub releases are skipped unless unreleased repositories are explicitly included. Dev mode adds open issue counts, open PR counts, and latest CI status.
 
 ## Configure
 

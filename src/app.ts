@@ -39,13 +39,15 @@ const elements = {
   staleCount: query<HTMLSpanElement>("#staleCount"),
   search: query<HTMLInputElement>("#search"),
   devMode: query<HTMLInputElement>("#devMode"),
+  accountMenu: query<HTMLDivElement>("#accountMenu"),
+  accountButton: query<HTMLButtonElement>("#accountButton"),
+  accountDropdown: query<HTMLDivElement>("#accountDropdown"),
   settingsButton: query<HTMLButtonElement>("#settingsButton"),
   settingsPanel: query<HTMLDivElement>("#settingsPanel"),
   settingsSummary: query<HTMLParagraphElement>("#settingsSummary"),
-  authStatus: query<HTMLParagraphElement>("#authStatus"),
   sourceForm: query<HTMLFormElement>("#sourceForm"),
   sourceInput: query<HTMLInputElement>("#sourceInput"),
-  signInButton: query<HTMLButtonElement>("#signInButton"),
+  installButton: query<HTMLButtonElement>("#installButton"),
   logoutButton: query<HTMLButtonElement>("#logoutButton"),
   ownerToggles: query<HTMLDivElement>("#ownerToggles"),
   repoToggles: query<HTMLDivElement>("#repoToggles"),
@@ -206,25 +208,43 @@ function currentReturnTo(): string {
   return `${location.pathname}${location.search}${location.hash}`;
 }
 
+function setAccountMenuOpen(open: boolean): void {
+  elements.accountDropdown.hidden = !open;
+  elements.accountButton.setAttribute("aria-expanded", String(open));
+}
+
+function toggleSettingsPanel(): void {
+  const open = elements.settingsPanel.toggleAttribute("data-open");
+  elements.settingsButton.setAttribute("aria-pressed", String(open));
+}
+
+function login(): void {
+  const loginUrl = new URL(state.auth?.loginUrl ?? "/api/auth/login", location.origin);
+  loginUrl.searchParams.set("returnTo", currentReturnTo());
+  location.assign(loginUrl.toString());
+}
+
+function logout(): void {
+  const logoutUrl = new URL(state.auth?.logoutUrl ?? "/api/auth/logout", location.origin);
+  logoutUrl.searchParams.set("returnTo", currentReturnTo());
+  location.assign(logoutUrl.toString());
+}
+
 function renderAuth(): void {
   const auth = state.auth;
   if (!auth?.configured) {
-    elements.authStatus.textContent = "public mode";
-    elements.signInButton.textContent = "GitHub login unavailable";
-    elements.signInButton.disabled = true;
-    elements.logoutButton.hidden = true;
+    elements.accountButton.textContent = "Login Unavailable";
+    elements.accountButton.disabled = true;
+    setAccountMenuOpen(false);
     return;
   }
 
-  elements.signInButton.disabled = false;
+  elements.accountButton.disabled = false;
   if (auth.user) {
-    elements.authStatus.textContent = `@${auth.user.login} signed in`;
-    elements.signInButton.textContent = "install GitHub App";
-    elements.logoutButton.hidden = false;
+    elements.accountButton.textContent = `@${auth.user.login}`;
   } else {
-    elements.authStatus.textContent = "public mode";
-    elements.signInButton.textContent = "sign in with GitHub";
-    elements.logoutButton.hidden = true;
+    elements.accountButton.textContent = "Log In";
+    setAccountMenuOpen(false);
   }
 }
 
@@ -546,9 +566,18 @@ elements.devMode.addEventListener("change", () => {
   render();
 });
 
+elements.accountButton.addEventListener("click", () => {
+  if (!state.auth?.configured) return;
+  if (!state.auth.user) {
+    login();
+    return;
+  }
+  setAccountMenuOpen(elements.accountDropdown.hasAttribute("hidden"));
+});
+
 elements.settingsButton.addEventListener("click", () => {
-  const open = elements.settingsPanel.toggleAttribute("data-open");
-  elements.settingsButton.setAttribute("aria-expanded", String(open));
+  toggleSettingsPanel();
+  setAccountMenuOpen(false);
 });
 
 elements.sourceInput.addEventListener("input", () => {
@@ -560,21 +589,26 @@ elements.sourceForm.addEventListener("submit", (event) => {
   addSource(elements.sourceInput.value);
 });
 
-elements.signInButton.addEventListener("click", () => {
-  const auth = state.auth;
-  if (auth?.user) {
-    location.assign(auth.installUrl);
-    return;
+elements.installButton.addEventListener("click", () => {
+  if (state.auth?.installUrl) {
+    location.assign(state.auth.installUrl);
   }
-  const loginUrl = new URL(auth?.loginUrl ?? "/api/auth/login", location.origin);
-  loginUrl.searchParams.set("returnTo", currentReturnTo());
-  location.assign(loginUrl.toString());
 });
 
 elements.logoutButton.addEventListener("click", () => {
-  const logoutUrl = new URL(state.auth?.logoutUrl ?? "/api/auth/logout", location.origin);
-  logoutUrl.searchParams.set("returnTo", currentReturnTo());
-  location.assign(logoutUrl.toString());
+  logout();
+});
+
+document.addEventListener("click", (event) => {
+  if (elements.accountDropdown.hidden) return;
+  if (event.target instanceof Node && elements.accountMenu.contains(event.target)) return;
+  setAccountMenuOpen(false);
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    setAccountMenuOpen(false);
+  }
 });
 
 document.querySelectorAll("[data-filter]").forEach((button) => {

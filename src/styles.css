@@ -92,6 +92,7 @@ h1 {
 .top-actions {
   display: flex;
   align-items: center;
+  align-self: flex-start;
   gap: 14px;
 }
 
@@ -210,14 +211,75 @@ button {
   cursor: pointer;
 }
 
-.icon-button {
-  padding: 0 12px;
-}
-
 button:hover,
 button.active {
   border-color: var(--green);
   color: var(--text);
+}
+
+.account-menu {
+  position: relative;
+}
+
+.account-button {
+  min-width: 92px;
+  padding: 0 12px;
+  border-color: #33402d;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.account-button::after {
+  content: "";
+  display: inline-block;
+  width: 0;
+  height: 0;
+  margin-left: 8px;
+  border-top: 4px solid currentColor;
+  border-right: 4px solid transparent;
+  border-left: 4px solid transparent;
+  vertical-align: middle;
+}
+
+.account-button[disabled]::after {
+  display: none;
+}
+
+.account-dropdown {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 10;
+  display: grid;
+  min-width: 190px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d100c;
+  box-shadow: var(--shadow);
+}
+
+.account-dropdown[hidden] {
+  display: none;
+}
+
+.menu-action {
+  width: 100%;
+  min-height: 38px;
+  border-width: 0 0 1px;
+  border-radius: 0;
+  padding: 0 12px;
+  background: transparent;
+  color: var(--muted);
+  text-align: left;
+}
+
+.menu-action:last-child {
+  border-bottom: 0;
+}
+
+.menu-action:hover {
+  background: rgba(156, 255, 87, 0.04);
 }
 
 .settings-panel {
@@ -250,10 +312,6 @@ button.active {
   font-size: 12px;
 }
 
-.settings-panel .auth-status {
-  color: var(--text);
-}
-
 .setting-list {
   display: flex;
   flex-wrap: wrap;
@@ -282,16 +340,9 @@ button.active {
   font-size: 13px;
 }
 
-.source-form button,
-.secondary-action {
+.source-form button {
   width: 100%;
   font-size: 12px;
-}
-
-.secondary-action {
-  margin-top: 8px;
-  border-color: #33402d;
-  background: transparent;
 }
 
 .setting-check {
@@ -527,8 +578,8 @@ body.dev-mode .dev-only {
   }
 
   .top-actions {
-    align-items: flex-start;
-    flex-direction: column;
+    align-items: center;
+    justify-content: space-between;
     margin-top: 18px;
   }
 

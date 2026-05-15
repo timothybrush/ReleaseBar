@@ -43,12 +43,31 @@
           </p>
         </div>
         <div class="top-actions">
-          <button id="settingsButton" class="icon-button" type="button" aria-expanded="false">
-            settings
-          </button>
           <div class="status" aria-live="polite">
             <span class="pulse"></span>
             <span id="generated">loading</span>
+          </div>
+          <div id="accountMenu" class="account-menu">
+            <button
+              id="accountButton"
+              class="account-button"
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded="false"
+            >
+              Log In
+            </button>
+            <div id="accountDropdown" class="account-dropdown" role="menu" hidden>
+              <button id="settingsButton" class="menu-action" type="button" role="menuitem">
+                Settings
+              </button>
+              <button id="installButton" class="menu-action" type="button" role="menuitem">
+                Install GitHub App
+              </button>
+              <button id="logoutButton" class="menu-action" type="button" role="menuitem">
+                Log Out
+              </button>
+            </div>
           </div>
         </div>
       </header>
@@ -57,7 +76,6 @@
         <div>
           <strong>dashboard</strong>
           <p id="settingsSummary">all visible</p>
-          <p id="authStatus" class="auth-status">public mode</p>
           <form id="sourceForm" class="source-form">
             <input
               id="sourceInput"
@@ -68,10 +86,6 @@
             />
             <button type="submit">add</button>
           </form>
-          <button id="signInButton" class="secondary-action" type="button">
-            sign in with GitHub
-          </button>
-          <button id="logoutButton" class="secondary-action" type="button" hidden>sign out</button>
         </div>
         <section>
           <h2>owners</h2>

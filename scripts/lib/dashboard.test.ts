@@ -360,7 +360,7 @@ test("worker exposes GitHub App auth endpoints", async () => {
     DASHBOARD_CACHE: kvStore(),
     GITHUB_APP_CLIENT_ID: "Iv123",
     GITHUB_APP_CLIENT_SECRET: "client-secret",
-    GITHUB_APP_SLUG: "releasedeck",
+    GITHUB_APP_SLUG: "releasebar-app",
   };
   const context = { waitUntil: () => undefined };
 
@@ -376,7 +376,7 @@ test("worker exposes GitHub App auth endpoints", async () => {
     loginUrl: "https://release.bar/api/auth/login",
     logoutUrl: "https://release.bar/api/auth/logout",
     installUrl: "https://release.bar/api/auth/install",
-    appUrl: "https://github.com/apps/releasedeck",
+    appUrl: "https://github.com/apps/releasebar-app",
   });
 
   const login = await worker.fetch(
@@ -405,7 +405,7 @@ test("worker exposes GitHub App auth endpoints", async () => {
   assert.equal(install.status, 302);
   assert.equal(
     install.headers.get("location"),
-    "https://github.com/apps/releasedeck/installations/new",
+    "https://github.com/apps/releasebar-app/installations/new",
   );
 });
 
@@ -433,7 +433,7 @@ test("worker reports GitHub App installation coverage for signed-in users", asyn
     GITHUB_APP_CLIENT_SECRET: "client-secret",
     GITHUB_APP_ID: "123",
     GITHUB_APP_PRIVATE_KEY: "private-key",
-    GITHUB_APP_SLUG: "releasedeck",
+    GITHUB_APP_SLUG: "releasebar-app",
   };
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input) => {
@@ -502,7 +502,7 @@ test("worker surfaces mixed-account dashboards as shared-quota", async () => {
     GITHUB_APP_CLIENT_SECRET: "client-secret",
     GITHUB_APP_ID: "123",
     GITHUB_APP_PRIVATE_KEY: "private-key",
-    GITHUB_APP_SLUG: "releasedeck",
+    GITHUB_APP_SLUG: "releasebar-app",
   };
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input) => {
@@ -571,7 +571,7 @@ test("worker uses GitHub App installation token for cold owner dashboards", asyn
     GITHUB_APP_CLIENT_SECRET: "client-secret",
     GITHUB_APP_ID: "123",
     GITHUB_APP_PRIVATE_KEY: privateKey,
-    GITHUB_APP_SLUG: "releasedeck",
+    GITHUB_APP_SLUG: "releasebar-app",
   };
   const originalFetch = globalThis.fetch;
   let ownerResolvedWithInstallationToken = false;

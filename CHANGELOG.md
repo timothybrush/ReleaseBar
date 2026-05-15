@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added route-aware owner dashboards, local visibility settings, and a cached Worker API for generic public GitHub dashboards.
 - Added favicon and social preview card assets.
 - Prevented cached dashboard data from showing archived repositories.
 - Hid archived repositories from the dashboard.

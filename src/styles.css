@@ -57,6 +57,14 @@ a:hover {
   margin-bottom: 28px;
 }
 
+.subtitle {
+  max-width: 760px;
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
 .eyebrow {
   margin: 0 0 8px;
   color: var(--green);
@@ -79,6 +87,12 @@ h1 {
   color: var(--muted);
   font-size: 13px;
   white-space: nowrap;
+}
+
+.top-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
 }
 
 .pulse {
@@ -196,10 +210,81 @@ button {
   cursor: pointer;
 }
 
+.icon-button {
+  padding: 0 12px;
+}
+
 button:hover,
 button.active {
   border-color: var(--green);
   color: var(--text);
+}
+
+.settings-panel {
+  display: none;
+  grid-template-columns: minmax(150px, 0.4fr) minmax(160px, 0.5fr) minmax(320px, 1fr);
+  gap: 18px;
+  margin: -8px 0 22px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  background: rgba(16, 19, 15, 0.92);
+}
+
+.settings-panel[data-open] {
+  display: grid;
+}
+
+.settings-panel strong,
+.settings-panel h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.settings-panel p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.setting-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.repo-settings {
+  max-height: 188px;
+  overflow: auto;
+}
+
+.setting-check {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 9px;
+  background: #0d100c;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.setting-check:has(input:checked) {
+  border-color: #33402d;
+  color: var(--text);
+}
+
+.setting-check input {
+  width: 12px;
+  height: 12px;
+  accent-color: var(--green);
 }
 
 .table-wrap {
@@ -409,8 +494,19 @@ body.dev-mode .dev-only {
     display: block;
   }
 
-  .status {
+  .top-actions {
+    align-items: flex-start;
+    flex-direction: column;
     margin-top: 18px;
+  }
+
+  .status {
+    margin-top: 0;
+  }
+
+  .settings-panel,
+  .settings-panel[data-open] {
+    grid-template-columns: 1fr;
   }
 
   .metrics {

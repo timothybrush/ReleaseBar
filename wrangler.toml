@@ -1,0 +1,13 @@
+name = "releasedeck-api"
+main = "node_modules/.cache/releasedeck-build/worker/index.js"
+compatibility_date = "2026-05-15"
+account_id = "91b59577e757131d68d55a471fe32aca"
+routes = [{ pattern = "releasedeck.dev/api/*", zone_name = "releasedeck.dev" }]
+
+[build]
+command = "npm run build:script"
+
+[[kv_namespaces]]
+binding = "DASHBOARD_CACHE"
+id = "fd8ec8720e9c46d388a36a8856f04804"
+preview_id = "59c63bf8d32c43c1ac55c8930ac6f2ec"

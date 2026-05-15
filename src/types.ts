@@ -10,6 +10,7 @@ export type ReleaseDeckConfig = {
   owners: Owner[];
   includeForks: boolean;
   includeArchived: boolean;
+  includeUnreleased?: boolean;
   excludeRepos?: string[];
 };
 
@@ -65,6 +66,20 @@ export type DashboardPayload = {
   canonicalDomain: string;
   generatedAt: string;
   owners: Owner[];
+  options?: {
+    includeForks: boolean;
+    includeArchived: boolean;
+    includeUnreleased: boolean;
+    repoLimit: number | null;
+  };
+  cache?: {
+    state: "fresh" | "stale" | "rebuilding" | "error";
+    stale: boolean;
+    capped: boolean;
+    repoLimit: number | null;
+    generatedAt: string;
+    message?: string;
+  };
   totals: {
     repos: number;
     released: number;

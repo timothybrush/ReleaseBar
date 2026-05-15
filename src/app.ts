@@ -1,4 +1,5 @@
 import type { CiState, DashboardPayload, Freshness, Project } from "./types.js";
+import { dashboardRoute } from "./routing.js";
 
 type SortKey = "repo" | "version" | "release" | "since" | "activity" | "issues" | "prs" | "ci";
 type SortDirection = "asc" | "desc";
@@ -10,6 +11,13 @@ const state = {
   sortKey: "activity" as SortKey,
   sortDirection: "desc" as SortDirection,
   devMode: localStorage.getItem("releasedeck:dev-mode") === "true",
+  hiddenOwners: new Set<string>(
+    JSON.parse(localStorage.getItem("releasedeck:hidden-owners") || "[]") as string[],
+  ),
+  hiddenRepos: new Set<string>(
+    JSON.parse(localStorage.getItem("releasedeck:hidden-repos") || "[]") as string[],
+  ),
+  route: dashboardRoute(location.pathname, location.search),
 };
 
 const numberFormat = new Intl.NumberFormat("en", { notation: "compact" });
@@ -21,13 +29,20 @@ const dateFormat = new Intl.DateTimeFormat("en", {
 const relativeFormat = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
 
 const elements = {
+  ownerLabel: query<HTMLParagraphElement>("#ownerLabel"),
   generated: query<HTMLSpanElement>("#generated"),
+  subtitle: query<HTMLParagraphElement>("#subtitle"),
   repoCount: query<HTMLSpanElement>("#repoCount"),
   releasedCount: query<HTMLSpanElement>("#releasedCount"),
   commitCount: query<HTMLSpanElement>("#commitCount"),
   staleCount: query<HTMLSpanElement>("#staleCount"),
   search: query<HTMLInputElement>("#search"),
   devMode: query<HTMLInputElement>("#devMode"),
+  settingsButton: query<HTMLButtonElement>("#settingsButton"),
+  settingsPanel: query<HTMLDivElement>("#settingsPanel"),
+  settingsSummary: query<HTMLParagraphElement>("#settingsSummary"),
+  ownerToggles: query<HTMLDivElement>("#ownerToggles"),
+  repoToggles: query<HTMLDivElement>("#repoToggles"),
   projects: query<HTMLDivElement>("#projects"),
   template: query<HTMLTemplateElement>("#projectRow"),
   sortButtons: document.querySelectorAll<HTMLButtonElement>("[data-sort]"),
@@ -65,7 +80,9 @@ function relativeDate(value: string | null): string {
 }
 
 function matches(project: Project): boolean {
-  if (project.archived) return false;
+  if (project.archived && !state.data?.options?.includeArchived) return false;
+  if (state.hiddenOwners.has(project.owner.toLowerCase())) return false;
+  if (state.hiddenRepos.has(project.fullName.toLowerCase())) return false;
   if (state.filter !== "all" && project.freshness !== state.filter) return false;
   if (!state.query) return true;
   const haystack = [
@@ -81,6 +98,67 @@ function matches(project: Project): boolean {
     .join(" ")
     .toLowerCase();
   return haystack.includes(state.query);
+}
+
+function persistVisibility(): void {
+  localStorage.setItem("releasedeck:hidden-owners", JSON.stringify([...state.hiddenOwners]));
+  localStorage.setItem("releasedeck:hidden-repos", JSON.stringify([...state.hiddenRepos]));
+}
+
+function toggleSet(set: Set<string>, key: string, visible: boolean): void {
+  if (visible) {
+    set.delete(key);
+  } else {
+    set.add(key);
+  }
+}
+
+function checkbox(
+  label: string,
+  checked: boolean,
+  onChange: (checked: boolean) => void,
+): HTMLLabelElement {
+  const item = document.createElement("label");
+  item.className = "setting-check";
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.checked = checked;
+  input.addEventListener("change", () => onChange(input.checked));
+  const span = document.createElement("span");
+  span.textContent = label;
+  item.append(input, span);
+  return item;
+}
+
+function renderSettings(): void {
+  const data = state.data;
+  if (!data) return;
+
+  const owners = [...new Set(data.projects.map((project) => project.owner.toLowerCase()))].sort();
+  elements.ownerToggles.replaceChildren(
+    ...owners.map((owner) =>
+      checkbox(`@${owner}`, !state.hiddenOwners.has(owner), (checked) => {
+        toggleSet(state.hiddenOwners, owner, checked);
+        persistVisibility();
+        render();
+      }),
+    ),
+  );
+
+  elements.repoToggles.replaceChildren(
+    ...data.projects.map((project) => {
+      const key = project.fullName.toLowerCase();
+      return checkbox(project.fullName, !state.hiddenRepos.has(key), (checked) => {
+        toggleSet(state.hiddenRepos, key, checked);
+        persistVisibility();
+        render();
+      });
+    }),
+  );
+
+  const hiddenCount = state.hiddenOwners.size + state.hiddenRepos.size;
+  elements.settingsSummary.textContent =
+    hiddenCount === 0 ? "all visible" : `${numberFormat.format(hiddenCount)} hidden`;
 }
 
 function tag(label: string, tone = ""): HTMLSpanElement {
@@ -222,7 +300,11 @@ function renderProject(project: Project): DocumentFragment {
   if (!release) {
     throw new Error("Project template is missing .release-cell");
   }
-  release.innerHTML = `<strong>${absoluteDate(project.releaseDate)}</strong><span>${relativeDate(project.releaseDate)}</span>`;
+  const releaseDate = document.createElement("strong");
+  releaseDate.textContent = absoluteDate(project.releaseDate);
+  const releaseAge = document.createElement("span");
+  releaseAge.textContent = relativeDate(project.releaseDate);
+  release.replaceChildren(releaseDate, releaseAge);
 
   const since = fragment.querySelector<HTMLDivElement>(".since-cell");
   if (!since) {
@@ -244,7 +326,11 @@ function renderProject(project: Project): DocumentFragment {
   if (!activity) {
     throw new Error("Project template is missing .activity-cell");
   }
-  activity.innerHTML = `<strong>${relativeDate(project.latestCommitDate || project.pushedAt)}</strong><span>${project.latestCommitSha || project.defaultBranch}</span>`;
+  const activityAge = document.createElement("strong");
+  activityAge.textContent = relativeDate(project.latestCommitDate || project.pushedAt);
+  const activityRef = document.createElement("span");
+  activityRef.textContent = project.latestCommitSha || project.defaultBranch;
+  activity.replaceChildren(activityAge, activityRef);
 
   const issues = fragment.querySelector<HTMLDivElement>(".issues-cell");
   if (!issues) {
@@ -292,7 +378,7 @@ function render(): void {
   elements.projects.replaceChildren(...projects.map(renderProject));
   elements.repoCount.textContent = numberFormat.format(projects.length);
   elements.releasedCount.textContent = numberFormat.format(
-    projects.filter((project) => project.version).length,
+    projects.filter((project) => project.releaseDate).length,
   );
   elements.commitCount.textContent = numberFormat.format(
     projects.reduce((sum, project) => sum + (project.commitsSinceRelease || 0), 0),
@@ -301,15 +387,55 @@ function render(): void {
     projects.filter((project) => ["hot", "busy"].includes(project.freshness)).length,
   );
   updateSortButtons();
+  renderSettings();
+}
+
+function updateStatus(): void {
+  if (!state.data) return;
+  elements.subtitle.textContent = state.data.subtitle;
+  const cacheState = state.data.cache?.state;
+  const stale = state.data.cache?.stale ? " stale" : "";
+  const capped = state.data.cache?.capped ? " capped" : "";
+  elements.generated.textContent = `updated ${relativeDate(state.data.generatedAt)}${cacheState ? ` · ${cacheState}` : ""}${stale}${capped}`;
+}
+
+async function loadDashboard(attempt = 0): Promise<void> {
+  const joiner = state.route.apiPath.includes("?") ? "&" : "?";
+  const response = await fetch(`${state.route.apiPath}${joiner}v=${Date.now()}`, {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as
+      | DashboardPayload
+      | { error?: string }
+      | null;
+    if (body && "cache" in body) {
+      state.data = body;
+      document.title = state.data.title;
+      updateStatus();
+      render();
+      elements.projects.textContent = body.cache?.message || "dashboard error";
+      return;
+    }
+    const message =
+      body && "error" in body ? body.error : `dashboard fetch failed: ${response.status}`;
+    throw new Error(message || `dashboard fetch failed: ${response.status}`);
+  }
+  state.data = (await response.json()) as DashboardPayload;
+  document.title = state.data.title;
+  updateStatus();
+  render();
+  if (state.data.cache?.state === "rebuilding" && attempt < 24) {
+    globalThis.setTimeout(() => {
+      void loadDashboard(attempt + 1);
+    }, 5000);
+  }
 }
 
 async function boot(): Promise<void> {
-  const response = await fetch(`./data/projects.json?v=${Date.now()}`, { cache: "no-store" });
-  state.data = (await response.json()) as DashboardPayload;
-  document.title = state.data.title;
-  elements.generated.textContent = `updated ${relativeDate(state.data.generatedAt)}`;
+  elements.ownerLabel.textContent = state.route.label;
   elements.devMode.checked = state.devMode;
-  render();
+  await loadDashboard();
 }
 
 elements.search.addEventListener("input", () => {
@@ -325,6 +451,11 @@ elements.devMode.addEventListener("change", () => {
   }
   localStorage.setItem("releasedeck:dev-mode", String(state.devMode));
   render();
+});
+
+elements.settingsButton.addEventListener("click", () => {
+  const open = elements.settingsPanel.toggleAttribute("data-open");
+  elements.settingsButton.setAttribute("aria-expanded", String(open));
 });
 
 document.querySelectorAll("[data-filter]").forEach((button) => {

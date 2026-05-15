@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Prevented cached dashboard data from showing archived repositories.
 - Hid archived repositories from the dashboard.
 - Updated the header owner label to `@steipete`.
 - Added a dev mode toggle for open issues, open pull requests, and latest CI status.

@@ -65,6 +65,7 @@ function relativeDate(value: string | null): string {
 }
 
 function matches(project: Project): boolean {
+  if (project.archived) return false;
   if (state.filter !== "all" && project.freshness !== state.filter) return false;
   if (!state.query) return true;
   const haystack = [
@@ -303,7 +304,7 @@ function render(): void {
 }
 
 async function boot(): Promise<void> {
-  const response = await fetch("./data/projects.json");
+  const response = await fetch(`./data/projects.json?v=${Date.now()}`, { cache: "no-store" });
   state.data = (await response.json()) as DashboardPayload;
   document.title = state.data.title;
   elements.generated.textContent = `updated ${relativeDate(state.data.generatedAt)}`;

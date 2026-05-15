@@ -118,13 +118,13 @@ function testDashboard(owner: string, projects: Project[]): DashboardPayload {
       includeForks: false,
       includeArchived: false,
       includeUnreleased: false,
-      repoLimit: 8,
+      repoLimit: 200,
     },
     cache: {
       state: "fresh",
       stale: false,
       capped: false,
-      repoLimit: 8,
+      repoLimit: 200,
       generatedAt: "2026-05-15T12:00:00Z",
     },
     totals: {
@@ -169,12 +169,12 @@ test("owner route parsing keeps root hot board and owners API-backed", () => {
 });
 
 test("worker builds root hot dashboard from cached dashboards", async () => {
-  const alphaKey = dashboardCacheKey({ owner: "alpha", schemaVersion: 1 });
-  const betaKey = dashboardCacheKey({ owner: "beta", schemaVersion: 1 });
-  const forksKey = dashboardCacheKey({ owner: "forks", includeForks: true, schemaVersion: 1 });
+  const alphaKey = dashboardCacheKey({ owner: "alpha", schemaVersion: 2 });
+  const betaKey = dashboardCacheKey({ owner: "beta", schemaVersion: 2 });
+  const forksKey = dashboardCacheKey({ owner: "forks", includeForks: true, schemaVersion: 2 });
   const env = {
     DASHBOARD_CACHE: kvStore({
-      "hot:index:v1": JSON.stringify([alphaKey]),
+      "hot:index:v2": JSON.stringify([alphaKey]),
       [alphaKey]: JSON.stringify(
         testDashboard("alpha", [
           testProject({
@@ -223,10 +223,10 @@ test("worker builds root hot dashboard from cached dashboards", async () => {
           includeForks: true,
           includeArchived: false,
           includeUnreleased: false,
-          repoLimit: 8,
+          repoLimit: 200,
         },
       }),
-      [dashboardCacheKey({ owner: "gamma", schemaVersion: 1 })]: JSON.stringify(
+      [dashboardCacheKey({ owner: "gamma", schemaVersion: 2 })]: JSON.stringify(
         testDashboard("gamma", [
           testProject({
             owner: "gamma",

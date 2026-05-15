@@ -512,7 +512,9 @@ function updateStatus(): void {
   document.title = `${label} · ReleaseBar`;
   const cacheState = state.data.cache?.state;
   const stale = state.data.cache?.stale ? " stale" : "";
-  const capped = state.data.cache?.capped ? " capped" : "";
+  const capped = state.data.cache?.capped
+    ? ` capped at ${numberFormat.format(state.data.cache.repoLimit ?? state.data.projects.length)}`
+    : "";
   elements.generated.textContent = `updated ${relativeDate(state.data.generatedAt)}${cacheState ? ` · ${cacheState}` : ""}${stale}${capped}`;
 }
 

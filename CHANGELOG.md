@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added favicon and social preview card assets.
 - Prevented cached dashboard data from showing archived repositories.
 - Hid archived repositories from the dashboard.
 - Updated the header owner label to `@steipete`.

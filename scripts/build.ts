@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import ts from "typescript";
 
@@ -351,7 +351,15 @@ async function main() {
   await rm(distDir, { recursive: true, force: true });
   await mkdir(path.join(distDir, "data"), { recursive: true });
 
-  for (const file of ["index.html", "styles.css", "app.js"]) {
+  for (const file of [
+    "index.html",
+    "styles.css",
+    "app.js",
+    "favicon.ico",
+    "favicon.svg",
+    "apple-touch-icon.png",
+    "og-card.png",
+  ]) {
     if (file === "app.js") {
       const appSource = await readFile(path.join(publicDir, "app.ts"), "utf8");
       const appOutput = ts.transpileModule(appSource, {
@@ -364,8 +372,7 @@ async function main() {
       });
       await writeFile(path.join(distDir, file), appOutput.outputText);
     } else {
-      const source = await readFile(path.join(publicDir, file), "utf8");
-      await writeFile(path.join(distDir, file), source);
+      await copyFile(path.join(publicDir, file), path.join(distDir, file));
     }
   }
 

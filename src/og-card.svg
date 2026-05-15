@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630">
+  <defs>
+    <pattern id="grid" width="34" height="34" patternUnits="userSpaceOnUse">
+      <line x1="0" y1="0" x2="34" y2="0" stroke="#9cff57" stroke-opacity=".08" stroke-width="1" />
+      <line x1="0" y1="0" x2="0" y2="34" stroke="#9cff57" stroke-opacity=".08" stroke-width="1" />
+    </pattern>
+    <radialGradient id="glow" cx="18%" cy="10%" r="80%">
+      <stop offset="0" stop-color="#63d8ff" stop-opacity=".24" />
+      <stop offset=".45" stop-color="#63d8ff" stop-opacity=".08" />
+      <stop offset="1" stop-color="#080908" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+  <rect width="1200" height="630" fill="#080908" />
+  <rect width="1200" height="630" fill="url(#grid)" />
+  <rect width="1200" height="630" fill="url(#glow)" />
+  <rect x="70" y="64" width="1060" height="502" rx="20" fill="#10130f" fill-opacity=".86" stroke="#293126" stroke-width="2" />
+  <rect x="70" y="64" width="1060" height="76" rx="20" fill="#0d100c" />
+  <path d="M70 120h1060" stroke="#293126" stroke-width="2" />
+  <circle cx="112" cy="102" r="10" fill="#ff6b6b" />
+  <circle cx="146" cy="102" r="10" fill="#ffcc66" />
+  <circle cx="180" cy="102" r="10" fill="#9cff57" />
+  <text x="222" y="111" fill="#899180" font-family="monospace" font-size="26">$ releasedeck status</text>
+  <text x="98" y="244" fill="#9cff57" font-family="monospace" font-size="32" font-weight="700">@steipete</text>
+  <text x="94" y="340" fill="#e8f4df" font-family="monospace" font-size="98" font-weight="800">ReleaseDeck</text>
+  <text x="100" y="405" fill="#c7dcbc" font-family="monospace" font-size="32">
+    Open source release freshness.
+  </text>
+  <text x="100" y="456" fill="#899180" font-family="monospace" font-size="28">
+    versions - stale releases - commits - issues - PRs - CI
+  </text>
+  <g transform="translate(100 500)" font-family="monospace" font-size="24" font-weight="700">
+    <rect width="132" height="44" rx="22" fill="#151914" stroke="#33402d" />
+    <text x="24" y="30" fill="#63d8ff">61 repos</text>
+    <rect x="154" width="170" height="44" rx="22" fill="#151914" stroke="#33402d" />
+    <text x="178" y="30" fill="#9cff57">0 archived</text>
+    <rect x="346" width="140" height="44" rx="22" fill="#151914" stroke="#33402d" />
+    <text x="370" y="30" fill="#ffcc66">dev mode</text>
+  </g>
+  <rect x="840" y="190" width="210" height="210" rx="38" fill="#080908" stroke="#9cff57" stroke-width="8" />
+  <text x="878" y="322" fill="#63d8ff" font-family="monospace" font-size="82" font-weight="800">&lt;</text>
+  <text x="936" y="328" fill="#e8f4df" font-family="monospace" font-size="88" font-weight="800">/</text>
+  <text x="987" y="322" fill="#ffcc66" font-family="monospace" font-size="82" font-weight="800">&gt;</text>
+</svg>

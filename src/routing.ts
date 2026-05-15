@@ -4,6 +4,8 @@ export type DashboardRoute = {
   fallbackApiPath: string | null;
   label: string;
   isDefault: boolean;
+  extraOwners: string[];
+  repos: string[];
 };
 
 export type RouteOptions = {
@@ -14,6 +16,8 @@ export type RouteOptions = {
 
 export const workerApiOrigin = "";
 export const workersDevApiOrigin = "https://releasedeck-api.steipete.workers.dev";
+const ownerListKey = "owners";
+const repoListKey = "repos";
 
 export function ownerFromPath(pathname: string): string | null {
   const [first] = pathname.split("/").filter(Boolean);
@@ -36,6 +40,22 @@ export function optionsFromSearch(search: string): RouteOptions {
   };
 }
 
+export function listParam(search: string, key: string): string[] {
+  const params = new URLSearchParams(search);
+  return [
+    ...new Set(
+      (params.get(key) ?? "")
+        .split(",")
+        .map((value) => value.trim().replace(/^@/, "").toLowerCase())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+export function validRepoSlug(repo: string): boolean {
+  return /^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?\/[a-z\d._-]{1,100}$/i.test(repo);
+}
+
 export function dashboardRoute(
   pathname: string,
   search = "",
@@ -43,19 +63,31 @@ export function dashboardRoute(
 ): DashboardRoute {
   const owner = ownerFromPath(pathname);
   const options = optionsFromSearch(search);
+  const extraOwners = listParam(search, ownerListKey).filter(
+    (extraOwner) =>
+      /^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?$/i.test(extraOwner) &&
+      extraOwner !== owner?.toLowerCase(),
+  );
+  const repos = listParam(search, repoListKey).filter(validRepoSlug);
   const query = new URLSearchParams();
   if (options.includeForks) query.set("forks", "true");
   if (options.includeArchived) query.set("archived", "true");
   if (options.includeUnreleased) query.set("unreleased", "true");
+  if (extraOwners.length > 0) query.set(ownerListKey, extraOwners.join(","));
+  if (repos.length > 0) query.set(repoListKey, repos.join(","));
   const suffix = query.size > 0 ? `?${query}` : "";
 
   if (!owner) {
+    const custom = extraOwners.length > 0 || repos.length > 0;
+    const apiPath = custom ? `/api/dashboard${suffix}` : `./data/projects.json${suffix}`;
     return {
       owner: null,
-      apiPath: `./data/projects.json${suffix}`,
-      fallbackApiPath: null,
-      label: "@steipete",
-      isDefault: true,
+      apiPath: `${custom ? apiOrigin : ""}${apiPath}`,
+      fallbackApiPath: custom && apiOrigin === "" ? `${workersDevApiOrigin}${apiPath}` : null,
+      label: custom ? "custom deck" : "@steipete",
+      isDefault: !custom,
+      extraOwners,
+      repos,
     };
   }
 
@@ -64,7 +96,12 @@ export function dashboardRoute(
     owner,
     apiPath: `${apiOrigin}${ownerPath}`,
     fallbackApiPath: apiOrigin === "" ? `${workersDevApiOrigin}${ownerPath}` : null,
-    label: `@${owner}`,
+    label:
+      extraOwners.length > 0 || repos.length > 0
+        ? `@${owner} +${extraOwners.length + repos.length}`
+        : `@${owner}`,
     isDefault: false,
+    extraOwners,
+    repos,
   };
 }

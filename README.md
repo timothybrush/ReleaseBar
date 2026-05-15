@@ -25,7 +25,11 @@ Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token
 - `/` loads the checked-in static snapshot from `data/projects.json`
 - `/:owner` loads the Worker API for that owner
 - query options: `forks=true`, `archived=true`, `unreleased=true`
+- add public sources with `owners=openclaw,steipete` or `repos=owner/name`
+- the settings panel can add public users, orgs, or explicit repos to the current URL
+- custom URLs are capped at 8 added public sources
 - settings can hide visible owners or repos locally without changing the shared cache
+- private orgs need the future GitHub App login flow; public dashboards do not require login
 
 The Worker in `worker/index.ts` serves both the static app shell and the generic owner API. It validates public GitHub owners, builds a capped public dashboard from the 8 most recently pushed public repos, stores it in KV, serves fresh cache for 1h, and serves stale cache while revalidating. Configure `DASHBOARD_CACHE` and `GITHUB_TOKEN` before deploying the Worker. GitHub Pages builds fall back to the workers.dev API origin while DNS is still cached away from Cloudflare.
 

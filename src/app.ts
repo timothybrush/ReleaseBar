@@ -1,5 +1,5 @@
 import type { CiState, DashboardPayload, Freshness, Project } from "./types.js";
-import { dashboardRoute } from "./routing.js";
+import { dashboardRoute, validRepoSlug } from "./routing.js";
 
 type SortKey = "repo" | "version" | "release" | "since" | "activity" | "issues" | "prs" | "ci";
 type SortDirection = "asc" | "desc";
@@ -29,7 +29,7 @@ const dateFormat = new Intl.DateTimeFormat("en", {
 const relativeFormat = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
 
 const elements = {
-  ownerLabel: query<HTMLParagraphElement>("#ownerLabel"),
+  dashboardTitle: query<HTMLHeadingElement>("#dashboardTitle"),
   generated: query<HTMLSpanElement>("#generated"),
   subtitle: query<HTMLParagraphElement>("#subtitle"),
   repoCount: query<HTMLSpanElement>("#repoCount"),
@@ -41,6 +41,9 @@ const elements = {
   settingsButton: query<HTMLButtonElement>("#settingsButton"),
   settingsPanel: query<HTMLDivElement>("#settingsPanel"),
   settingsSummary: query<HTMLParagraphElement>("#settingsSummary"),
+  sourceForm: query<HTMLFormElement>("#sourceForm"),
+  sourceInput: query<HTMLInputElement>("#sourceInput"),
+  signInButton: query<HTMLButtonElement>("#signInButton"),
   ownerToggles: query<HTMLDivElement>("#ownerToggles"),
   repoToggles: query<HTMLDivElement>("#repoToggles"),
   projects: query<HTMLDivElement>("#projects"),
@@ -54,6 +57,18 @@ function query<T extends Element>(selector: string): T {
     throw new Error(`Missing ${selector}`);
   }
   return element;
+}
+
+function ownerLabel(data: DashboardPayload): string {
+  if (data.owners.length > 0) {
+    const [first] = data.owners;
+    const extraCount = data.owners.length - 1 + state.route.repos.length;
+    return `${first ? `@${first.login}` : "custom"}${extraCount > 0 ? ` +${extraCount}` : ""}`;
+  }
+  if (state.route.repos.length === 1) {
+    return state.route.repos[0] ?? "custom deck";
+  }
+  return state.route.repos.length > 1 ? `custom deck +${state.route.repos.length}` : "@steipete";
 }
 
 function daysAgo(value: string | null): number | null {
@@ -103,6 +118,26 @@ function matches(project: Project): boolean {
 function persistVisibility(): void {
   localStorage.setItem("releasedeck:hidden-owners", JSON.stringify([...state.hiddenOwners]));
   localStorage.setItem("releasedeck:hidden-repos", JSON.stringify([...state.hiddenRepos]));
+}
+
+function addSource(value: string): void {
+  const normalized = value.trim().replace(/^@/, "").toLowerCase();
+  if (!normalized) return;
+
+  const url = new URL(location.href);
+  const key = validRepoSlug(normalized) ? "repos" : "owners";
+  if (key === "owners" && !/^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?$/i.test(normalized)) {
+    elements.sourceInput.setCustomValidity("Use @owner or owner/repo");
+    elements.sourceInput.reportValidity();
+    return;
+  }
+
+  const values = [
+    ...new Set((url.searchParams.get(key) ?? "").split(",").filter(Boolean).concat(normalized)),
+  ].sort();
+  url.searchParams.set(key, values.join(","));
+  localStorage.setItem("releasedeck:custom-sources", url.search);
+  location.assign(url.toString());
 }
 
 function toggleSet(set: Set<string>, key: string, visible: boolean): void {
@@ -157,8 +192,10 @@ function renderSettings(): void {
   );
 
   const hiddenCount = state.hiddenOwners.size + state.hiddenRepos.size;
-  elements.settingsSummary.textContent =
-    hiddenCount === 0 ? "all visible" : `${numberFormat.format(hiddenCount)} hidden`;
+  const sourceCount = state.route.extraOwners.length + state.route.repos.length;
+  elements.settingsSummary.textContent = `${sourceCount === 0 ? "default sources" : `${numberFormat.format(sourceCount)} added`} · ${
+    hiddenCount === 0 ? "all visible" : `${numberFormat.format(hiddenCount)} hidden`
+  }`;
 }
 
 function tag(label: string, tone = ""): HTMLSpanElement {
@@ -392,7 +429,10 @@ function render(): void {
 
 function updateStatus(): void {
   if (!state.data) return;
+  const label = ownerLabel(state.data);
+  elements.dashboardTitle.textContent = label;
   elements.subtitle.textContent = state.data.subtitle;
+  document.title = `${label} · ReleaseDeck`;
   const cacheState = state.data.cache?.state;
   const stale = state.data.cache?.stale ? " stale" : "";
   const capped = state.data.cache?.capped ? " capped" : "";
@@ -415,7 +455,6 @@ async function loadDashboard(attempt = 0): Promise<void> {
       | null;
     if (body && "cache" in body) {
       state.data = body;
-      document.title = state.data.title;
       updateStatus();
       render();
       elements.projects.textContent = body.cache?.message || "dashboard error";
@@ -425,7 +464,6 @@ async function loadDashboard(attempt = 0): Promise<void> {
       response = await fetchPayload(state.route.fallbackApiPath);
       if (response.ok) {
         state.data = (await response.json()) as DashboardPayload;
-        document.title = state.data.title;
         updateStatus();
         render();
         return;
@@ -436,7 +474,6 @@ async function loadDashboard(attempt = 0): Promise<void> {
     throw new Error(message || `dashboard fetch failed: ${response.status}`);
   }
   state.data = (await response.json()) as DashboardPayload;
-  document.title = state.data.title;
   updateStatus();
   render();
   if (state.data.cache?.state === "rebuilding" && attempt < 24) {
@@ -447,7 +484,7 @@ async function loadDashboard(attempt = 0): Promise<void> {
 }
 
 async function boot(): Promise<void> {
-  elements.ownerLabel.textContent = state.route.label;
+  elements.dashboardTitle.textContent = state.route.label;
   elements.devMode.checked = state.devMode;
   await loadDashboard();
 }
@@ -470,6 +507,22 @@ elements.devMode.addEventListener("change", () => {
 elements.settingsButton.addEventListener("click", () => {
   const open = elements.settingsPanel.toggleAttribute("data-open");
   elements.settingsButton.setAttribute("aria-expanded", String(open));
+});
+
+elements.sourceInput.addEventListener("input", () => {
+  elements.sourceInput.setCustomValidity("");
+});
+
+elements.sourceForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  addSource(elements.sourceInput.value);
+});
+
+elements.signInButton.addEventListener("click", () => {
+  elements.sourceInput.setCustomValidity(
+    "Private org dashboards need GitHub App login next. Public owners/repos can be added now.",
+  );
+  elements.sourceInput.reportValidity();
 });
 
 document.querySelectorAll("[data-filter]").forEach((button) => {

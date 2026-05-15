@@ -16,6 +16,7 @@ export type DashboardBuildOptions = {
   includeArchived: boolean;
   includeUnreleased?: boolean;
   excludeRepos?: string[];
+  includeRepos?: string[];
   repoLimit?: number;
   token?: string;
   fetch?: typeof fetch;
@@ -115,8 +116,23 @@ export function validOwnerSlug(login: string): boolean {
   return /^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?$/i.test(login);
 }
 
+export function validRepoSlug(repo: string): boolean {
+  return /^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?\/[a-z\d._-]{1,100}$/i.test(repo);
+}
+
+function cacheHash(value: string): string {
+  let hash = 0xcbf29ce484222325n;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= BigInt(value.charCodeAt(index));
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return hash.toString(36);
+}
+
 export function dashboardCacheKey(options: {
   owner: string;
+  owners?: string[];
+  repos?: string[];
   includeForks?: boolean;
   includeArchived?: boolean;
   includeUnreleased?: boolean;
@@ -128,7 +144,14 @@ export function dashboardCacheKey(options: {
     options.includeArchived ? "archived" : "noarchived",
     options.includeUnreleased ? "unreleased" : "released",
   ].join("-");
-  return `dashboard:v${schemaVersion}:${slugOwner(options.owner)}:${flags}`;
+  const owners = (options.owners ?? []).map(slugOwner).sort().join(",");
+  const repos = (options.repos ?? [])
+    .map((repo) => repo.toLowerCase())
+    .sort()
+    .join(",");
+  const sourceText = owners || repos ? `${owners}\n${repos}` : "";
+  const sources = sourceText ? `:sources-${cacheHash(sourceText)}` : "";
+  return `dashboard:v${schemaVersion}:${slugOwner(options.owner)}:${flags}${sources}`;
 }
 
 export function filterRepo(
@@ -245,6 +268,10 @@ async function ownerRepos(
   const base = owner.type === "org" ? `/orgs/${owner.login}/repos` : `/users/${owner.login}/repos`;
   const path = `${base}?type=public&sort=pushed&direction=desc`;
   return page ? githubPage<GitHubRepo>(client, path, page) : githubPages<GitHubRepo>(client, path);
+}
+
+async function repoByFullName(client: GitHubClient, fullName: string): Promise<GitHubRepo | null> {
+  return github<GitHubRepo>(client, `/repos/${fullName}`, [404]);
 }
 
 async function latestRelease(
@@ -411,27 +438,36 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
   let capped = false;
   const seen = new Set<string>();
 
+  async function addRepo(repo: GitHubRepo, countLabel: string, force = false): Promise<void> {
+    if (projects.some((project) => project.fullName === repo.full_name)) {
+      return;
+    }
+    if ((!force && seen.has(repo.full_name)) || !filterRepo(repo, options)) {
+      return;
+    }
+    seen.add(repo.full_name);
+    options.log?.(`fetch ${countLabel} ${repo.full_name}`);
+    const project = await repoSummary(client, repo, Boolean(options.includeUnreleased));
+    if (!project) {
+      options.log?.(`skip ${repo.full_name}: no releases`);
+      return;
+    }
+    projects.push({ ...project, freshness: freshness(project) });
+  }
+
   if (options.repoLimit) {
     for (const owner of options.owners) {
+      const ownerStart = projects.length;
       let page = 1;
-      while (projects.length <= options.repoLimit) {
+      while (projects.length - ownerStart <= options.repoLimit) {
         const repos = await ownerRepos(client, owner, page);
         if (repos.length === 0) {
           break;
         }
         for (const repo of repos) {
-          if (seen.has(repo.full_name) || !filterRepo(repo, options)) {
-            continue;
-          }
-          seen.add(repo.full_name);
-          options.log?.(`fetch ${projects.length + 1}/${options.repoLimit} ${repo.full_name}`);
-          const project = await repoSummary(client, repo, Boolean(options.includeUnreleased));
-          if (!project) {
-            options.log?.(`skip ${repo.full_name}: no releases`);
-            continue;
-          }
-          projects.push({ ...project, freshness: freshness(project) });
-          if (projects.length > options.repoLimit) {
+          const ownerCount = projects.length - ownerStart;
+          await addRepo(repo, `${owner.login} ${ownerCount + 1}/${options.repoLimit}`);
+          if (projects.length - ownerStart > options.repoLimit) {
             capped = true;
             break;
           }
@@ -441,8 +477,8 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
         }
         page += 1;
       }
-      if (projects.length > options.repoLimit) {
-        break;
+      if (projects.length - ownerStart > options.repoLimit) {
+        projects.splice(ownerStart + options.repoLimit);
       }
     }
   } else {
@@ -458,18 +494,15 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
     ];
 
     for (const [index, repo] of uniqueRepos.entries()) {
-      options.log?.(`fetch ${index + 1}/${uniqueRepos.length} ${repo.full_name}`);
-      const project = await repoSummary(client, repo, Boolean(options.includeUnreleased));
-      if (!project) {
-        options.log?.(`skip ${repo.full_name}: no releases`);
-        continue;
-      }
-      projects.push({ ...project, freshness: freshness(project) });
+      await addRepo(repo, `${index + 1}/${uniqueRepos.length}`);
     }
   }
 
-  if (options.repoLimit && projects.length > options.repoLimit) {
-    projects.length = options.repoLimit;
+  for (const fullName of options.includeRepos ?? []) {
+    const repo = await repoByFullName(client, fullName);
+    if (repo) {
+      await addRepo(repo, `custom`, true);
+    }
   }
 
   projects.sort((a, b) => {

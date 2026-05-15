@@ -23,13 +23,13 @@ Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token
 ## Generic Dashboards
 
 - `/` loads the checked-in static snapshot from `data/projects.json`
-- `/:owner` loads `/api/:owner`
+- `/:owner` loads the Worker API for that owner
 - query options: `forks=true`, `archived=true`, `unreleased=true`
 - settings can hide visible owners or repos locally without changing the shared cache
 
-The Worker API in `worker/index.ts` validates public GitHub owners, builds a capped public dashboard from the 8 most recently pushed public repos, stores it in KV, serves fresh cache for 1h, and serves stale cache while revalidating. Configure `DASHBOARD_CACHE` and `GITHUB_TOKEN` before deploying the Worker.
+The Worker API in `worker/index.ts` validates public GitHub owners, builds a capped public dashboard from the 8 most recently pushed public repos, stores it in KV, serves fresh cache for 1h, and serves stale cache while revalidating. Configure `DASHBOARD_CACHE` and `GITHUB_TOKEN` before deploying the Worker. Until `releasedeck.dev` is proxied through Cloudflare, owner dashboards call the workers.dev API origin directly.
 
 ## Deploy
 
 GitHub Pages is deployed by `.github/workflows/pages.yml`.
-The optional `/api/:owner` Worker is deployed separately with Wrangler once `wrangler.toml` has production KV ids.
+The optional owner dashboard API Worker is deployed separately with Wrangler once `wrangler.toml` has production KV ids.

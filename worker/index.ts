@@ -29,6 +29,11 @@ const repoLimit = 8;
 const schemaVersion = 1;
 const locks = new Map<string, Promise<DashboardPayload>>();
 const buildPending = Symbol("build-pending");
+const corsHeaders = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, OPTIONS",
+  "access-control-allow-headers": "content-type",
+};
 
 function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body, null, 2), {
@@ -36,6 +41,7 @@ function jsonResponse(body: unknown, status = 200, headers: Record<string, strin
     headers: {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "public, max-age=300, stale-while-revalidate=3600",
+      ...corsHeaders,
       ...headers,
     },
   });
@@ -267,6 +273,9 @@ async function ownerResponse(
 export default {
   async fetch(request: Request, env: Env, context: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
     if (request.method !== "GET") {
       return jsonResponse({ error: "method not allowed" }, 405, { allow: "GET" });
     }

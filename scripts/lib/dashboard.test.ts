@@ -9,7 +9,12 @@ import {
   normalizeBuildOptions,
   validOwnerSlug,
 } from "./dashboard.js";
-import { dashboardRoute, optionsFromSearch, ownerFromPath } from "../../src/routing.js";
+import {
+  dashboardRoute,
+  optionsFromSearch,
+  ownerFromPath,
+  workerApiOrigin,
+} from "../../src/routing.js";
 
 test("owner route parsing keeps root static and owners API-backed", () => {
   assert.equal(ownerFromPath("/"), null);
@@ -18,10 +23,10 @@ test("owner route parsing keeps root static and owners API-backed", () => {
   assert.equal(ownerFromPath("/bad_owner"), null);
 
   assert.deepEqual(dashboardRoute("/", "").isDefault, true);
-  assert.equal(dashboardRoute("/openclaw", "").apiPath, "/api/openclaw");
+  assert.equal(dashboardRoute("/openclaw", "").apiPath, `${workerApiOrigin}/api/openclaw`);
   assert.equal(
     dashboardRoute("/openclaw", "?forks=true&archived=true&unreleased=true").apiPath,
-    "/api/openclaw?forks=true&archived=true&unreleased=true",
+    `${workerApiOrigin}/api/openclaw?forks=true&archived=true&unreleased=true`,
   );
 });
 

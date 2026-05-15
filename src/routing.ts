@@ -11,6 +11,8 @@ export type RouteOptions = {
   includeUnreleased: boolean;
 };
 
+export const workerApiOrigin = "https://releasedeck-api.services-91b.workers.dev";
+
 export function ownerFromPath(pathname: string): string | null {
   const [first] = pathname.split("/").filter(Boolean);
   if (!first || first === "index.html") {
@@ -32,7 +34,11 @@ export function optionsFromSearch(search: string): RouteOptions {
   };
 }
 
-export function dashboardRoute(pathname: string, search = ""): DashboardRoute {
+export function dashboardRoute(
+  pathname: string,
+  search = "",
+  apiOrigin = workerApiOrigin,
+): DashboardRoute {
   const owner = ownerFromPath(pathname);
   const options = optionsFromSearch(search);
   const query = new URLSearchParams();
@@ -52,7 +58,7 @@ export function dashboardRoute(pathname: string, search = ""): DashboardRoute {
 
   return {
     owner,
-    apiPath: `/api/${encodeURIComponent(owner)}${suffix}`,
+    apiPath: `${apiOrigin}/api/${encodeURIComponent(owner)}${suffix}`,
     label: `@${owner}`,
     isDefault: false,
   };

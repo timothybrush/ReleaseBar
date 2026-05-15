@@ -2,7 +2,7 @@ name = "releasedeck-api"
 main = "node_modules/.cache/releasedeck-build/worker/index.js"
 compatibility_date = "2026-05-15"
 account_id = "91b59577e757131d68d55a471fe32aca"
-routes = [{ pattern = "releasedeck.dev/api/*", zone_name = "releasedeck.dev" }]
+workers_dev = true
 
 [build]
 command = "npm run build:script"

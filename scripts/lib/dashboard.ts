@@ -4,7 +4,7 @@ import type {
   Freshness,
   Owner,
   Project,
-  ReleaseDeckConfig,
+  ReleaseBarConfig,
 } from "../../src/types.js";
 
 export type DashboardBuildOptions = {
@@ -96,7 +96,7 @@ type GitHubClient = {
 };
 
 export function normalizeBuildOptions(
-  config: ReleaseDeckConfig,
+  config: ReleaseBarConfig,
   overrides: Partial<DashboardBuildOptions> = {},
 ): DashboardBuildOptions {
   return {
@@ -186,7 +186,7 @@ export function freshness(project: Pick<Project, "commitsSinceRelease">): Freshn
 function githubClient(token = "", fetcher: typeof fetch = fetch): GitHubClient {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
-    "User-Agent": "ReleaseDeck",
+    "User-Agent": "ReleaseBar",
     "X-GitHub-Api-Version": "2022-11-28",
   };
 

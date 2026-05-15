@@ -1,7 +1,7 @@
 {
-  "title": "ReleaseDeck",
+  "title": "ReleaseBar",
   "subtitle": "Open source release freshness across steipete and OpenClaw.",
-  "canonicalDomain": "releasedeck.dev",
+  "canonicalDomain": "release.bar",
   "owners": [
     {
       "type": "user",

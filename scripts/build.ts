@@ -3,7 +3,7 @@ import path from "node:path";
 import ts from "typescript";
 
 import { buildDashboard, normalizeBuildOptions } from "./lib/dashboard.js";
-import type { ReleaseDeckConfig } from "../src/types.js";
+import type { ReleaseBarConfig } from "../src/types.js";
 
 const root = process.cwd();
 const distDir = path.join(root, "dist");
@@ -11,7 +11,7 @@ const configPath = path.join(root, "releasedeck.config.json");
 const publicDir = path.join(root, "src");
 const checkOnly = process.argv.includes("--check");
 
-async function copyStaticAssets(config: ReleaseDeckConfig): Promise<void> {
+async function copyStaticAssets(config: ReleaseBarConfig): Promise<void> {
   await rm(distDir, { recursive: true, force: true });
   await mkdir(path.join(distDir, "data"), { recursive: true });
 
@@ -46,7 +46,7 @@ async function copyStaticAssets(config: ReleaseDeckConfig): Promise<void> {
 }
 
 async function main() {
-  const config = JSON.parse(await readFile(configPath, "utf8")) as ReleaseDeckConfig;
+  const config = JSON.parse(await readFile(configPath, "utf8")) as ReleaseBarConfig;
   const payload = await buildDashboard(
     normalizeBuildOptions(config, {
       token: process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "",

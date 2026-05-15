@@ -502,7 +502,7 @@ function updateStatus(): void {
   const label = ownerLabel(state.data);
   elements.dashboardTitle.textContent = label;
   elements.subtitle.textContent = state.data.subtitle;
-  document.title = `${label} · ReleaseDeck`;
+  document.title = `${label} · ReleaseBar`;
   const cacheState = state.data.cache?.state;
   const stale = state.data.cache?.stale ? " stale" : "";
   const capped = state.data.cache?.capped ? " capped" : "";

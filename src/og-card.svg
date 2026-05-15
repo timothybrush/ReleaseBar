@@ -19,9 +19,9 @@
   <circle cx="112" cy="102" r="10" fill="#ff6b6b" />
   <circle cx="146" cy="102" r="10" fill="#ffcc66" />
   <circle cx="180" cy="102" r="10" fill="#9cff57" />
-  <text x="222" y="111" fill="#899180" font-family="monospace" font-size="26">$ releasedeck status</text>
+  <text x="222" y="111" fill="#899180" font-family="monospace" font-size="26">$ releasebar status</text>
   <text x="98" y="244" fill="#9cff57" font-family="monospace" font-size="32" font-weight="700">@steipete</text>
-  <text x="94" y="340" fill="#e8f4df" font-family="monospace" font-size="98" font-weight="800">ReleaseDeck</text>
+  <text x="94" y="340" fill="#e8f4df" font-family="monospace" font-size="98" font-weight="800">ReleaseBar</text>
   <text x="100" y="405" fill="#c7dcbc" font-family="monospace" font-size="32">
     Open source release freshness.
   </text>

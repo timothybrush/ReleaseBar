@@ -211,8 +211,8 @@ function randomNonce(): string {
 function safeReturnTo(value: string | null): string {
   if (!value || value.startsWith("//")) return "/";
   try {
-    const url = new URL(value, "https://releasedeck.dev");
-    if (url.origin !== "https://releasedeck.dev") return "/";
+    const url = new URL(value, "https://release.bar");
+    if (url.origin !== "https://release.bar") return "/";
     return `${url.pathname}${url.search}${url.hash}`;
   } catch {
     return "/";
@@ -355,10 +355,10 @@ async function assetResponse(request: Request, env: Env): Promise<Response> {
     const label = socialLabel(originalUrl);
     const image = `${originalUrl.origin}/og/${encodeURIComponent(label)}.svg`;
     const html = (await response.text())
-      .replace(/<title>.*?<\/title>/, `<title>${escapeHtml(label)} · ReleaseDeck</title>`)
+      .replace(/<title>.*?<\/title>/, `<title>${escapeHtml(label)} · ReleaseBar</title>`)
       .replace(
         /<meta property="og:title" content="[^"]*" \/>/,
-        `<meta property="og:title" content="${escapeHtml(label)} · ReleaseDeck" />`,
+        `<meta property="og:title" content="${escapeHtml(label)} · ReleaseBar" />`,
       )
       .replace(
         /<meta property="og:url" content="[^"]*" \/>/,
@@ -370,7 +370,7 @@ async function assetResponse(request: Request, env: Env): Promise<Response> {
       )
       .replace(
         /<meta name="twitter:title" content="[^"]*" \/>/,
-        `<meta name="twitter:title" content="${escapeHtml(label)} · ReleaseDeck" />`,
+        `<meta name="twitter:title" content="${escapeHtml(label)} · ReleaseBar" />`,
       )
       .replace(
         /<meta name="twitter:image" content="[^"]*" \/>/,
@@ -421,10 +421,10 @@ function socialImage(label: string): Response {
   <rect width="1200" height="630" fill="#080908"/>
   <path d="M0 124H1200M0 248H1200M0 372H1200M0 496H1200M160 0V630M400 0V630M640 0V630M880 0V630M1120 0V630" stroke="#182014" stroke-width="1"/>
   <rect x="72" y="70" width="1056" height="490" rx="0" fill="none" stroke="#8cff4b" stroke-width="2"/>
-  <text x="96" y="148" fill="#a8ff6b" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="38" letter-spacing="0">ReleaseDeck</text>
+  <text x="96" y="148" fill="#a8ff6b" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="38" letter-spacing="0">ReleaseBar</text>
   <text x="92" y="354" fill="#f2ffe9" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="${titleSize}" font-weight="700" letter-spacing="0">${title}</text>
   <text x="96" y="444" fill="#8f9b89" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="34" letter-spacing="0">release freshness dashboard</text>
-  <text x="96" y="506" fill="#52604d" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="24" letter-spacing="0">releasedeck.dev</text>
+  <text x="96" y="506" fill="#52604d" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="24" letter-spacing="0">release.bar</text>
 </svg>`;
   return new Response(svg, {
     headers: {
@@ -550,7 +550,7 @@ async function githubUser(accessToken: string): Promise<AuthUser> {
     headers: {
       accept: "application/vnd.github+json",
       authorization: `Bearer ${accessToken}`,
-      "user-agent": "ReleaseDeck",
+      "user-agent": "ReleaseBar",
       "x-github-api-version": "2022-11-28",
     },
   });
@@ -572,7 +572,7 @@ async function githubJson<T>(accessToken: string, pathname: string): Promise<T> 
     headers: {
       accept: "application/vnd.github+json",
       authorization: `Bearer ${accessToken}`,
-      "user-agent": "ReleaseDeck",
+      "user-agent": "ReleaseBar",
       "x-github-api-version": "2022-11-28",
     },
   });
@@ -731,7 +731,7 @@ async function githubInstallationToken(env: Env, installationId: number): Promis
       headers: {
         accept: "application/vnd.github+json",
         authorization: `Bearer ${jwt}`,
-        "user-agent": "ReleaseDeck",
+        "user-agent": "ReleaseBar",
         "x-github-api-version": "2022-11-28",
       },
     },
@@ -1041,9 +1041,9 @@ async function rebuild(dashboard: DashboardRequest, env: Env): Promise<Dashboard
 
   const promise = (async () => {
     const payload = await buildDashboard({
-      title: "ReleaseDeck",
+      title: "ReleaseBar",
       subtitle: dashboard.subtitle,
-      canonicalDomain: env.RELEASEDECK_CANONICAL_DOMAIN ?? "releasedeck.dev",
+      canonicalDomain: env.RELEASEDECK_CANONICAL_DOMAIN ?? "release.bar",
       owners: dashboard.owners,
       includeRepos: dashboard.includeRepos,
       ...optionsFromUrl(dashboard.url),
@@ -1090,9 +1090,9 @@ function statusPayload(
   generatedAt: string,
 ): DashboardPayload {
   return {
-    title: "ReleaseDeck",
+    title: "ReleaseBar",
     subtitle: dashboard.subtitle,
-    canonicalDomain: env.RELEASEDECK_CANONICAL_DOMAIN ?? "releasedeck.dev",
+    canonicalDomain: env.RELEASEDECK_CANONICAL_DOMAIN ?? "release.bar",
     generatedAt,
     owners: dashboard.owners,
     options: {

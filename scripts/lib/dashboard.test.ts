@@ -84,7 +84,7 @@ test("owner route parsing keeps root static and owners API-backed", () => {
 test("worker rejects oversized custom source requests", async () => {
   const owners = Array.from({ length: 9 }, (_, index) => `owner-${index}`).join(",");
   const response = await worker.fetch(
-    new Request(`https://releasedeck.dev/api/dashboard?owners=${owners}`),
+    new Request(`https://release.bar/api/dashboard?owners=${owners}`),
     {},
     { waitUntil: () => undefined },
   );
@@ -103,7 +103,7 @@ test("worker exposes GitHub App auth endpoints", async () => {
   };
   const context = { waitUntil: () => undefined };
 
-  const anonymous = await worker.fetch(new Request("https://releasedeck.dev/api/me"), env, context);
+  const anonymous = await worker.fetch(new Request("https://release.bar/api/me"), env, context);
   assert.equal(anonymous.status, 200);
   assert.deepEqual(await anonymous.json(), {
     configured: true,
@@ -112,14 +112,14 @@ test("worker exposes GitHub App auth endpoints", async () => {
     installations: [],
     installNeeded: false,
     installReason: null,
-    loginUrl: "https://releasedeck.dev/api/auth/login",
-    logoutUrl: "https://releasedeck.dev/api/auth/logout",
-    installUrl: "https://releasedeck.dev/api/auth/install",
+    loginUrl: "https://release.bar/api/auth/login",
+    logoutUrl: "https://release.bar/api/auth/logout",
+    installUrl: "https://release.bar/api/auth/install",
     appUrl: "https://github.com/apps/releasedeck",
   });
 
   const login = await worker.fetch(
-    new Request("https://releasedeck.dev/api/auth/login?returnTo=/openclaw?owners=steipete"),
+    new Request("https://release.bar/api/auth/login?returnTo=/openclaw?owners=steipete"),
     env,
     context,
   );
@@ -127,17 +127,17 @@ test("worker exposes GitHub App auth endpoints", async () => {
   const location = login.headers.get("location") ?? "";
   assert.equal(location.startsWith("https://github.com/login/oauth/authorize?"), true);
   assert.match(location, /client_id=Iv123/);
-  assert.match(location, /redirect_uri=https%3A%2F%2Freleasedeck.dev%2Fapi%2Fauth%2Fcallback/);
+  assert.match(location, /redirect_uri=https%3A%2F%2Frelease.bar%2Fapi%2Fauth%2Fcallback/);
 
   const badCallback = await worker.fetch(
-    new Request("https://releasedeck.dev/api/auth/callback?code=x&state=bad"),
+    new Request("https://release.bar/api/auth/callback?code=x&state=bad"),
     env,
     context,
   );
   assert.equal(badCallback.status, 400);
 
   const install = await worker.fetch(
-    new Request("https://releasedeck.dev/api/auth/install?returnTo=/openclaw"),
+    new Request("https://release.bar/api/auth/install?returnTo=/openclaw"),
     env,
     context,
   );
@@ -199,7 +199,7 @@ test("worker reports GitHub App installation coverage for signed-in users", asyn
   };
   try {
     const response = await worker.fetch(
-      new Request("https://releasedeck.dev/api/me?returnTo=/openclaw", {
+      new Request("https://release.bar/api/me?returnTo=/openclaw", {
         headers: { cookie: `rd_session=${authCookie}` },
       }),
       env,
@@ -266,7 +266,7 @@ test("worker surfaces mixed-account dashboards as shared-quota", async () => {
   };
   try {
     const response = await worker.fetch(
-      new Request("https://releasedeck.dev/api/me?returnTo=/openclaw?owners=steipete", {
+      new Request("https://release.bar/api/me?returnTo=/openclaw?owners=steipete", {
         headers: { cookie: `rd_session=${authCookie}` },
       }),
       env,
@@ -353,7 +353,7 @@ test("worker uses GitHub App installation token for cold owner dashboards", asyn
   };
   try {
     const response = await worker.fetch(
-      new Request("https://releasedeck.dev/api/openclaw", {
+      new Request("https://release.bar/api/openclaw", {
         headers: { cookie: `rd_session=${authCookie}` },
       }),
       env,
@@ -376,7 +376,7 @@ test("query options are explicit booleans", () => {
 
 test("build option normalization preserves config includeUnreleased", () => {
   const options = normalizeBuildOptions({
-    title: "ReleaseDeck",
+    title: "ReleaseBar",
     subtitle: "test",
     canonicalDomain: "example.com",
     owners: [{ type: "user", login: "owner" }],
@@ -505,7 +505,7 @@ test("dashboard build skips empty unreleased repositories without failing", asyn
   };
 
   const payload = await buildDashboard({
-    title: "ReleaseDeck",
+    title: "ReleaseBar",
     subtitle: "test",
     canonicalDomain: "example.com",
     owners: [{ type: "user", login: "owner" }],
@@ -519,7 +519,7 @@ test("dashboard build skips empty unreleased repositories without failing", asyn
 
 test("dashboard build can add explicit public repositories without an owner scan", async () => {
   const payload = await buildDashboard({
-    title: "ReleaseDeck",
+    title: "ReleaseBar",
     subtitle: "test",
     canonicalDomain: "example.com",
     owners: [],
@@ -605,7 +605,7 @@ test("dashboard cache cap only marks omitted repos as capped", async () => {
 
   const build = (repos: unknown[]) =>
     buildDashboard({
-      title: "ReleaseDeck",
+      title: "ReleaseBar",
       subtitle: "test",
       canonicalDomain: "example.com",
       owners: [{ type: "user", login: "owner" }],
@@ -674,7 +674,7 @@ test("explicit repositories survive capped owner scan trimming", async () => {
   });
 
   const payload = await buildDashboard({
-    title: "ReleaseDeck",
+    title: "ReleaseBar",
     subtitle: "test",
     canonicalDomain: "example.com",
     owners: [{ type: "user", login: "owner" }],
@@ -751,7 +751,7 @@ test("dashboard repo cap applies after visibility filters", async () => {
   });
 
   const payload = await buildDashboard({
-    title: "ReleaseDeck",
+    title: "ReleaseBar",
     subtitle: "test",
     canonicalDomain: "example.com",
     owners: [{ type: "user", login: "owner" }],
@@ -830,7 +830,7 @@ test("dashboard repo cap applies per owner for custom dashboards", async () => {
   });
 
   const payload = await buildDashboard({
-    title: "ReleaseDeck",
+    title: "ReleaseBar",
     subtitle: "test",
     canonicalDomain: "example.com",
     owners: [
@@ -917,7 +917,7 @@ test("dashboard repo cap applies after release eligibility", async () => {
   const released = new Set(["one", "two", "three"]);
 
   const payload = await buildDashboard({
-    title: "ReleaseDeck",
+    title: "ReleaseBar",
     subtitle: "test",
     canonicalDomain: "example.com",
     owners: [{ type: "user", login: "owner" }],
@@ -1002,7 +1002,7 @@ test("dashboard repo cap keeps paginating until eligible repos survive filters",
   });
 
   const payload = await buildDashboard({
-    title: "ReleaseDeck",
+    title: "ReleaseBar",
     subtitle: "test",
     canonicalDomain: "example.com",
     owners: [{ type: "user", login: "owner" }],

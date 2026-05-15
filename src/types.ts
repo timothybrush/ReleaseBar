@@ -3,7 +3,7 @@ export type Owner = {
   login: string;
 };
 
-export type ReleaseDeckConfig = {
+export type ReleaseBarConfig = {
   title: string;
   subtitle: string;
   canonicalDomain: string;

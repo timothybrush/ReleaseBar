@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Changed the canonical public domain to `release.bar` and renamed the public dashboard to ReleaseBar.
 - Added a combined GitHub connection flow that detects GitHub App installations and prompts installation for dedicated API quota only when needed.
 - Removed the always-on GitHub App install action from the account menu and tightened account menu styling.
 - Moved GitHub login state into a top-right account menu with settings and logout actions.

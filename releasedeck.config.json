@@ -13,6 +13,6 @@
     }
   ],
   "includeForks": false,
-  "includeArchived": true,
+  "includeArchived": false,
   "excludeRepos": ["steipete/steipete"]
 }

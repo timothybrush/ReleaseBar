@@ -2,9 +2,10 @@
 
 ## Unreleased
 
+- Fixed GitHub App install redirects to use the real `releasedeck` app slug while keeping `release.bar` OAuth callbacks.
 - Changed the root dashboard to `ReleaseBar Hot`, built from cached public dashboards instead of the maintainer snapshot.
 - Replaced raw GitHub rate-limit failures with dashboard-shaped quota guidance.
-- Changed the canonical public domain to `release.bar`, renamed the public dashboard to ReleaseBar, and updated the default GitHub App slug to `releasebar`.
+- Changed the canonical public domain to `release.bar` and renamed the public dashboard to ReleaseBar.
 - Added a combined GitHub connection flow that detects GitHub App installations and prompts installation for dedicated API quota only when needed.
 - Removed the always-on GitHub App install action from the account menu and tightened account menu styling.
 - Moved GitHub login state into a top-right account menu with settings and logout actions.

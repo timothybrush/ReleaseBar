@@ -256,7 +256,7 @@ function authConfigured(env: Env): boolean {
 }
 
 function appSlug(env: Env): string {
-  return env.GITHUB_APP_SLUG || "releasebar";
+  return env.GITHUB_APP_SLUG || "releasedeck";
 }
 
 function cookie(name: string, value: string, maxAge = sessionMaxAgeSeconds): string {

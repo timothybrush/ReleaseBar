@@ -36,7 +36,7 @@ Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token
 - GitHub App installation gives ReleaseBar dedicated GitHub API quota for the selected account/repositories; public dashboards still fall back to the shared server token and cache
 - private repositories are ignored even when selected in GitHub App installation; ReleaseBar only stores and renders public repository metadata
 
-The Worker in `worker/index.ts` serves both the static app shell and the generic owner API. It validates public GitHub owners, builds a capped public dashboard from up to 200 public released repositories per owner, stores it in KV, serves fresh cache for 1h, serves stale cache while revalidating, and builds the root hot board from existing cached dashboards. Configure `DASHBOARD_CACHE` and `GITHUB_TOKEN` before deploying the Worker. GitHub Pages builds fall back to the workers.dev API origin while DNS is still cached away from Cloudflare.
+The Worker in `worker/index.ts` serves both the static app shell and the generic owner API. It validates public GitHub owners, builds a capped public dashboard from up to 200 public released repositories per owner, stores dashboards and repo fragments in KV, serves fresh cache for 1h, serves stale cache while revalidating, and builds the root hot board from existing cached dashboards. A Durable Object binding prevents repeated cold requests from stampeding GitHub. Configure `DASHBOARD_CACHE`, `DASHBOARD_LOCKS`, and `GITHUB_TOKEN` before deploying the Worker.
 
 ### GitHub App Login
 
@@ -54,12 +54,11 @@ Set the GitHub App setup URL to `https://release.bar/api/auth/install` and enabl
 
 ## Deploy
 
-GitHub Pages is deployed by `.github/workflows/pages.yml`.
-The combined app/API Worker deploys with Wrangler:
+The combined app/API Worker deploys with Wrangler through `.github/workflows/deploy.yml` on pushes to `main`:
 
 ```sh
 npm run build
 wrangler deploy
 ```
 
-`wrangler.toml` binds `dist` as Worker static assets and runs the Worker first so `/api/*` stays dynamic and owner routes like `/openclaw` return the app shell with HTTP 200.
+`wrangler.toml` binds `dist` as Worker static assets, `DASHBOARD_CACHE` as KV, and `DASHBOARD_LOCKS` as the Durable Object single-flight lock. The Worker runs first so `/api/*` stays dynamic and owner routes like `/openclaw` return the app shell with HTTP 200.

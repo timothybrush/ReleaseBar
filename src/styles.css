@@ -558,6 +558,83 @@ body.dev-mode .dev-only {
   text-transform: lowercase;
 }
 
+.loading-state {
+  min-height: 260px;
+  padding: 42px 18px 48px;
+  border-top: 1px solid var(--line);
+  background:
+    linear-gradient(180deg, rgba(156, 255, 87, 0.035), transparent 62%), rgba(8, 9, 8, 0.42);
+  color: var(--muted);
+  text-align: center;
+}
+
+.loading-kicker {
+  display: block;
+  color: var(--green);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.loading-state strong {
+  display: block;
+  margin-top: 14px;
+  color: var(--text);
+  font-size: clamp(24px, 3vw, 42px);
+  line-height: 1;
+}
+
+.loading-state small {
+  display: block;
+  max-width: 520px;
+  margin: 12px auto 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.loading-bars {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(44px, 1fr));
+  gap: 8px;
+  width: min(280px, 70vw);
+  margin: 28px auto 0;
+}
+
+.loading-bars span {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--line-strong);
+  animation: loading-pulse 1.2s ease-in-out infinite;
+}
+
+.loading-bars span:nth-child(2) {
+  animation-delay: 0.16s;
+}
+
+.loading-bars span:nth-child(3) {
+  animation-delay: 0.32s;
+}
+
+.empty-state {
+  background: rgba(8, 9, 8, 0.42);
+}
+
+.empty-state .loading-kicker {
+  color: var(--muted);
+}
+
+@keyframes loading-pulse {
+  0%,
+  100% {
+    background: var(--line-strong);
+    box-shadow: none;
+  }
+
+  50% {
+    background: var(--green);
+    box-shadow: 0 0 18px rgba(156, 255, 87, 0.28);
+  }
+}
+
 .table-head button:last-child,
 .project > div:last-child {
   border-right: 0;

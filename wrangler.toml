@@ -17,3 +17,11 @@ run_worker_first = true
 binding = "DASHBOARD_CACHE"
 id = "687a658593b94897b8cc09d62127d140"
 preview_id = "30e91855eea543e8ad6e0b6f981d529f"
+
+[[durable_objects.bindings]]
+name = "DASHBOARD_LOCKS"
+class_name = "DashboardBuildLock"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DashboardBuildLock"]

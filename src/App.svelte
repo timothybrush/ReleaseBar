@@ -76,6 +76,9 @@
     sortKey,
     sortDirection,
   );
+  $: dashboardFetching =
+    (!data && !errorMessage) ||
+    (data?.cache?.state === "rebuilding" && data.projects.length === 0);
   $: ownerToggles = data
     ? [...new Set(data.projects.map((project) => project.owner.toLowerCase()))].sort()
     : [];
@@ -858,8 +861,25 @@
     <div class="projects">
       {#if errorMessage}
         <p class="error-message">{errorMessage}</p>
-      {/if}
-      {#each filteredProjects as project (project.fullName)}
+      {:else if dashboardFetching}
+        <div class="loading-state" aria-live="polite">
+          <span class="loading-kicker">fetching dashboard</span>
+          <strong>{data?.cache?.message ?? "building release data"}</strong>
+          <small>GitHub data is being cached. This dashboard will refresh automatically.</small>
+          <div class="loading-bars" aria-hidden="true">
+            <span></span>
+            <span></span>
+            <span></span>
+          </div>
+        </div>
+      {:else if filteredProjects.length === 0}
+        <div class="loading-state empty-state">
+          <span class="loading-kicker">no matching repos</span>
+          <strong>nothing visible here</strong>
+          <small>Adjust search, filters, or dashboard settings.</small>
+        </div>
+      {:else}
+        {#each filteredProjects as project (project.fullName)}
         <article class="project" data-freshness={project.freshness}>
           <div class="repo-cell">
             <a class="repo-link" target="_blank" rel="noreferrer" href={project.url}>
@@ -923,7 +943,8 @@
             {/if}
           </div>
         </article>
-      {/each}
+        {/each}
+      {/if}
     </div>
   </section>
 </main>

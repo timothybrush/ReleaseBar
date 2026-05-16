@@ -20,7 +20,13 @@ export type DashboardBuildOptions = {
   repoLimit?: number;
   token?: string;
   fetch?: typeof fetch;
+  projectCache?: ProjectCache;
   log?: (message: string) => void;
+};
+
+type ProjectCache = {
+  get(key: string): Promise<string | null>;
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
 };
 
 type GitHubOwner = {
@@ -44,6 +50,9 @@ type GitHubRepo = {
   updated_at: string | null;
   fork: boolean;
   private: boolean;
+  latest_release?: GitHubRelease | null;
+  open_issues_total?: number;
+  open_pull_requests_total?: number;
 };
 
 type GitHubRelease = {
@@ -93,7 +102,70 @@ type CiDetails = {
 type GitHubClient = {
   fetch: typeof fetch;
   headers: Record<string, string>;
+  graphqlCursors: Map<string, Array<string | null | undefined>>;
 };
+
+type GraphQLRepoNode = {
+  owner: {
+    login: string;
+    __typename?: string;
+  };
+  name: string;
+  nameWithOwner: string;
+  description: string | null;
+  url: string;
+  defaultBranchRef: null | {
+    name: string;
+  };
+  primaryLanguage: null | {
+    name: string;
+  };
+  stargazerCount: number;
+  forkCount: number;
+  issues: {
+    totalCount: number;
+  };
+  pullRequests: {
+    totalCount: number;
+  };
+  isArchived: boolean;
+  isFork: boolean;
+  isPrivate: boolean;
+  pushedAt: string | null;
+  updatedAt: string | null;
+  releases: {
+    nodes: Array<{
+      tagName: string;
+      name: string | null;
+      url: string;
+      isDraft?: boolean;
+      publishedAt: string | null;
+    } | null>;
+  };
+};
+
+type GraphQLRepoPage = {
+  data?: {
+    repositoryOwner?: null | {
+      __typename?: string;
+      repositories: {
+        pageInfo: {
+          hasNextPage: boolean;
+          endCursor: string | null;
+        };
+        nodes: Array<GraphQLRepoNode | null>;
+      };
+    };
+  };
+  errors?: Array<{ message?: string; type?: string }>;
+};
+
+type ProjectCacheEntry = {
+  signature: string;
+  project: Omit<Project, "freshness">;
+};
+
+const repoFragmentTtlSeconds = 30 * 60;
 
 export class GitHubRateLimitError extends Error {
   readonly retryAfterSeconds: number | null;
@@ -223,7 +295,7 @@ function githubClient(token = "", fetcher: typeof fetch = fetch): GitHubClient {
     headers.Authorization = `Bearer ${token}`;
   }
 
-  return { fetch: fetcher, headers };
+  return { fetch: fetcher, headers, graphqlCursors: new Map() };
 }
 
 async function github<T>(
@@ -268,6 +340,163 @@ async function githubPages<T>(client: GitHubClient, pathname: string): Promise<T
   return items;
 }
 
+async function githubGraphql<T>(
+  client: GitHubClient,
+  query: string,
+  variables: Record<string, unknown>,
+): Promise<T | null> {
+  if (!client.headers.Authorization) {
+    return null;
+  }
+  const response = await client.fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: {
+      ...client.headers,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const rateLimit = rateLimitFromResponse(response, "/graphql");
+  if (rateLimit) throw rateLimit;
+  if (!response.ok) {
+    return null;
+  }
+  const body = (await response.json()) as GraphQLRepoPage;
+  if (body.errors?.length) {
+    const message = body.errors.map((error) => error.message ?? error.type).join("; ");
+    if (/rate limit|secondary rate|api rate limit/i.test(message)) {
+      throw new GitHubRateLimitError(`GitHub rate limit hit for /graphql`, null);
+    }
+    return null;
+  }
+  return body as T;
+}
+
+const ownerReposQuery = /* GraphQL */ `
+  query ReleaseBarOwnerRepos($login: String!, $first: Int!, $after: String) {
+    repositoryOwner(login: $login) {
+      __typename
+      repositories(
+        first: $first
+        after: $after
+        orderBy: { field: PUSHED_AT, direction: DESC }
+        ownerAffiliations: OWNER
+        privacy: PUBLIC
+      ) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          owner {
+            login
+            __typename
+          }
+          name
+          nameWithOwner
+          description
+          url
+          defaultBranchRef {
+            name
+          }
+          primaryLanguage {
+            name
+          }
+          stargazerCount
+          forkCount
+          issues(states: OPEN) {
+            totalCount
+          }
+          pullRequests(states: OPEN) {
+            totalCount
+          }
+          isArchived
+          isFork
+          isPrivate
+          pushedAt
+          updatedAt
+          releases(first: 10, orderBy: { field: CREATED_AT, direction: DESC }) {
+            nodes {
+              tagName
+              name
+              url
+              isDraft
+              publishedAt
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+function graphQlRepo(node: GraphQLRepoNode): GitHubRepo {
+  const latestRelease = node.releases.nodes.find(
+    (release) => release?.tagName && !release.isDraft && release.publishedAt,
+  );
+  return {
+    owner: {
+      login: node.owner.login,
+      type: node.owner.__typename === "Organization" ? "Organization" : "User",
+    },
+    name: node.name,
+    full_name: node.nameWithOwner,
+    description: node.description,
+    html_url: node.url,
+    default_branch: node.defaultBranchRef?.name ?? "main",
+    language: node.primaryLanguage?.name ?? null,
+    stargazers_count: node.stargazerCount,
+    forks_count: node.forkCount,
+    open_issues_count: node.issues.totalCount + node.pullRequests.totalCount,
+    archived: node.isArchived,
+    pushed_at: node.pushedAt,
+    updated_at: node.updatedAt,
+    fork: node.isFork,
+    private: node.isPrivate,
+    latest_release: latestRelease
+      ? {
+          tag_name: latestRelease.tagName,
+          name: latestRelease.name,
+          html_url: latestRelease.url,
+          draft: latestRelease.isDraft,
+          published_at: latestRelease.publishedAt,
+        }
+      : null,
+    open_issues_total: node.issues.totalCount,
+    open_pull_requests_total: node.pullRequests.totalCount,
+  };
+}
+
+async function ownerReposGraphqlPage(
+  client: GitHubClient,
+  owner: Owner,
+  page: number,
+): Promise<GitHubRepo[] | null> {
+  const cursorKey = `${owner.type}:${slugOwner(owner.login)}`;
+  const cursors = client.graphqlCursors.get(cursorKey) ?? [null];
+  const after = cursors[page - 1];
+  if (after === undefined) {
+    return null;
+  }
+  const body = await githubGraphql<GraphQLRepoPage>(client, ownerReposQuery, {
+    login: owner.login,
+    first: 100,
+    after,
+  });
+  const repositoryOwner = body?.data?.repositoryOwner;
+  if (!repositoryOwner) {
+    return null;
+  }
+  const repos = repositoryOwner.repositories.nodes
+    .filter((node): node is GraphQLRepoNode => Boolean(node))
+    .map(graphQlRepo);
+  cursors[page] = repositoryOwner.repositories.pageInfo.hasNextPage
+    ? repositoryOwner.repositories.pageInfo.endCursor
+    : undefined;
+  client.graphqlCursors.set(cursorKey, cursors);
+  return repos;
+}
+
 async function githubCount(client: GitHubClient, pathname: string): Promise<number> {
   const joiner = pathname.includes("?") ? "&" : "?";
   const response = await client.fetch(`https://api.github.com${pathname}${joiner}per_page=1`, {
@@ -298,6 +527,12 @@ async function ownerRepos(
   owner: Owner,
   page?: number,
 ): Promise<GitHubRepo[]> {
+  if (page) {
+    const graphqlRepos = await ownerReposGraphqlPage(client, owner, page);
+    if (graphqlRepos) {
+      return graphqlRepos;
+    }
+  }
   const base = owner.type === "org" ? `/orgs/${owner.login}/repos` : `/users/${owner.login}/repos`;
   const path = `${base}?type=public&sort=pushed&direction=desc`;
   return page ? githubPage<GitHubRepo>(client, path, page) : githubPages<GitHubRepo>(client, path);
@@ -311,6 +546,10 @@ async function latestRelease(
   client: GitHubClient,
   repo: GitHubRepo,
 ): Promise<GitHubRelease | null> {
+  if (repo.latest_release !== undefined) {
+    const release = repo.latest_release;
+    return release?.tag_name && !release.draft && release.published_at ? release : null;
+  }
   const releases = await github<GitHubRelease[]>(
     client,
     `/repos/${repo.full_name}/releases?per_page=10`,
@@ -405,7 +644,8 @@ async function repoSummary(
           `/repos/${repo.full_name}/compare/${encodeURIComponent(release.tag_name)}...${encodeURIComponent(repo.default_branch)}`,
         )
       : Promise.resolve(null),
-    githubCount(client, `/repos/${repo.full_name}/pulls?state=open`),
+    repo.open_pull_requests_total ??
+      githubCount(client, `/repos/${repo.full_name}/pulls?state=open`),
     checkRuns(client, repo, latestRef),
   ]);
   commitsSinceRelease = compare?.total_commits ?? null;
@@ -422,7 +662,7 @@ async function repoSummary(
     language: repo.language,
     stars: repo.stargazers_count,
     forks: repo.forks_count,
-    openIssues: Math.max(repo.open_issues_count - openPullRequests, 0),
+    openIssues: repo.open_issues_total ?? Math.max(repo.open_issues_count - openPullRequests, 0),
     openPullRequests,
     issuesUrl: `${repo.html_url}/issues`,
     pullRequestsUrl: `${repo.html_url}/pulls`,
@@ -444,6 +684,51 @@ async function repoSummary(
     ciUrl: ci.url,
     ciRunDate: ci.runDate,
   };
+}
+
+function projectCacheKey(repo: GitHubRepo, includeUnreleased: boolean): string {
+  return `repo:v1:${repo.full_name.toLowerCase()}:${includeUnreleased ? "unreleased" : "released"}`;
+}
+
+function projectCacheSignature(repo: GitHubRepo): string {
+  return [
+    repo.default_branch,
+    repo.pushed_at ?? "",
+    repo.updated_at ?? "",
+    repo.latest_release?.tag_name ?? "",
+    repo.latest_release?.published_at ?? "",
+  ].join("|");
+}
+
+async function readProjectCache(
+  cache: ProjectCache | undefined,
+  repo: GitHubRepo,
+  includeUnreleased: boolean,
+): Promise<Omit<Project, "freshness"> | null> {
+  const raw = await cache?.get(projectCacheKey(repo, includeUnreleased));
+  if (!raw) return null;
+  try {
+    const cached = JSON.parse(raw) as ProjectCacheEntry;
+    return cached.signature === projectCacheSignature(repo) ? cached.project : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeProjectCache(
+  cache: ProjectCache | undefined,
+  repo: GitHubRepo,
+  includeUnreleased: boolean,
+  project: Omit<Project, "freshness">,
+): Promise<void> {
+  await cache?.put(
+    projectCacheKey(repo, includeUnreleased),
+    JSON.stringify({
+      signature: projectCacheSignature(repo),
+      project,
+    } satisfies ProjectCacheEntry),
+    { expirationTtl: repoFragmentTtlSeconds },
+  );
 }
 
 export async function resolveOwnerType(
@@ -480,10 +765,15 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
     }
     seen.add(repo.full_name);
     options.log?.(`fetch ${countLabel} ${repo.full_name}`);
-    const project = await repoSummary(client, repo, Boolean(options.includeUnreleased));
+    const includeUnreleased = Boolean(options.includeUnreleased);
+    const cached = await readProjectCache(options.projectCache, repo, includeUnreleased);
+    const project = cached ?? (await repoSummary(client, repo, includeUnreleased));
     if (!project) {
       options.log?.(`skip ${repo.full_name}: no releases`);
       return;
+    }
+    if (!cached) {
+      await writeProjectCache(options.projectCache, repo, includeUnreleased, project);
     }
     projects.push({ ...project, freshness: freshness(project) });
   }

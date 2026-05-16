@@ -2,7 +2,9 @@
 
 ## Unreleased
 
+- Reduced GitHub API fanout with GraphQL repository metadata, KV-backed repo fragments, and Durable Object rebuild locking.
 - Made repository language tags clickable filters and exposed language filters in the command palette.
+- Added a dedicated loading state while empty dashboards are still being fetched and cached.
 - Improved account dropdown menu vertical alignment and item spacing.
 - Replaced GitHub Pages deploys with automatic Cloudflare Worker deploys and live asset smoke checks.
 - Added URL-restored dashboard view state for search, filters, sort order, and dev columns.

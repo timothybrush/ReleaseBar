@@ -41,10 +41,30 @@ type KVNamespace = {
   }>;
 };
 
+type DurableObjectId = unknown;
+
+type DurableObjectStub = {
+  fetch(request: Request): Promise<Response>;
+};
+
+type DurableObjectNamespace = {
+  idFromName(name: string): DurableObjectId;
+  get(id: DurableObjectId): DurableObjectStub;
+};
+
+type DurableObjectState = {
+  storage: {
+    get<T>(key: string): Promise<T | undefined>;
+    put<T>(key: string, value: T): Promise<void>;
+    delete(key: string): Promise<boolean>;
+  };
+};
+
 type Env = {
   ASSETS?: { fetch(request: Request): Promise<Response> };
   AUTH_COOKIE_SECRET?: string;
   DASHBOARD_CACHE?: KVNamespace;
+  DASHBOARD_LOCKS?: DurableObjectNamespace;
   GITHUB_APP_CLIENT_ID?: string;
   GITHUB_APP_CLIENT_SECRET?: string;
   GITHUB_APP_ID?: string;
@@ -62,6 +82,8 @@ const fullTtlMs = 60 * 60 * 1000;
 const staleTtlSeconds = 3 * 24 * 60 * 60;
 const installationTokenTtlSeconds = 50 * 60;
 const coldBuildWaitMs = 15 * 1000;
+const buildLockTtlMs = 2 * 60 * 1000;
+const buildLockRefreshMs = 30 * 1000;
 const repoLimit = 200;
 const hotLimit = 50;
 const hotOwnerLimit = 3;
@@ -93,6 +115,16 @@ type DashboardRequest = {
   key: string;
   url: URL;
   token?: string;
+};
+
+type BuildLock = {
+  refresh(): Promise<void>;
+  release(): Promise<void>;
+};
+
+type StoredBuildLock = {
+  token: string;
+  expiresAt: number;
 };
 
 type AuthState = {
@@ -1249,6 +1281,56 @@ async function hotResponse(env: Env): Promise<Response> {
   return jsonResponse(payload);
 }
 
+async function acquireBuildLock(env: Env, key: string): Promise<BuildLock | null> {
+  if (!env.DASHBOARD_LOCKS) {
+    return {
+      refresh: async () => undefined,
+      release: async () => undefined,
+    };
+  }
+
+  try {
+    const token = randomNonce();
+    const id = env.DASHBOARD_LOCKS.idFromName(key);
+    const stub = env.DASHBOARD_LOCKS.get(id);
+    const response = await stub.fetch(
+      new Request("https://releasebar.internal/acquire", {
+        method: "POST",
+        body: JSON.stringify({ token }),
+      }),
+    );
+    if (response.status === 409) {
+      return null;
+    }
+    if (!response.ok) {
+      return {
+        refresh: async () => undefined,
+        release: async () => undefined,
+      };
+    }
+    const sendToken = (pathname: string) =>
+      stub.fetch(
+        new Request(`https://releasebar.internal/${pathname}`, {
+          method: "POST",
+          body: JSON.stringify({ token }),
+        }),
+      );
+    return {
+      refresh: async () => {
+        await sendToken("refresh").catch(() => undefined);
+      },
+      release: async () => {
+        await sendToken("release").catch(() => undefined);
+      },
+    };
+  } catch {
+    return {
+      refresh: async () => undefined,
+      release: async () => undefined,
+    };
+  }
+}
+
 async function rebuild(dashboard: DashboardRequest, env: Env): Promise<DashboardPayload> {
   const existing = locks.get(dashboard.key);
   if (existing) {
@@ -1266,6 +1348,7 @@ async function rebuild(dashboard: DashboardRequest, env: Env): Promise<Dashboard
       repoLimit,
       token: dashboard.token ?? env.GITHUB_TOKEN,
       fetch: workerFetch,
+      projectCache: env.DASHBOARD_CACHE,
     });
     await writeCached(env, dashboard.key, payload);
     await rememberHotDashboard(env, dashboard.key, payload);
@@ -1277,6 +1360,26 @@ async function rebuild(dashboard: DashboardRequest, env: Env): Promise<Dashboard
     return await promise;
   } finally {
     locks.delete(dashboard.key);
+  }
+}
+
+async function rebuildWithBuildLock(
+  dashboard: DashboardRequest,
+  env: Env,
+): Promise<DashboardPayload | null> {
+  const lock = await acquireBuildLock(env, dashboard.key);
+  if (!lock) {
+    return null;
+  }
+
+  const refresh = globalThis.setInterval(() => {
+    void lock.refresh();
+  }, buildLockRefreshMs);
+  try {
+    return await rebuild(dashboard, env);
+  } finally {
+    globalThis.clearInterval(refresh);
+    await lock.release();
   }
 }
 
@@ -1394,7 +1497,9 @@ async function ownerResponse(
         .catch(() => null)
         .then((token) => {
           const dashboard = cachedDashboardRequest(cached, includeRepos, key, url, token);
-          return rebuild(dashboard, env).catch((error) => cacheBuildError(dashboard, env, error));
+          return rebuildWithBuildLock(dashboard, env).catch((error) =>
+            cacheBuildError(dashboard, env, error),
+          );
         }),
     );
     return jsonResponse(cached, errorStatus(cached.cache.message ?? ""), {
@@ -1412,7 +1517,7 @@ async function ownerResponse(
         .catch(() => null)
         .then((token) => {
           const dashboard = cachedDashboardRequest(cached, includeRepos, key, url, token);
-          return rebuild(dashboard, env).catch(() => undefined);
+          return rebuildWithBuildLock(dashboard, env).catch(() => undefined);
         }),
     );
     return jsonResponse(withCacheState(cached, "stale"));
@@ -1435,7 +1540,7 @@ async function ownerResponse(
   }
 
   const dashboard = dashboardRequest(owners, includeRepos, key, url, token);
-  const build = rebuild(dashboard, env);
+  const build = rebuildWithBuildLock(dashboard, env);
   try {
     const payload = await Promise.race([
       build,
@@ -1443,7 +1548,7 @@ async function ownerResponse(
         setTimeout(() => resolve(buildPending), coldBuildWaitMs);
       }),
     ]);
-    if (payload === buildPending) {
+    if (payload === buildPending || payload === null) {
       context.waitUntil(build.catch((error) => cacheBuildError(dashboard, env, error)));
       return jsonResponse(rebuildingPayload(dashboard, env), 202, {
         "cache-control": "no-store",
@@ -1482,6 +1587,60 @@ function dashboardRequest(
     url,
     ...(token ? { token } : {}),
   };
+}
+
+export class DashboardBuildLock {
+  constructor(
+    private readonly state: DurableObjectState,
+    _env: Env,
+  ) {}
+
+  async fetch(request: Request): Promise<Response> {
+    if (request.method !== "POST") {
+      return new Response(null, { status: 405 });
+    }
+
+    const url = new URL(request.url);
+    if (url.pathname === "/acquire") {
+      const body = (await request.json().catch(() => null)) as { token?: string } | null;
+      if (!body?.token) {
+        return new Response(null, { status: 400 });
+      }
+      const existing = await this.state.storage.get<StoredBuildLock>("lock");
+      if (existing && existing.expiresAt > Date.now()) {
+        return new Response(null, { status: 409 });
+      }
+      await this.state.storage.put("lock", {
+        token: body.token,
+        expiresAt: Date.now() + buildLockTtlMs,
+      } satisfies StoredBuildLock);
+      return new Response(null, { status: 204 });
+    }
+
+    if (url.pathname === "/release") {
+      const body = (await request.json().catch(() => null)) as { token?: string } | null;
+      const existing = await this.state.storage.get<StoredBuildLock>("lock");
+      if (existing?.token === body?.token) {
+        await this.state.storage.delete("lock");
+      }
+      return new Response(null, { status: 204 });
+    }
+
+    if (url.pathname === "/refresh") {
+      const body = (await request.json().catch(() => null)) as { token?: string } | null;
+      const existing = await this.state.storage.get<StoredBuildLock>("lock");
+      if (!existing || existing.token !== body?.token) {
+        return new Response(null, { status: 409 });
+      }
+      await this.state.storage.put("lock", {
+        token: existing.token,
+        expiresAt: Date.now() + buildLockTtlMs,
+      } satisfies StoredBuildLock);
+      return new Response(null, { status: 204 });
+    }
+
+    return new Response(null, { status: 404 });
+  }
 }
 
 export default {

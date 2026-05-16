@@ -26,7 +26,7 @@ import {
   type DashboardViewState,
 } from "../../src/dashboard-view.js";
 import type { DashboardPayload, Project } from "../../src/types.js";
-import worker from "../../worker/index.js";
+import worker, { DashboardBuildLock } from "../../worker/index.js";
 
 const textEncoder = new TextEncoder();
 
@@ -423,6 +423,140 @@ test("worker returns dashboard-shaped rate-limit errors without raw GitHub JSON"
   }
 });
 
+test("worker returns rebuilding while another isolate owns the dashboard build lock", async () => {
+  const originalFetch = globalThis.fetch;
+  let repoFetches = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/users/openclaw") {
+      return Response.json({ login: "openclaw", type: "Organization" });
+    }
+    if (url.pathname.includes("/repos")) {
+      repoFetches += 1;
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const busyLocks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async () => new Response(null, { status: 409 }),
+    }),
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/openclaw"),
+      {
+        DASHBOARD_CACHE: kvStore(),
+        DASHBOARD_LOCKS: busyLocks,
+        GITHUB_TOKEN: "shared-token",
+      },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 202);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.cache?.state, "rebuilding");
+    assert.equal(repoFetches, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("dashboard build lock only releases the matching lease token", async () => {
+  const storage = new Map<string, unknown>();
+  const lock = new DashboardBuildLock(
+    {
+      storage: {
+        async get<T>(key: string) {
+          return storage.get(key) as T | undefined;
+        },
+        async put<T>(key: string, value: T) {
+          storage.set(key, value);
+        },
+        async delete(key: string) {
+          return storage.delete(key);
+        },
+      },
+    },
+    {},
+  );
+
+  assert.equal(
+    (
+      await lock.fetch(
+        new Request("https://releasebar.internal/acquire", {
+          method: "POST",
+          body: JSON.stringify({ token: "first" }),
+        }),
+      )
+    ).status,
+    204,
+  );
+  assert.equal(
+    (
+      await lock.fetch(
+        new Request("https://releasebar.internal/acquire", {
+          method: "POST",
+          body: JSON.stringify({ token: "second" }),
+        }),
+      )
+    ).status,
+    409,
+  );
+
+  storage.set("lock", { token: "first", expiresAt: Date.now() - 1 });
+  assert.equal(
+    (
+      await lock.fetch(
+        new Request("https://releasebar.internal/acquire", {
+          method: "POST",
+          body: JSON.stringify({ token: "second" }),
+        }),
+      )
+    ).status,
+    204,
+  );
+  const secondExpiresAt = (storage.get("lock") as { expiresAt: number }).expiresAt;
+  assert.equal(
+    (
+      await lock.fetch(
+        new Request("https://releasebar.internal/refresh", {
+          method: "POST",
+          body: JSON.stringify({ token: "first" }),
+        }),
+      )
+    ).status,
+    409,
+  );
+  assert.equal(
+    (
+      await lock.fetch(
+        new Request("https://releasebar.internal/refresh", {
+          method: "POST",
+          body: JSON.stringify({ token: "second" }),
+        }),
+      )
+    ).status,
+    204,
+  );
+  assert.equal((storage.get("lock") as { expiresAt: number }).expiresAt >= secondExpiresAt, true);
+  assert.equal(
+    (
+      await lock.fetch(
+        new Request("https://releasebar.internal/release", {
+          method: "POST",
+          body: JSON.stringify({ token: "first" }),
+        }),
+      )
+    ).status,
+    204,
+  );
+  assert.deepEqual(storage.get("lock"), {
+    token: "second",
+    expiresAt: (storage.get("lock") as { expiresAt: number }).expiresAt,
+  });
+});
+
 test("worker rejects oversized custom source requests", async () => {
   const owners = Array.from({ length: 9 }, (_, index) => `owner-${index}`).join(",");
   const response = await worker.fetch(
@@ -777,9 +911,19 @@ test("worker uses GitHub App installation token for cold owner dashboards", asyn
       ownerResolvedWithInstallationToken = true;
       return Response.json({ login: "openclaw", type: "Organization" });
     }
-    if (url.pathname === "/orgs/openclaw/repos") {
+    if (url.pathname === "/graphql") {
       assert.equal(authorization, "Bearer installation-token");
-      return Response.json([]);
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "Organization",
+            repositories: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [],
+            },
+          },
+        },
+      });
     }
     throw new Error(`unexpected fetch ${url.pathname}`);
   };
@@ -1254,6 +1398,191 @@ test("dashboard build can add explicit public repositories without an owner scan
 
   assert.equal(payload.totals.repos, 1);
   assert.equal(payload.projects[0]?.fullName, "other/repo");
+});
+
+test("dashboard build uses GraphQL owner metadata when token is available", async () => {
+  const requested: string[] = [];
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    repoLimit: 1,
+    token: "token",
+    fetch: async (url, init) => {
+      const parsed = new URL(String(url));
+      const path = parsed.pathname;
+      requested.push(`${path}${parsed.search}`);
+      if (path === "/graphql") {
+        assert.equal(init?.method, "POST");
+        return Response.json({
+          data: {
+            repositoryOwner: {
+              __typename: "User",
+              repositories: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    owner: { login: "owner", __typename: "User" },
+                    name: "repo",
+                    nameWithOwner: "owner/repo",
+                    description: "GraphQL repo",
+                    url: "https://github.com/owner/repo",
+                    defaultBranchRef: { name: "main" },
+                    primaryLanguage: { name: "TypeScript" },
+                    stargazerCount: 42,
+                    forkCount: 2,
+                    issues: { totalCount: 7 },
+                    pullRequests: { totalCount: 3 },
+                    isArchived: false,
+                    isFork: false,
+                    isPrivate: false,
+                    pushedAt: "2026-01-03T00:00:00Z",
+                    updatedAt: "2026-01-03T00:00:00Z",
+                    releases: {
+                      nodes: [
+                        {
+                          tagName: "v2.0.0-alpha.1",
+                          name: null,
+                          url: "https://github.com/owner/repo/releases/tag/v2.0.0-alpha.1",
+                          isDraft: false,
+                          publishedAt: "2026-01-04T00:00:00Z",
+                        },
+                        {
+                          tagName: "v1.0.0",
+                          name: null,
+                          url: "https://github.com/owner/repo/releases/tag/v1.0.0",
+                          isDraft: false,
+                          publishedAt: "2026-01-01T00:00:00Z",
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        });
+      }
+      if (path === "/repos/owner/repo/commits/main") {
+        return Response.json({
+          sha: "abcdef123456",
+          commit: { committer: { date: "2026-01-03T00:00:00Z" } },
+        });
+      }
+      if (path === "/repos/owner/repo/compare/v2.0.0-alpha.1...main") {
+        return Response.json({
+          total_commits: 4,
+          html_url: "https://github.com/owner/repo/compare/v2.0.0-alpha.1...main",
+        });
+      }
+      if (path === "/repos/owner/repo/commits/abcdef123456/check-runs") {
+        return Response.json({ check_runs: [] });
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+  });
+
+  assert.equal(payload.totals.repos, 1);
+  assert.equal(payload.projects[0]?.openIssues, 7);
+  assert.equal(payload.projects[0]?.openPullRequests, 3);
+  assert.equal(payload.projects[0]?.version, "v2.0.0-alpha.1");
+  assert.equal(
+    requested.some((path) => path.includes("/releases")),
+    false,
+  );
+  assert.equal(
+    requested.some((path) => path.includes("/pulls")),
+    false,
+  );
+});
+
+test("dashboard build reuses cached repo fragments when metadata is unchanged", async () => {
+  const cache = kvStore();
+  let fanoutCalls = 0;
+  const build = () =>
+    buildDashboard({
+      title: "ReleaseBar",
+      subtitle: "test",
+      canonicalDomain: "example.com",
+      owners: [{ type: "user", login: "owner" }],
+      includeForks: false,
+      includeArchived: false,
+      repoLimit: 1,
+      token: "token",
+      projectCache: cache,
+      fetch: async (url) => {
+        const path = new URL(String(url)).pathname;
+        if (path === "/graphql") {
+          return Response.json({
+            data: {
+              repositoryOwner: {
+                __typename: "User",
+                repositories: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [
+                    {
+                      owner: { login: "owner", __typename: "User" },
+                      name: "repo",
+                      nameWithOwner: "owner/repo",
+                      description: null,
+                      url: "https://github.com/owner/repo",
+                      defaultBranchRef: { name: "main" },
+                      primaryLanguage: null,
+                      stargazerCount: 1,
+                      forkCount: 0,
+                      issues: { totalCount: 0 },
+                      pullRequests: { totalCount: 0 },
+                      isArchived: false,
+                      isFork: false,
+                      isPrivate: false,
+                      pushedAt: "2026-01-03T00:00:00Z",
+                      updatedAt: "2026-01-03T00:00:00Z",
+                      releases: {
+                        nodes: [
+                          {
+                            tagName: "v1.0.0",
+                            name: null,
+                            url: "https://github.com/owner/repo/releases/tag/v1.0.0",
+                            isDraft: false,
+                            publishedAt: "2026-01-01T00:00:00Z",
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          });
+        }
+        if (path === "/repos/owner/repo/commits/main") {
+          fanoutCalls += 1;
+          return Response.json({
+            sha: "abcdef123456",
+            commit: { committer: { date: "2026-01-03T00:00:00Z" } },
+          });
+        }
+        if (path === "/repos/owner/repo/compare/v1.0.0...main") {
+          fanoutCalls += 1;
+          return Response.json({
+            total_commits: 0,
+            html_url: "https://github.com/owner/repo/compare/v1.0.0...main",
+          });
+        }
+        if (path === "/repos/owner/repo/commits/abcdef123456/check-runs") {
+          fanoutCalls += 1;
+          return Response.json({ check_runs: [] });
+        }
+        throw new Error(`unexpected ${path}`);
+      },
+    });
+
+  assert.equal((await build()).totals.repos, 1);
+  assert.equal((await build()).totals.repos, 1);
+  assert.equal(fanoutCalls, 3);
 });
 
 test("dashboard build ignores explicit private repositories", async () => {

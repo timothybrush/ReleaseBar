@@ -606,6 +606,20 @@ body.dev-mode .dev-only {
   font-size: 11px;
 }
 
+.tag-button {
+  min-height: 22px;
+  background: transparent;
+  line-height: 1;
+}
+
+.tag-button:hover,
+.tag-button:focus-visible,
+.tag-button.active {
+  border-color: var(--green);
+  color: var(--green);
+  outline: 0;
+}
+
 .tag.muted,
 .muted {
   color: var(--muted);

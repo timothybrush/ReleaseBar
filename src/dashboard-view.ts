@@ -14,6 +14,7 @@ export type DashboardFilter = Freshness | "all" | "attention";
 
 export type DashboardViewState = {
   query: string;
+  language: string;
   filter: DashboardFilter;
   sortKey: SortKey;
   sortDirection: SortDirection;
@@ -66,6 +67,7 @@ export function parseViewState(
 
   return {
     query: (params.get("q") ?? "").trim(),
+    language: (params.get("lang") ?? "").trim(),
     filter: (filterValues.has(rawFilter) ? rawFilter : "all") as DashboardFilter,
     sortKey,
     sortDirection,
@@ -80,10 +82,12 @@ export function viewStateSearch(
 ): string {
   const params = new URLSearchParams(currentSearch);
   const normalizedQuery = state.query.trim();
+  const normalizedLanguage = state.language.trim();
   const fallbackSortKey = defaultSortKey(isDefaultRoute);
   const fallbackDirection = defaultSortDirection(fallbackSortKey);
 
   setOrDelete(params, "q", normalizedQuery);
+  setOrDelete(params, "lang", normalizedLanguage);
   setOrDelete(params, "filter", state.filter === "all" ? "" : state.filter);
 
   const customSort = state.sortKey !== fallbackSortKey || state.sortDirection !== fallbackDirection;

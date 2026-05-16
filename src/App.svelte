@@ -37,6 +37,7 @@
   let data: DashboardPayload | null = null;
   let auth: AuthPayload | null = null;
   let query = initialView.query;
+  let language = initialView.language;
   let filter: DashboardFilter = initialView.filter;
   let sortKey: SortKey = initialView.sortKey;
   let sortDirection: SortDirection = initialView.sortDirection;
@@ -67,7 +68,7 @@
   $: includeArchived = data?.options?.includeArchived === true;
   $: visibleProjects = data
     ? data.projects.filter((project) =>
-        matchesBase(project, query, hiddenOwners, hiddenRepos, includeArchived),
+        matchesBase(project, query, language, hiddenOwners, hiddenRepos, includeArchived),
       )
     : [];
   $: filteredProjects = sortProjects(
@@ -77,6 +78,18 @@
   );
   $: ownerToggles = data
     ? [...new Set(data.projects.map((project) => project.owner.toLowerCase()))].sort()
+    : [];
+  $: languageOptions = data
+    ? [
+        ...new Set(
+          data.projects
+            .filter((project) =>
+              matchesBase(project, "", "", hiddenOwners, hiddenRepos, includeArchived),
+            )
+            .map((project) => project.language)
+            .filter((language): language is string => Boolean(language)),
+        ),
+      ].sort((a, b) => a.localeCompare(b))
     : [];
   $: sourceCount = initialRoute.extraOwners.length + initialRoute.repos.length;
   $: hiddenCount = hiddenOwners.size + hiddenRepos.size;
@@ -88,6 +101,7 @@
     buildCommands(
       filteredProjects,
       ownerToggles,
+      languageOptions,
       paletteText,
       hiddenOwners,
       hiddenRepos,
@@ -101,7 +115,7 @@
   );
   $: document.body.classList.toggle("dev-mode", devMode);
   $: document.title = `${label} · ReleaseBar`;
-  $: syncViewState(query, filter, sortKey, sortDirection, devMode);
+  $: syncViewState(query, language, filter, sortKey, sortDirection, devMode);
 
   function ownerLabel(payload: DashboardPayload): string {
     if (initialRoute.isDefault) {
@@ -146,6 +160,7 @@
   function matchesBase(
     project: Project,
     searchQuery: string,
+    languageQuery: string,
     hiddenOwnerSet: Set<string>,
     hiddenRepoSet: Set<string>,
     includeArchived: boolean,
@@ -153,6 +168,7 @@
     if (project.archived && !includeArchived) return false;
     if (hiddenOwnerSet.has(project.owner.toLowerCase())) return false;
     if (hiddenRepoSet.has(project.fullName.toLowerCase())) return false;
+    if (languageQuery && project.language?.toLowerCase() !== languageQuery.toLowerCase()) return false;
     const normalizedQuery = searchQuery.trim().toLowerCase();
     if (!normalizedQuery) return true;
     const haystack = [
@@ -283,6 +299,7 @@
 
   function syncViewState(
     activeQuery: string,
+    activeLanguage: string,
     activeFilter: DashboardFilter,
     activeSortKey: SortKey,
     activeSortDirection: SortDirection,
@@ -293,6 +310,7 @@
       location.search,
       {
         query: activeQuery,
+        language: activeLanguage,
         filter: activeFilter,
         sortKey: activeSortKey,
         sortDirection: activeSortDirection,
@@ -391,6 +409,18 @@
     }
   }
 
+  function activeLanguage(nextLanguage: string): boolean {
+    return language.trim().toLowerCase() === nextLanguage.toLowerCase();
+  }
+
+  function setLanguageFilter(nextLanguage: string): void {
+    language = nextLanguage;
+  }
+
+  function toggleLanguageFilter(nextLanguage: string): void {
+    language = activeLanguage(nextLanguage) ? "" : nextLanguage;
+  }
+
   function sortCommand(key: SortKey): CommandAction {
     return {
       actionId: `sort:${key}`,
@@ -412,6 +442,17 @@
       onRun: () => {
         filter = value;
       },
+    };
+  }
+
+  function languageCommand(language: string): CommandAction {
+    return {
+      actionId: `language:${language.toLowerCase()}`,
+      title: `Show ${language}`,
+      subTitle: activeLanguage(language) ? "current language filter" : "language filter",
+      group: "Languages",
+      keywords: ["language", "tech", "stack", language],
+      onRun: () => setLanguageFilter(language),
     };
   }
 
@@ -485,6 +526,7 @@
   function buildCommands(
     projects: Project[],
     owners: string[],
+    languages: string[],
     typedText: string,
     hiddenOwnerSet: Set<string>,
     hiddenRepoSet: Set<string>,
@@ -539,6 +581,7 @@
         onRun: () => location.assign("/"),
       },
       ...ownerCommands,
+      ...languages.map(languageCommand),
       ...projects.flatMap(repoCommands).slice(0, 420),
       ...filterOptions.map(filterCommand),
       ...sortOptions.map(sortCommand),
@@ -824,7 +867,18 @@
             </a>
             <p class="description">{project.description || "no description"}</p>
             <div class="tags">
-              {#if project.language}<span class="tag">{project.language}</span>{/if}
+              {#if project.language}
+                <button
+                  class="tag tag-button"
+                  class:active={activeLanguage(project.language)}
+                  type="button"
+                  aria-pressed={activeLanguage(project.language)}
+                  title={`Filter by ${project.language}`}
+                  onclick={() => toggleLanguageFilter(project.language ?? "")}
+                >
+                  {project.language}
+                </button>
+              {/if}
               <span class="tag">{numberFormat.format(project.stars)} stars</span>
               {#if project.archived}<span class="tag muted">archived</span>{/if}
               <span class="tag">{project.freshness}</span>

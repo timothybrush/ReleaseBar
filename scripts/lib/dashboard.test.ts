@@ -174,21 +174,29 @@ test("owner route parsing keeps root hot board and owners API-backed", () => {
     `${workersDevApiOrigin}/api/dashboard?owners=openclaw`,
   );
   assert.equal(
-    dashboardRoute("/openclaw", "?q=codex&filter=attention&sort=issues&dir=desc&dev=true").apiPath,
+    dashboardRoute(
+      "/openclaw",
+      "?q=codex&lang=Swift&filter=attention&sort=issues&dir=desc&dev=true",
+    ).apiPath,
     `${workerApiOrigin}/api/openclaw`,
   );
 });
 
 test("dashboard view state restores search, filters, sorting, and dev columns", () => {
-  assert.deepEqual(parseViewState("?q=CodexBar&filter=attention&sort=issues&dir=asc", false), {
-    query: "CodexBar",
-    filter: "attention",
-    sortKey: "issues",
-    sortDirection: "asc",
-    devMode: true,
-  });
+  assert.deepEqual(
+    parseViewState("?q=CodexBar&lang=Swift&filter=attention&sort=issues&dir=asc", false),
+    {
+      query: "CodexBar",
+      language: "Swift",
+      filter: "attention",
+      sortKey: "issues",
+      sortDirection: "asc",
+      devMode: true,
+    },
+  );
   assert.deepEqual(parseViewState("?filter=nope&sort=nope&dir=sideways", true), {
     query: "",
+    language: "",
     filter: "all",
     sortKey: "since",
     sortDirection: "desc",
@@ -197,6 +205,7 @@ test("dashboard view state restores search, filters, sorting, and dev columns", 
 
   const state: DashboardViewState = {
     query: "repo",
+    language: "Go",
     filter: "hot",
     sortKey: "prs",
     sortDirection: "desc",
@@ -204,13 +213,14 @@ test("dashboard view state restores search, filters, sorting, and dev columns", 
   };
   assert.equal(
     viewStateSearch("?owners=openclaw&q=old", state, false),
-    "?owners=openclaw&q=repo&filter=hot&sort=prs&dir=desc&dev=true",
+    "?owners=openclaw&q=repo&lang=Go&filter=hot&sort=prs&dir=desc&dev=true",
   );
   assert.equal(
     viewStateSearch(
       "?owners=openclaw&q=repo&filter=all&sort=activity&dir=desc&dev=true",
       {
         query: "",
+        language: "",
         filter: "all",
         sortKey: "activity",
         sortDirection: "desc",

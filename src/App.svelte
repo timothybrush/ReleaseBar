@@ -53,6 +53,7 @@
   let errorMessage = "";
   let paletteText = "";
   let generatedLabel = "loading";
+  let generatedDetail = "";
   let mounted = false;
 
   const numberFormat = new Intl.NumberFormat("en", { notation: "compact" });
@@ -367,12 +368,15 @@
   function updateStatus(): void {
     if (!data) return;
     const cacheState = data.cache?.state;
-    const stale = data.cache?.stale && cacheState !== "stale" ? " · stale" : "";
+    const stale = data.cache?.stale && cacheState !== "stale" ? "stale" : "";
     const capped = data.cache?.capped
-      ? ` · capped at ${numberFormat.format(data.cache.repoLimit ?? data.projects.length)}`
+      ? `capped at ${numberFormat.format(data.cache.repoLimit ?? data.projects.length)}`
       : "";
     const quota = quotaLabel(data.cache?.quota);
-    generatedLabel = `updated ${relativeDate(data.generatedAt)}${cacheState ? ` · ${cacheState}` : ""}${stale}${capped}${quota ? ` · ${quota}` : ""}`;
+    generatedLabel = `updated ${relativeDate(data.generatedAt)}`;
+    generatedDetail = [cacheState, stale, capped, quota, data.cache?.message ?? ""]
+      .filter(Boolean)
+      .join(" · ");
   }
 
   async function fetchPayload(apiPath: string): Promise<Response> {
@@ -705,7 +709,8 @@
     });
     void Promise.all([loadAuth(), loadDashboard()]).catch((error) => {
       generatedLabel = "failed";
-      errorMessage = error instanceof Error ? error.message : String(error);
+      generatedDetail = error instanceof Error ? error.message : String(error);
+      errorMessage = generatedDetail;
     });
     return () => unsubscribe();
   });
@@ -723,10 +728,17 @@
       <p class="subtitle">{subtitle}</p>
     </div>
     <div class="top-actions">
-      <div class="status" aria-live="polite">
+      <button
+        type="button"
+        class="status"
+        aria-live="polite"
+        aria-label={generatedDetail ? `${generatedLabel} · ${generatedDetail}` : generatedLabel}
+        data-tooltip={generatedDetail || undefined}
+        tabindex={generatedDetail ? 0 : undefined}
+      >
         <span class="pulse"></span>
         <span>{generatedLabel}</span>
-      </div>
+      </button>
 
       {#if auth?.user}
         <DropdownMenu.Root>

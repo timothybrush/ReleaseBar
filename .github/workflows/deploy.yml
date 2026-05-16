@@ -41,5 +41,12 @@ jobs:
           live_css="$(printf '%s\n' "$live_html" | grep -Eo '/assets/index-[^"]+\.css' | head -n 1)"
           test "$live_js" = "$expected_js"
           test "$live_css" = "$expected_css"
+          for _ in $(seq 1 20); do
+            if curl -fsSL "https://release.bar${live_js}" >/dev/null \
+              && curl -fsSL "https://release.bar${live_css}" >/dev/null; then
+              exit 0
+            fi
+            sleep 3
+          done
           curl -fsSL "https://release.bar${live_js}" >/dev/null
           curl -fsSL "https://release.bar${live_css}" >/dev/null

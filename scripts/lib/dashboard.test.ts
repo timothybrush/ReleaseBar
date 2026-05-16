@@ -653,6 +653,10 @@ test("worker preserves cached quota metadata on fresh responses", async () => {
   );
 
   assert.equal(response.status, 200);
+  assert.equal(
+    response.headers.get("cache-control"),
+    "public, max-age=60, stale-while-revalidate=300",
+  );
   const body = (await response.json()) as DashboardPayload;
   assert.equal(body.cache?.state, "fresh");
   assert.equal(body.cache?.quota?.source, "app");

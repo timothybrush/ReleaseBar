@@ -314,7 +314,7 @@
         const body = (await response.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `save failed: ${response.status}`);
       }
-      location.assign(`/${encodeURIComponent(initialRoute.owner)}`);
+      location.assign(`/${encodeURIComponent(initialRoute.owner)}?rdRefresh=${Date.now()}`);
     } catch (error) {
       profileMessage = error instanceof Error ? error.message : String(error);
     } finally {
@@ -334,7 +334,7 @@
         const body = (await response.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `reset failed: ${response.status}`);
       }
-      location.assign(`/${encodeURIComponent(initialRoute.owner)}`);
+      location.assign(`/${encodeURIComponent(initialRoute.owner)}?rdRefresh=${Date.now()}`);
     } catch (error) {
       profileMessage = error instanceof Error ? error.message : String(error);
     } finally {
@@ -513,9 +513,24 @@
       .join(" · ");
   }
 
-  async function fetchPayload(apiPath: string): Promise<Response> {
+  async function fetchPayload(apiPath: string, bypassCache = false): Promise<Response> {
+    if (!bypassCache) {
+      return fetch(apiPath);
+    }
     const joiner = apiPath.includes("?") ? "&" : "?";
     return fetch(`${apiPath}${joiner}v=${Date.now()}`, { cache: "no-store" });
+  }
+
+  function clearDashboardRefreshParam(): void {
+    const params = new URLSearchParams(location.search);
+    if (!params.has("rdRefresh")) return;
+    params.delete("rdRefresh");
+    const nextSearch = params.toString();
+    history.replaceState(
+      history.state,
+      "",
+      `${location.pathname}${nextSearch ? `?${nextSearch}` : ""}${location.hash}`,
+    );
   }
 
   async function readDashboardResponse(
@@ -595,37 +610,46 @@
   }
 
   async function loadDashboard(attempt = 0): Promise<void> {
-    let response = await fetchPayload(initialRoute.apiPath);
-    let body = await readDashboardResponse(response);
-    if (response.ok && body && "projects" in body) {
-      data = body;
-      updateStatus();
-      if (shouldAutoRefresh(data)) {
-        if (!startDashboardStream(attempt)) {
-          scheduleDashboardRefresh(attempt);
-        }
-      } else {
-        closeDashboardStream();
-      }
-      return;
-    }
-    if (body && "cache" in body) {
-      data = body;
-      updateStatus();
-      errorMessage = body.cache?.message || "dashboard error";
-      return;
-    }
-    if (initialRoute.fallbackApiPath) {
-      response = await fetchPayload(initialRoute.fallbackApiPath);
-      body = await readDashboardResponse(response);
+    const forceRefresh = new URLSearchParams(location.search).has("rdRefresh");
+    const bypassCache = attempt > 0 || forceRefresh;
+    try {
+      let response = await fetchPayload(initialRoute.apiPath, bypassCache);
+      let body = await readDashboardResponse(response);
       if (response.ok && body && "projects" in body) {
         data = body;
         updateStatus();
+        if (shouldAutoRefresh(data)) {
+          if (!startDashboardStream(attempt)) {
+            scheduleDashboardRefresh(attempt);
+          }
+        } else {
+          closeDashboardStream();
+        }
         return;
       }
+      if (body && "cache" in body) {
+        data = body;
+        updateStatus();
+        errorMessage = body.cache?.message || "dashboard error";
+        return;
+      }
+      if (initialRoute.fallbackApiPath) {
+        response = await fetchPayload(initialRoute.fallbackApiPath, bypassCache);
+        body = await readDashboardResponse(response);
+        if (response.ok && body && "projects" in body) {
+          data = body;
+          updateStatus();
+          return;
+        }
+      }
+      const message =
+        body && "error" in body ? body.error : `dashboard fetch failed: ${response.status}`;
+      throw new Error(message || `dashboard fetch failed: ${response.status}`);
+    } finally {
+      if (forceRefresh) {
+        clearDashboardRefreshParam();
+      }
     }
-    const message = body && "error" in body ? body.error : `dashboard fetch failed: ${response.status}`;
-    throw new Error(message || `dashboard fetch failed: ${response.status}`);
   }
 
   function handleSourceSubmit(event: SubmitEvent): void {

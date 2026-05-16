@@ -506,11 +506,11 @@ function socialImage(label: string): Response {
 }
 
 function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
-  return new Response(JSON.stringify(body, null, 2), {
+  return new Response(JSON.stringify(body), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
-      "cache-control": "public, max-age=300, stale-while-revalidate=3600",
+      "cache-control": "public, max-age=60, stale-while-revalidate=300",
       ...corsHeaders,
       ...headers,
     },

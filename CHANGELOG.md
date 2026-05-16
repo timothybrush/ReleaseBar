@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Let fresh public dashboard API responses use a short edge cache and compact JSON payloads.
 - Kept dashboard cache entries longer, limited very old stale fallbacks, and auto-refreshed stale dashboards while rebuilds finish.
 - Renamed the table `since` header to `commits since`.
 - Combined the version and release table columns and removed version sorting.

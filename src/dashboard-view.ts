@@ -1,6 +1,6 @@
 import type { Freshness, Project } from "./types.js";
 
-export type SortKey = "repo" | "release" | "since" | "activity" | "issues" | "prs" | "ci";
+export type SortKey = "repo" | "stars" | "release" | "since" | "activity" | "issues" | "prs" | "ci";
 export type SortDirection = "asc" | "desc";
 export type DashboardFilter = Freshness | "all" | "attention";
 
@@ -15,7 +15,7 @@ export type DashboardViewState = {
 
 export const filterOptions: DashboardFilter[] = ["all", "attention", "hot", "busy", "fresh"];
 export const attentionFreshness: Freshness[] = ["hot", "busy"];
-export const sortOptions: SortKey[] = ["repo", "release", "since", "activity"];
+export const sortOptions: SortKey[] = ["repo", "stars", "release", "since", "activity"];
 export const devSortOptions: SortKey[] = ["issues", "prs", "ci"];
 
 const filterValues = new Set<string>(filterOptions);
@@ -108,6 +108,8 @@ export function sortValue(project: Project, key: SortKey): string | number {
   switch (key) {
     case "repo":
       return project.fullName.toLowerCase();
+    case "stars":
+      return project.stars;
     case "release":
       return timestamp(project.releaseDate);
     case "since":

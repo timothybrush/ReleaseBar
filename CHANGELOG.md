@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added a stars table column, repository topic tags, clearer GitHub Hot placeholders, and automatic release scanning for the top Hot repositories.
 - Improved responsive table and settings controls, including a compact `since` header and centered settings close button.
 - Let fresh public dashboard API responses use a short edge cache and compact JSON payloads.
 - Kept dashboard cache entries longer, limited very old stale fallbacks, and auto-refreshed stale dashboards while rebuilds finish.

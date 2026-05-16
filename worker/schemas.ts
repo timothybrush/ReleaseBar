@@ -60,6 +60,7 @@ export const gitHubSearchRepositorySchema = v.looseObject({
   description: v.nullable(v.string()),
   default_branch: v.optional(v.string()),
   language: v.nullable(v.string()),
+  topics: v.optional(v.array(v.string())),
   stargazers_count: v.optional(v.number()),
   forks_count: v.optional(v.number()),
   open_issues_count: v.optional(v.number()),

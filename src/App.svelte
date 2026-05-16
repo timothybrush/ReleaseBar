@@ -237,6 +237,7 @@
       project.fullName,
       project.description,
       project.language,
+      ...(project.topics ?? []),
       project.version,
       project.freshness,
       project.ciState,
@@ -678,6 +679,10 @@
     language = activeLanguage(nextLanguage) ? "" : nextLanguage;
   }
 
+  function setTopicSearch(topic: string): void {
+    query = query.trim().toLowerCase() === topic.toLowerCase() ? "" : topic;
+  }
+
   function sortCommand(key: SortKey): CommandAction {
     return {
       actionId: `sort:${key}`,
@@ -714,6 +719,7 @@
   }
 
   function repoCommands(project: Project): CommandAction[] {
+    const topics = project.topics ?? [];
     const commands: CommandAction[] = [
       {
         actionId: `repo:${project.fullName}`,
@@ -721,7 +727,7 @@
         subTitle: `${project.version} · ${project.freshness} · ${numberFormat.format(project.stars)} stars`,
         description: project.description ?? undefined,
         group: "Repos",
-        keywords: [project.owner, project.name, project.language ?? "", project.version],
+        keywords: [project.owner, project.name, project.language ?? "", project.version, ...topics],
         onRun: () => openUrl(project.url),
       },
       {
@@ -778,6 +784,15 @@
       });
     }
     return commands;
+  }
+
+  function isRepositorySearchProject(project: Project): boolean {
+    return (
+      project.version === "repo search" &&
+      project.releaseDate === null &&
+      project.commitsSinceRelease === null &&
+      project.compareUrl === null
+    );
   }
 
   function buildCommands(
@@ -1259,23 +1274,45 @@
                   {project.language}
                 </button>
               {/if}
-              <span class="tag">{numberFormat.format(project.stars)} stars</span>
+              {#each (project.topics ?? []).slice(0, 4) as topic}
+                <button
+                  class="tag tag-button"
+                  class:active={query.trim().toLowerCase() === topic.toLowerCase()}
+                  type="button"
+                  aria-pressed={query.trim().toLowerCase() === topic.toLowerCase()}
+                  title={`Search ${topic}`}
+                  onclick={() => setTopicSearch(topic)}
+                >
+                  {topic}
+                </button>
+              {/each}
               {#if project.archived}<span class="tag muted">archived</span>{/if}
               <span class="tag">{project.freshness}</span>
             </div>
           </div>
+          <div class="stars-cell">
+            <strong>{numberFormat.format(project.stars)}</strong>
+          </div>
           <div class="release-cell">
-            <strong>{absoluteDate(project.releaseDate)}</strong>
-            <a
-              class="release-version"
-              href={project.releaseUrl}
-              target="_blank"
-              rel="noreferrer"
-              title={`Open release ${project.version}`}
-            >
-              {project.version}
-            </a>
-            <span>{relativeDate(project.releaseDate)}</span>
+            {#if isRepositorySearchProject(project)}
+              <strong>repo search</strong>
+              <a class="release-version" href={project.url} target="_blank" rel="noreferrer">
+                open repo
+              </a>
+              <span>release not scanned</span>
+            {:else}
+              <strong>{absoluteDate(project.releaseDate)}</strong>
+              <a
+                class="release-version"
+                href={project.releaseUrl}
+                target="_blank"
+                rel="noreferrer"
+                title={`Open release ${project.version}`}
+              >
+                {project.version}
+              </a>
+              <span>{relativeDate(project.releaseDate)}</span>
+            {/if}
           </div>
           <div class="since-cell" class:muted={!project.compareUrl || project.commitsSinceRelease === null}>
             {#if project.compareUrl && project.commitsSinceRelease !== null}

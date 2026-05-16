@@ -87,6 +87,7 @@ function testProject(overrides: Partial<Project> & Pick<Project, "owner" | "name
     url: `https://github.com/${fullName}`,
     defaultBranch: "main",
     language: null,
+    topics: [],
     stars: 1,
     forks: 0,
     openIssues: 0,
@@ -285,6 +286,17 @@ test("dashboard project sorting handles dev issue and pull request counts numeri
     sortProjects(projects, "prs", "desc").map((project) => project.name),
     ["some", "many", "zero"],
   );
+  assert.deepEqual(
+    sortProjects(
+      [
+        testProject({ owner: "owner", name: "small", stars: 10 }),
+        testProject({ owner: "owner", name: "large", stars: 1000 }),
+      ],
+      "stars",
+      "desc",
+    ).map((project) => project.name),
+    ["large", "small"],
+  );
 });
 
 test("worker builds root hot dashboard from cached dashboards", async () => {
@@ -422,19 +434,210 @@ test("worker keeps hot owner route distinct from root hot API", async () => {
 
 test("worker serves cached GitHub discovery dashboards from repository search", async () => {
   const originalFetch = globalThis.fetch;
-  let calls = 0;
+  let searchCalls = 0;
+  let repoCalls = 0;
   globalThis.fetch = async (input, init) => {
-    calls += 1;
     const url = new URL(String(input));
-    assert.equal(url.pathname, "/search/repositories");
-    assert.match(url.searchParams.get("q") ?? "", /language:"TypeScript"/);
-    assert.match(url.searchParams.get("q") ?? "", /pushed:>=/);
-    assert.equal(url.searchParams.get("sort"), "stars");
-    assert.equal((init?.headers as Record<string, string>)?.authorization, "Bearer shared-token");
-    return Response.json(
-      {
-        total_count: 2,
-        incomplete_results: false,
+    if (url.pathname === "/search/repositories") {
+      searchCalls += 1;
+      assert.match(url.searchParams.get("q") ?? "", /language:"TypeScript"/);
+      assert.match(url.searchParams.get("q") ?? "", /pushed:>=/);
+      assert.equal(url.searchParams.get("sort"), "stars");
+      assert.equal((init?.headers as Record<string, string>)?.authorization, "Bearer shared-token");
+      return Response.json(
+        {
+          total_count: 2,
+          incomplete_results: false,
+          items: [
+            {
+              name: "releasebar",
+              full_name: "acme/releasebar",
+              private: false,
+              fork: false,
+              archived: false,
+              html_url: "https://github.com/acme/releasebar",
+              description: "Release dashboard",
+              default_branch: "main",
+              language: "TypeScript",
+              topics: ["releases", "dashboard"],
+              stargazers_count: 1200,
+              forks_count: 42,
+              open_issues_count: 7,
+              pushed_at: "2026-05-16T12:00:00Z",
+              updated_at: "2026-05-16T12:00:00Z",
+              owner: { login: "acme" },
+            },
+          ],
+        },
+        {
+          headers: {
+            "x-ratelimit-remaining": "4999",
+            "x-ratelimit-limit": "5000",
+            "x-ratelimit-reset": "1770000000",
+            "x-ratelimit-resource": "search",
+          },
+        },
+      );
+    }
+    repoCalls += 1;
+    if (url.pathname === "/repos/acme/releasebar") {
+      return Response.json({
+        owner: { login: "acme" },
+        name: "releasebar",
+        full_name: "acme/releasebar",
+        description: "Release dashboard",
+        html_url: "https://github.com/acme/releasebar",
+        default_branch: "main",
+        language: "TypeScript",
+        topics: ["releases", "dashboard"],
+        stargazers_count: 1200,
+        forks_count: 42,
+        open_issues_count: 9,
+        archived: false,
+        pushed_at: "2026-05-16T12:00:00Z",
+        updated_at: "2026-05-16T12:00:00Z",
+        fork: false,
+        private: false,
+      });
+    }
+    if (url.pathname === "/repos/acme/releasebar/releases") {
+      return Response.json([
+        {
+          tag_name: "v1.2.3",
+          name: "Release 1.2.3",
+          html_url: "https://github.com/acme/releasebar/releases/tag/v1.2.3",
+          draft: false,
+          published_at: "2026-05-15T00:00:00Z",
+        },
+      ]);
+    }
+    if (url.pathname === "/repos/acme/releasebar/commits/main") {
+      return Response.json({
+        sha: "abcdef123456",
+        commit: { committer: { date: "2026-05-16T12:00:00Z" } },
+      });
+    }
+    if (url.pathname === "/repos/acme/releasebar/compare/v1.2.3...main") {
+      return Response.json({
+        total_commits: 5,
+        html_url: "https://github.com/acme/releasebar/compare/v1.2.3...main",
+      });
+    }
+    if (url.pathname === "/repos/acme/releasebar/pulls") {
+      return Response.json([{}]);
+    }
+    if (url.pathname === "/repos/acme/releasebar/commits/abcdef123456/check-runs") {
+      return Response.json({ check_runs: [] });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const waitUntil: Promise<unknown>[] = [];
+  const context = {
+    waitUntil: (promise: Promise<unknown>) => {
+      waitUntil.push(promise);
+    },
+  };
+  const env = {
+    DASHBOARD_CACHE: kvStore(),
+    GITHUB_TOKEN: "shared-token",
+  };
+  try {
+    const first = await worker.fetch(
+      new Request("https://release.bar/api/_discover?period=week&lang=TypeScript"),
+      env,
+      context,
+    );
+    assert.equal(first.status, 200);
+    assert.equal(first.headers.get("cache-control"), "no-store");
+    const body = (await first.json()) as DashboardPayload;
+    assert.equal(body.title, "GitHub Hot");
+    assert.equal(body.projects[0]?.fullName, "acme/releasebar");
+    assert.equal(body.projects[0]?.version, "repo search");
+    assert.deepEqual(body.projects[0]?.topics, ["releases", "dashboard"]);
+    assert.equal(body.projects[0]?.openIssues, 7);
+    assert.equal(body.cache?.state, "partial");
+    assert.equal(body.cache?.progress?.done, false);
+    assert.equal(body.cache?.quota?.remaining, 4999);
+    assert.match(body.cache?.message ?? "", /repository search/);
+
+    await Promise.all(waitUntil.splice(0));
+
+    const second = await worker.fetch(
+      new Request("https://release.bar/api/_discover?period=week&lang=TypeScript"),
+      env,
+      context,
+    );
+    assert.equal(second.status, 200);
+    const hydrated = (await second.json()) as DashboardPayload;
+    assert.equal(hydrated.cache?.state, "fresh");
+    assert.equal(hydrated.cache?.progress?.done, true);
+    assert.equal(hydrated.projects[0]?.version, "v1.2.3");
+    assert.equal(hydrated.projects[0]?.commitsSinceRelease, 5);
+    assert.equal(hydrated.projects[0]?.openPullRequests, 1);
+    assert.equal(searchCalls, 1);
+    assert.equal(repoCalls > 0, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker does not rehydrate completed GitHub discovery cache", async () => {
+  const originalFetch = globalThis.fetch;
+  const cached = testDashboard("cached", [
+    testProject({
+      owner: "cached",
+      name: "repo",
+      version: "v2.0.0",
+      releaseDate: "2026-05-16T00:00:00Z",
+      commitsSinceRelease: 2,
+    }),
+  ]);
+  const env = {
+    DASHBOARD_CACHE: kvStore({
+      "discover:v3:week:all": JSON.stringify({
+        ...cached,
+        title: "GitHub Hot",
+        owners: [],
+        generatedAt: new Date().toISOString(),
+        cache: {
+          ...(cached.cache ?? {
+            capped: false,
+            repoLimit: 40,
+            generatedAt: cached.generatedAt,
+          }),
+          state: "fresh",
+          stale: false,
+          generatedAt: new Date().toISOString(),
+          progress: { scanned: 1, limit: 1, done: true },
+        },
+      }),
+    }),
+  };
+  globalThis.fetch = async () => {
+    throw new Error("discovery cache should not fetch");
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/_discover?period=week"),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.projects[0]?.version, "v2.0.0");
+    assert.equal(body.cache?.state, "fresh");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker marks GitHub discovery hydration complete when release scan is rate limited", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/search/repositories") {
+      return Response.json({
+        total_count: 1,
         items: [
           {
             name: "releasebar",
@@ -454,43 +657,34 @@ test("worker serves cached GitHub discovery dashboards from repository search", 
             owner: { login: "acme" },
           },
         ],
-      },
+      });
+    }
+    return Response.json({ message: "API rate limit exceeded" }, { status: 403 });
+  };
+  const waitUntil: Promise<unknown>[] = [];
+  const env = { DASHBOARD_CACHE: kvStore() };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/_discover?period=week"),
+      env,
       {
-        headers: {
-          "x-ratelimit-remaining": "4999",
-          "x-ratelimit-limit": "5000",
-          "x-ratelimit-reset": "1770000000",
-          "x-ratelimit-resource": "search",
+        waitUntil: (promise: Promise<unknown>) => {
+          waitUntil.push(promise);
         },
       },
     );
-  };
-  const env = {
-    DASHBOARD_CACHE: kvStore(),
-    GITHUB_TOKEN: "shared-token",
-  };
-  try {
-    const first = await worker.fetch(
-      new Request("https://release.bar/api/_discover?period=week&lang=TypeScript"),
+    assert.equal(response.status, 200);
+    await Promise.all(waitUntil.splice(0));
+    const cached = await worker.fetch(
+      new Request("https://release.bar/api/_discover?period=week"),
       env,
       { waitUntil: () => undefined },
     );
-    assert.equal(first.status, 200);
-    const body = (await first.json()) as DashboardPayload;
-    assert.equal(body.title, "GitHub Hot");
-    assert.equal(body.projects[0]?.fullName, "acme/releasebar");
+    const body = (await cached.json()) as DashboardPayload;
+    assert.equal(body.cache?.state, "fresh");
+    assert.equal(body.cache?.progress?.done, true);
     assert.equal(body.projects[0]?.version, "repo search");
-    assert.equal(body.projects[0]?.openIssues, 7);
-    assert.equal(body.cache?.quota?.remaining, 4999);
-    assert.match(body.cache?.message ?? "", /repository search/);
-
-    const second = await worker.fetch(
-      new Request("https://release.bar/api/_discover?period=week&lang=TypeScript"),
-      env,
-      { waitUntil: () => undefined },
-    );
-    assert.equal(second.status, 200);
-    assert.equal(calls, 1);
+    assert.match(body.cache?.message ?? "", /release scan skipped/);
   } finally {
     globalThis.fetch = originalFetch;
   }

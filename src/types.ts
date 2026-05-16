@@ -34,6 +34,7 @@ export type Project = {
   url: string;
   defaultBranch: string;
   language: string | null;
+  topics: string[];
   stars: number;
   forks: number;
   openIssues: number;

@@ -643,10 +643,9 @@ button:focus-visible {
 .table-head,
 .project {
   display: grid;
-  grid-template-columns: minmax(280px, 1.75fr) minmax(190px, 0.9fr) minmax(90px, 0.45fr) minmax(
-      140px,
-      0.6fr
-    );
+  grid-template-columns:
+    minmax(280px, 1.65fr) minmax(78px, 0.34fr) minmax(190px, 0.82fr) minmax(90px, 0.4fr)
+    minmax(140px, 0.58fr);
   gap: 0;
   align-items: stretch;
 }
@@ -654,8 +653,8 @@ button:focus-visible {
 body.dev-mode .table-head,
 body.dev-mode .project {
   grid-template-columns:
-    minmax(250px, 1.45fr) minmax(190px, 0.76fr) minmax(78px, 0.34fr) minmax(125px, 0.52fr)
-    minmax(74px, 0.32fr) minmax(64px, 0.28fr) minmax(110px, 0.5fr);
+    minmax(250px, 1.28fr) minmax(70px, 0.28fr) minmax(180px, 0.68fr) minmax(78px, 0.32fr)
+    minmax(125px, 0.48fr) minmax(74px, 0.3fr) minmax(64px, 0.26fr) minmax(110px, 0.44fr);
 }
 
 .dev-only {
@@ -984,6 +983,11 @@ body.dev-mode .table-head .since-heading .label-compact {
   font-size: 13px;
 }
 
+.stars-cell strong {
+  color: var(--blue);
+  font-size: 24px;
+}
+
 .ci-cell a {
   display: block;
   font-size: 15px;
@@ -1021,6 +1025,11 @@ body.dev-mode .table-head .since-heading .label-compact {
 .project[data-freshness="hot"] .since-cell,
 .project[data-freshness="hot"] .since-cell a {
   color: var(--red);
+}
+
+.since-cell.muted,
+.since-cell.muted a {
+  color: var(--muted);
 }
 
 .error-message {
@@ -1251,6 +1260,7 @@ body.dev-mode .table-head .since-heading .label-compact {
   }
 
   .release-cell::before,
+  .stars-cell::before,
   .since-cell::before,
   .activity-cell::before,
   .issues-cell::before,
@@ -1265,6 +1275,10 @@ body.dev-mode .table-head .since-heading .label-compact {
 
   .release-cell::before {
     content: "release";
+  }
+
+  .stars-cell::before {
+    content: "stars";
   }
 
   .since-cell::before {

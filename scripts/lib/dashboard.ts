@@ -53,6 +53,7 @@ type GitHubRepo = {
   html_url: string;
   default_branch: string;
   language: string | null;
+  topics?: string[];
   stargazers_count: number;
   forks_count: number;
   open_issues_count: number;
@@ -131,6 +132,13 @@ type GraphQLRepoNode = {
   };
   primaryLanguage: null | {
     name: string;
+  };
+  repositoryTopics?: {
+    nodes: Array<{
+      topic?: {
+        name?: string | null;
+      } | null;
+    } | null>;
   };
   stargazerCount: number;
   forkCount: number;
@@ -476,6 +484,13 @@ const ownerReposQuery = /* GraphQL */ `
           primaryLanguage {
             name
           }
+          repositoryTopics(first: 6) {
+            nodes {
+              topic {
+                name
+              }
+            }
+          }
           stargazerCount
           forkCount
           issues(states: OPEN) {
@@ -519,6 +534,10 @@ function graphQlRepo(node: GraphQLRepoNode): GitHubRepo {
     html_url: node.url,
     default_branch: node.defaultBranchRef?.name ?? "main",
     language: node.primaryLanguage?.name ?? null,
+    topics:
+      node.repositoryTopics?.nodes
+        .map((topicNode) => topicNode?.topic?.name)
+        .filter((name): name is string => Boolean(name)) ?? [],
     stargazers_count: node.stargazerCount,
     forks_count: node.forkCount,
     open_issues_count: node.issues.totalCount + node.pullRequests.totalCount,
@@ -735,6 +754,7 @@ async function repoSummary(
     url: repo.html_url,
     defaultBranch: repo.default_branch,
     language: repo.language,
+    topics: repo.topics ?? [],
     stars: repo.stargazers_count,
     forks: repo.forks_count,
     openIssues: repo.open_issues_total ?? Math.max(repo.open_issues_count - openPullRequests, 0),
@@ -770,6 +790,7 @@ function projectCacheSignature(repo: GitHubRepo): string {
     repo.default_branch,
     repo.pushed_at ?? "",
     repo.updated_at ?? "",
+    (repo.topics ?? []).join(","),
     repo.latest_release?.tag_name ?? "",
     repo.latest_release?.published_at ?? "",
   ].join("|");

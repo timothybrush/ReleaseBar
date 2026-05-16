@@ -100,6 +100,7 @@ const hotSourceLimit = 24;
 const hotIndexLimit = 100;
 const hotCacheTtlMs = 5 * 60 * 1000;
 const discoverLimit = 40;
+const discoverHydrateLimit = 12;
 const discoverCacheTtlMs = 60 * 60 * 1000;
 const maxCustomSources = 8;
 const dashboardSchemaVersion = 5;
@@ -1588,6 +1589,7 @@ function discoverProject(repo: GitHubSearchRepository): Project {
     url: repo.html_url,
     defaultBranch,
     language: repo.language,
+    topics: repo.topics ?? [],
     stars: repo.stargazers_count ?? 0,
     forks: repo.forks_count ?? 0,
     openIssues: repo.open_issues_count ?? 0,
@@ -1613,6 +1615,20 @@ function discoverProject(repo: GitHubSearchRepository): Project {
     ciRunDate: null,
     freshness: discoverFreshness(repo),
   };
+}
+
+function isRepositorySearchProject(project: Project): boolean {
+  return (
+    project.version === "repo search" &&
+    project.releaseDate === null &&
+    project.commitsSinceRelease === null &&
+    project.compareUrl === null
+  );
+}
+
+function discoverNeedsHydration(payload: DashboardPayload): boolean {
+  if (payload.cache?.progress?.done === true) return false;
+  return payload.projects.slice(0, discoverHydrateLimit).some(isRepositorySearchProject);
 }
 
 function discoverErrorPayload(
@@ -1706,33 +1722,158 @@ async function discoverPayload(
       repoLimit: discoverLimit,
     },
     cache: {
-      state: "fresh",
-      stale: false,
+      state: "partial",
+      stale: true,
       capped: total > projects.length,
       repoLimit: discoverLimit,
       generatedAt,
       quota: quotaFromResponse(response, env),
-      message: "approximated with GitHub repository search; star velocity needs GH Archive",
+      progress: {
+        scanned: 0,
+        limit: Math.min(discoverHydrateLimit, projects.length),
+        done: false,
+      },
+      message: "repository search loaded; scanning release data for top repositories",
     },
     totals: dashboardTotals(projects),
     projects,
   };
 }
 
-async function discoverResponse(env: Env, url: URL): Promise<Response> {
+async function hydrateDiscoverPayload(
+  payload: DashboardPayload,
+  env: Env,
+): Promise<DashboardPayload> {
+  const now = new Date().toISOString();
+  const repos = payload.projects.slice(0, discoverHydrateLimit).map((project) => project.fullName);
+  if (repos.length === 0) {
+    return {
+      ...payload,
+      generatedAt: now,
+      cache: {
+        ...(payload.cache ?? {
+          capped: false,
+          repoLimit: discoverLimit,
+          generatedAt: now,
+        }),
+        state: "fresh",
+        stale: false,
+        generatedAt: now,
+        progress: { scanned: 0, limit: 0, done: true },
+        message: "repository search loaded",
+      },
+    };
+  }
+  const hydrated = await buildDashboard({
+    title: payload.title,
+    subtitle: payload.subtitle,
+    canonicalDomain: payload.canonicalDomain,
+    owners: [],
+    includeRepos: repos,
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    token: env.GITHUB_TOKEN,
+    quotaSource: env.GITHUB_TOKEN ? "shared" : "anonymous",
+    fetch: workerFetch,
+    projectCache: env.DASHBOARD_CACHE,
+  });
+  const hydratedProjects = new Map(
+    hydrated.projects.map((project) => [project.fullName.toLowerCase(), project]),
+  );
+  const projects = payload.projects.map(
+    (project) => hydratedProjects.get(project.fullName.toLowerCase()) ?? project,
+  );
+  const scanned = repos.length;
+  return {
+    ...payload,
+    generatedAt: now,
+    cache: {
+      ...(payload.cache ?? {
+        capped: false,
+        repoLimit: discoverLimit,
+        generatedAt: now,
+      }),
+      state: "fresh",
+      stale: false,
+      generatedAt: now,
+      ...((hydrated.cache?.quota ?? payload.cache?.quota)
+        ? { quota: hydrated.cache?.quota ?? payload.cache?.quota }
+        : {}),
+      progress: {
+        scanned,
+        limit: scanned,
+        done: true,
+      },
+      message: `release data scanned for top ${scanned} repositories`,
+    },
+    totals: dashboardTotals(projects),
+    projects,
+  };
+}
+
+async function hydrateDiscoverCache(
+  key: string,
+  payload: DashboardPayload,
+  env: Env,
+): Promise<void> {
+  if (!discoverNeedsHydration(payload)) return;
+  const lock = await acquireBuildLock(env, `hydrate:${key}`);
+  if (!lock) return;
+  const refresh = globalThis.setInterval(() => {
+    void lock.refresh();
+  }, buildLockRefreshMs);
+  try {
+    const hydrated = await hydrateDiscoverPayload(payload, env);
+    await writeCached(env, key, hydrated);
+  } catch (error) {
+    await writeCached(env, key, {
+      ...payload,
+      cache: {
+        ...(payload.cache ?? {
+          capped: false,
+          repoLimit: discoverLimit,
+          generatedAt: payload.generatedAt,
+        }),
+        state: "fresh",
+        stale: false,
+        progress: {
+          scanned: 0,
+          limit: Math.min(discoverHydrateLimit, payload.projects.length),
+          done: true,
+        },
+        message: `release scan skipped: ${dashboardErrorMessage(error)}`,
+      },
+    });
+  } finally {
+    globalThis.clearInterval(refresh);
+    await lock.release();
+  }
+}
+
+async function discoverResponse(env: Env, url: URL, context: ExecutionContext): Promise<Response> {
   const period = discoverPeriod(url);
   const language = discoverLanguage(url);
   const key = discoverCacheKey(period, language);
   const cached = await readCached(env, key);
   const ageMs = cacheAgeMs(cached);
   if (cached && canDisplayCached(cached) && ageMs < discoverCacheTtlMs) {
+    if (discoverNeedsHydration(cached)) {
+      context.waitUntil(hydrateDiscoverCache(key, cached, env).catch(() => undefined));
+      return jsonResponse(
+        withCacheState(cached, "partial", "scanning release data for top repositories"),
+        200,
+        { "cache-control": "no-store" },
+      );
+    }
     return jsonResponse(withCacheState(cached, "fresh"));
   }
 
   try {
     const payload = await discoverPayload(period, language, env);
     await writeCached(env, key, payload);
-    return jsonResponse(payload);
+    context.waitUntil(hydrateDiscoverCache(key, payload, env).catch(() => undefined));
+    return jsonResponse(payload, 200, { "cache-control": "no-store" });
   } catch (error) {
     if (canDisplayCached(cached)) {
       return jsonResponse(
@@ -2462,7 +2603,7 @@ async function routeRequest(
     return hotResponse(env);
   }
   if (url.pathname === "/api/_discover") {
-    return discoverResponse(env, url);
+    return discoverResponse(env, url, context);
   }
   if (url.pathname.startsWith("/api/") && url.pathname.endsWith("/events")) {
     return ownerEventsResponse(request, env);

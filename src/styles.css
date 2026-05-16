@@ -745,7 +745,7 @@ body.dev-mode .dev-only {
 }
 
 .command-input::placeholder {
-  color: #5f6959;
+  color: #87917f;
 }
 
 .command-results {
@@ -754,9 +754,9 @@ body.dev-mode .dev-only {
   padding: 8px;
 }
 
-.command-results .cp-group-header {
+.command-panel .command-results .cp-group-header {
   padding: 12px 10px 6px;
-  color: var(--green);
+  color: #bac8b0;
   font-size: 11px;
   letter-spacing: 0;
 }
@@ -769,6 +769,7 @@ body.dev-mode .dev-only {
   border: 1px solid transparent;
   border-radius: 6px;
   padding: 9px 10px;
+  color: var(--text);
   cursor: pointer;
 }
 
@@ -779,6 +780,18 @@ body.dev-mode .dev-only {
   box-shadow: inset 3px 0 0 var(--green);
 }
 
+.command-result:hover .cp-result-title.command-title,
+.command-result.command-result-active .cp-result-title.command-title {
+  color: var(--green);
+}
+
+.command-result:hover .cp-result-subtitle.command-subtitle,
+.command-result.command-result-active .cp-result-subtitle.command-subtitle,
+.command-result:hover .cp-result-description.command-description,
+.command-result.command-result-active .cp-result-description.command-description {
+  color: var(--text);
+}
+
 .command-result .cp-result-icon {
   width: 30px;
   height: 30px;
@@ -787,27 +800,27 @@ body.dev-mode .dev-only {
   background: var(--panel);
 }
 
-.command-title {
+.command-result .cp-result-title.command-title {
   overflow: hidden;
-  color: var(--text);
+  color: #dce9d3;
   font-size: 14px;
   font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.command-subtitle {
+.command-result .cp-result-subtitle.command-subtitle {
   margin-top: 2px;
   overflow: hidden;
-  color: var(--muted);
+  color: #a9b3a1;
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.command-description {
+.command-result .cp-result-description.command-description {
   margin-top: 4px;
-  color: #66705f;
+  color: #a0aa98;
   font-size: 12px;
 }
 

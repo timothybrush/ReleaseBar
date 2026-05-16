@@ -124,7 +124,7 @@ export type DashboardPayload = {
     repoLimit: number | null;
   };
   cache?: {
-    state: "fresh" | "stale" | "rebuilding" | "error";
+    state: "fresh" | "stale" | "partial" | "rebuilding" | "error";
     stale: boolean;
     capped: boolean;
     repoLimit: number | null;

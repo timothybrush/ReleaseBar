@@ -541,6 +541,62 @@ test("worker returns rebuilding while another isolate owns the dashboard build l
   }
 });
 
+test("worker serves partial cached sources while combined dashboard rebuilds", async () => {
+  const originalFetch = globalThis.fetch;
+  let repoFetches = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/users/alpha") {
+      return Response.json({ login: "alpha", type: "User" });
+    }
+    if (url.pathname === "/users/beta") {
+      return Response.json({ login: "beta", type: "Organization" });
+    }
+    if (url.pathname.includes("/repos")) {
+      repoFetches += 1;
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const busyLocks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async () => new Response(null, { status: 409 }),
+    }),
+  };
+  const alphaKey = dashboardCacheKey({ owner: "alpha", schemaVersion: 2 });
+  const betaKey = dashboardCacheKey({ owner: "beta", schemaVersion: 2 });
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/alpha?owners=beta"),
+      {
+        DASHBOARD_CACHE: kvStore({
+          [alphaKey]: JSON.stringify(
+            testDashboard("alpha", [testProject({ owner: "alpha", name: "one" })]),
+          ),
+          [betaKey]: JSON.stringify(
+            testDashboard("beta", [testProject({ owner: "beta", name: "two" })]),
+          ),
+        }),
+        DASHBOARD_LOCKS: busyLocks,
+        GITHUB_TOKEN: "shared-token",
+      },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.cache?.state, "partial");
+    assert.deepEqual(body.projects.map((project) => project.fullName).sort(), [
+      "alpha/one",
+      "beta/two",
+    ]);
+    assert.equal(body.totals.repos, 2);
+    assert.equal(repoFetches, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("dashboard build lock only releases the matching lease token", async () => {
   const storage = new Map<string, unknown>();
   const lock = new DashboardBuildLock(

@@ -1242,6 +1242,89 @@ function withProfile(
   };
 }
 
+function dashboardTotals(projects: Project[]): DashboardPayload["totals"] {
+  const released = projects.filter((project) => project.releaseDate).length;
+  return {
+    repos: projects.length,
+    released,
+    unreleased: projects.length - released,
+    commitsSinceRelease: projects.reduce(
+      (sum, project) => sum + (project.commitsSinceRelease ?? 0),
+      0,
+    ),
+  };
+}
+
+async function partialDashboardPayload(
+  dashboard: DashboardRequest,
+  env: Env,
+  ownerSlugs: string[],
+): Promise<DashboardPayload | null> {
+  const options = optionsFromUrl(dashboard.url);
+  const keys = [
+    ...ownerSlugs.map((owner) =>
+      dashboardCacheKey({
+        owner,
+        ...options,
+        schemaVersion,
+      }),
+    ),
+    ...dashboard.includeRepos.map((repo) =>
+      dashboardCacheKey({
+        owner: "custom",
+        repos: [repo],
+        ...options,
+        schemaVersion,
+      }),
+    ),
+  ];
+  const dashboards = (
+    await Promise.all([...new Set(keys)].map((key) => readCached(env, key)))
+  ).filter(
+    (payload): payload is DashboardPayload =>
+      payload !== null && payload.cache?.state !== "error" && payload.projects.length > 0,
+  );
+  if (dashboards.length === 0) return null;
+
+  const projectsByName = new Map<string, Project>();
+  for (const payload of dashboards) {
+    for (const project of payload.projects) {
+      projectsByName.set(project.fullName.toLowerCase(), project);
+    }
+  }
+  const projects = [...projectsByName.values()];
+  const generatedAt = dashboards
+    .map((payload) => payload.generatedAt)
+    .filter((value) => !Number.isNaN(Date.parse(value)))
+    .sort()[0];
+  const firstQuota = dashboards.find((payload) => payload.cache?.quota)?.cache?.quota;
+  return withProfile(
+    {
+      title: "ReleaseBar",
+      subtitle: dashboard.subtitle,
+      canonicalDomain: env.RELEASEDECK_CANONICAL_DOMAIN ?? "release.bar",
+      generatedAt: generatedAt ?? new Date().toISOString(),
+      owners: dashboard.owners,
+      options: {
+        ...options,
+        repoLimit,
+      },
+      cache: {
+        state: "partial",
+        stale: true,
+        capped: dashboards.some((payload) => payload.cache?.capped),
+        repoLimit,
+        generatedAt: generatedAt ?? new Date().toISOString(),
+        ...(firstQuota ? { quota: firstQuota } : {}),
+        message: `showing cached data from ${dashboards.length} source${dashboards.length === 1 ? "" : "s"} while the combined dashboard updates`,
+      },
+      totals: dashboardTotals(projects),
+      projects,
+    },
+    dashboard.profile,
+  );
+}
+
 async function readCachedDashboards(env: Env): Promise<DashboardPayload[]> {
   if (!env.DASHBOARD_CACHE) return [];
 
@@ -1322,10 +1405,6 @@ function hotDashboardPayload(
       return true;
     })
     .slice(0, hotLimit);
-  const totalCommits = projects.reduce(
-    (sum, project) => sum + (project.commitsSinceRelease ?? 0),
-    0,
-  );
   const omitted = candidates.size > projects.length;
 
   return {
@@ -1348,12 +1427,7 @@ function hotDashboardPayload(
       generatedAt,
       message: `built from ${dashboards.length} cached dashboard${dashboards.length === 1 ? "" : "s"}`,
     },
-    totals: {
-      repos: projects.length,
-      released: projects.filter((project) => project.releaseDate).length,
-      unreleased: projects.filter((project) => !project.releaseDate).length,
-      commitsSinceRelease: totalCommits,
-    },
+    totals: dashboardTotals(projects),
     projects,
   };
 }
@@ -1758,6 +1832,12 @@ async function ownerResponse(
     ]);
     if (payload === buildPending || payload === null) {
       context.waitUntil(build.catch((error) => cacheBuildError(dashboard, env, error)));
+      const partial = await partialDashboardPayload(dashboard, env, ownerSlugs);
+      if (partial) {
+        return jsonResponse(partial, 200, {
+          "cache-control": "no-store",
+        });
+      }
       return jsonResponse(rebuildingPayload(dashboard, env), 202, {
         "cache-control": "no-store",
       });

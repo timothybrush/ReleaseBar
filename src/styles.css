@@ -705,6 +705,29 @@ body.dev-mode .dev-only {
   color: var(--muted);
 }
 
+.partial-state {
+  display: grid;
+  gap: 4px;
+  padding: 13px 16px;
+  border-top: 1px solid var(--line);
+  background:
+    linear-gradient(90deg, rgba(156, 255, 87, 0.075), transparent 58%), rgba(8, 9, 8, 0.5);
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.partial-state span {
+  color: var(--green);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.partial-state strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
 @keyframes loading-pulse {
   0%,
   100% {

@@ -86,6 +86,7 @@
   $: dashboardFetching =
     (!data && !errorMessage) ||
     (data?.cache?.state === "rebuilding" && data.projects.length === 0);
+  $: dashboardUpdating = data?.cache?.state === "partial";
   $: ownerToggles = data
     ? [...new Set(data.projects.map((project) => project.owner.toLowerCase()))].sort()
     : [];
@@ -452,7 +453,10 @@
       ? `capped at ${numberFormat.format(data.cache.repoLimit ?? data.projects.length)}`
       : "";
     const quota = quotaLabel(data.cache?.quota);
-    generatedLabel = `updated ${relativeDate(data.generatedAt)}`;
+    generatedLabel =
+      cacheState === "partial"
+        ? `updating · cached ${relativeDate(data.generatedAt)}`
+        : `updated ${relativeDate(data.generatedAt)}`;
     generatedDetail = [cacheState, stale, capped, quota, data.cache?.message ?? ""]
       .filter(Boolean)
       .join(" · ");
@@ -488,7 +492,10 @@
     if (response.ok && body && "projects" in body) {
       data = body;
       updateStatus();
-      if (data.cache?.state === "rebuilding" && attempt < 24) {
+      if (
+        (data.cache?.state === "rebuilding" || data.cache?.state === "partial") &&
+        attempt < 24
+      ) {
         globalThis.setTimeout(() => {
           void loadDashboard(attempt + 1);
         }, 5000);
@@ -1024,6 +1031,12 @@
           <small>Adjust search, filters, or dashboard settings.</small>
         </div>
       {:else}
+        {#if dashboardUpdating}
+          <div class="partial-state" aria-live="polite">
+            <span>cached rows visible</span>
+            <strong>{data?.cache?.message ?? "combined dashboard updating"}</strong>
+          </div>
+        {/if}
         {#each filteredProjects as project (project.fullName)}
         <article class="project" data-freshness={project.freshness}>
           <div class="repo-cell">

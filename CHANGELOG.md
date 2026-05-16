@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Show cached partial source data while cold combined dashboards rebuild in the background.
 - Added owner-only public dashboard defaults so saved sources and visibility apply at clean owner URLs.
 - Added a close button to the dashboard settings panel.
 - Kept the dashboard timestamp compact and moved cache/quota details into an accessible tooltip.

@@ -367,13 +367,16 @@ button:focus-visible {
 }
 
 .menu-action {
+  display: flex;
+  align-items: center;
   width: 100%;
-  min-height: 40px;
+  min-height: 48px;
   border-width: 0;
   border-radius: 5px;
-  padding: 0 10px;
+  padding: 1px 20px 0;
   background: transparent;
   color: var(--muted);
+  line-height: 1;
   text-align: left;
   white-space: nowrap;
 }

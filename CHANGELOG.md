@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Made repository language tags clickable filters and exposed language filters in the command palette.
+- Improved account dropdown menu vertical alignment and item spacing.
 - Replaced GitHub Pages deploys with automatic Cloudflare Worker deploys and live asset smoke checks.
 - Added URL-restored dashboard view state for search, filters, sort order, and dev columns.
 - Added a `need attention` dashboard filter for hot and busy repositories, with the metric tile acting as a shortcut.

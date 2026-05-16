@@ -534,16 +534,16 @@ button:focus-visible {
   position: absolute;
   top: 12px;
   right: 12px;
-  display: inline-grid;
   width: 28px;
   height: 28px;
-  place-items: center;
   border: 1px solid var(--line);
   border-radius: 6px;
+  padding: 0;
   background: var(--panel-menu);
   color: var(--muted);
-  font-size: 20px;
-  line-height: 1;
+  font-size: 22px;
+  line-height: 28px;
+  text-align: center;
 }
 
 .settings-close:hover,
@@ -637,6 +637,7 @@ button:focus-visible {
   border-radius: var(--radius);
   background: rgba(8, 9, 8, 0.78);
   overflow: hidden;
+  container-type: inline-size;
 }
 
 .table-head,
@@ -702,6 +703,28 @@ body.dev-mode .dev-only {
   content: " " attr(data-direction);
   color: var(--muted);
   text-transform: lowercase;
+}
+
+.table-head .label-compact {
+  display: none;
+}
+
+body.dev-mode .table-head .since-heading .label-full {
+  display: none;
+}
+
+body.dev-mode .table-head .since-heading .label-compact {
+  display: inline;
+}
+
+@container (max-width: 980px) {
+  .table-head .since-heading .label-full {
+    display: none;
+  }
+
+  .table-head .since-heading .label-compact {
+    display: inline;
+  }
 }
 
 .loading-state {

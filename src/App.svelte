@@ -1190,12 +1190,19 @@
       {#each [...sortOptions, ...devSortOptions] as key}
         <button
           class:dev-only={devSortOptions.includes(key)}
+          class:since-heading={key === "since"}
           type="button"
+          aria-label={sortLabel(key)}
           aria-current={sortKey === key ? "true" : undefined}
           data-direction={sortKey === key ? sortDirection : ""}
           onclick={() => setSort(key)}
         >
-          {sortLabel(key)}
+          {#if key === "since"}
+            <span class="label-full">commits since</span>
+            <span class="label-compact">since</span>
+          {:else}
+            {sortLabel(key)}
+          {/if}
         </button>
       {/each}
     </div>

@@ -438,13 +438,14 @@ button:focus-visible {
 /* Settings */
 
 .settings-panel {
+  position: relative;
   display: none;
   grid-template-columns: minmax(150px, 0.4fr) minmax(160px, 0.5fr) minmax(320px, 1fr);
   gap: 18px;
   margin: -8px 0 22px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 16px;
+  padding: 16px 52px 16px 16px;
   background: rgba(16, 19, 15, 0.92);
 }
 
@@ -465,6 +466,28 @@ button:focus-visible {
   margin: 8px 0 0;
   color: var(--muted);
   font-size: 12px;
+}
+
+.settings-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: inline-grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-menu);
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+}
+
+.settings-close:hover,
+.settings-close:focus-visible {
+  border-color: var(--green);
+  color: var(--text);
 }
 
 .setting-list {
@@ -498,6 +521,26 @@ button:focus-visible {
 .source-form button {
   width: 100%;
   font-size: 12px;
+}
+
+.profile-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.profile-actions button {
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.profile-actions button:last-child {
+  color: var(--muted);
+}
+
+.profile-status {
+  max-width: 30ch;
 }
 
 .setting-check {

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added owner-only public dashboard defaults so saved sources and visibility apply at clean owner URLs.
+- Added a close button to the dashboard settings panel.
 - Kept the dashboard timestamp compact and moved cache/quota details into an accessible tooltip.
 - Exposed GitHub API quota source, remaining calls, and reset time in dashboard cache status.
 - Reduced GitHub API fanout with GraphQL repository metadata, KV-backed repo fragments, and Durable Object rebuild locking.

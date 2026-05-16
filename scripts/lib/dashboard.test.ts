@@ -1035,6 +1035,170 @@ test("worker uses GitHub App installation token for cold owner dashboards", asyn
   }
 });
 
+test("worker saves owner public defaults and applies them to clean owner URLs", async () => {
+  const sessionId = "session-profile";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+  });
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: cache,
+    GITHUB_TOKEN: "shared-token",
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    const path = url.pathname;
+    if (path === "/users/steipete") {
+      return Response.json({ login: "steipete", type: "User" });
+    }
+    if (path === "/graphql") {
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "User",
+            repositories: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [],
+            },
+          },
+        },
+      });
+    }
+    if (path === "/users/steipete/repos") {
+      return Response.json([]);
+    }
+    if (path === "/repos/openclaw/peekaboo") {
+      return Response.json({
+        owner: { login: "openclaw" },
+        name: "peekaboo",
+        full_name: "openclaw/peekaboo",
+        description: null,
+        html_url: "https://github.com/openclaw/peekaboo",
+        default_branch: "main",
+        language: "Swift",
+        stargazers_count: 5,
+        forks_count: 0,
+        open_issues_count: 0,
+        archived: false,
+        pushed_at: "2026-05-15T00:00:00Z",
+        updated_at: "2026-05-15T00:00:00Z",
+        fork: false,
+        private: false,
+      });
+    }
+    if (path === "/repos/openclaw/peekaboo/releases") {
+      return Response.json([
+        {
+          tag_name: "v1.0.0",
+          name: null,
+          html_url: "https://github.com/openclaw/peekaboo/releases/tag/v1.0.0",
+          draft: false,
+          published_at: "2026-05-01T00:00:00Z",
+        },
+      ]);
+    }
+    if (path === "/repos/openclaw/peekaboo/commits/main") {
+      return Response.json({
+        sha: "abcdef123456",
+        commit: { committer: { date: "2026-05-15T00:00:00Z" } },
+      });
+    }
+    if (path === "/repos/openclaw/peekaboo/compare/v1.0.0...main") {
+      return Response.json({
+        total_commits: 2,
+        html_url: "https://github.com/openclaw/peekaboo/compare/v1.0.0...main",
+      });
+    }
+    if (path === "/repos/openclaw/peekaboo/pulls") {
+      return Response.json([]);
+    }
+    if (path === "/repos/openclaw/peekaboo/commits/abcdef123456/check-runs") {
+      return Response.json({ check_runs: [] });
+    }
+    throw new Error(`unexpected fetch ${path}`);
+  };
+  try {
+    const save = await worker.fetch(
+      new Request("https://release.bar/api/profile/steipete", {
+        method: "POST",
+        headers: {
+          cookie: `rd_session=${authCookie}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          includeRepos: ["openclaw/peekaboo"],
+          hiddenRepos: [],
+        }),
+      }),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(save.status, 200);
+    const saved = await save.json();
+    assert.deepEqual(saved.profile.includeRepos, ["openclaw/peekaboo"]);
+
+    const response = await worker.fetch(new Request("https://release.bar/api/steipete"), env, {
+      waitUntil: () => undefined,
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.profile?.owner, "steipete");
+    assert.equal(body.projects[0]?.fullName, "openclaw/peekaboo");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker only lets the dashboard owner save public defaults", async () => {
+  const sessionId = "session-profile-forbidden";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: kvStore({
+      [`auth:session:${sessionId}`]: JSON.stringify({
+        user: {
+          id: 1,
+          login: "octocat",
+          name: null,
+          avatarUrl: "https://avatars.githubusercontent.com/u/1",
+          url: "https://github.com/octocat",
+        },
+        accessToken: "user-token",
+        iat: exp - 600,
+        exp,
+      }),
+    }),
+  };
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/profile/steipete", {
+      method: "POST",
+      headers: {
+        cookie: `rd_session=${authCookie}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ includeRepos: ["openclaw/peekaboo"] }),
+    }),
+    env,
+    { waitUntil: () => undefined },
+  );
+  assert.equal(response.status, 403);
+});
+
 test("worker logout deletes the stored session and clears the cookie", async () => {
   const sessionId = "session-logout";
   const exp = Math.floor(Date.now() / 1000) + 600;

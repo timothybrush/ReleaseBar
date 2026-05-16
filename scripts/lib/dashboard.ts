@@ -272,6 +272,7 @@ export function dashboardCacheKey(options: {
   owner: string;
   owners?: string[];
   repos?: string[];
+  salt?: string;
   includeForks?: boolean;
   includeArchived?: boolean;
   includeUnreleased?: boolean;
@@ -288,7 +289,11 @@ export function dashboardCacheKey(options: {
     .map((repo) => repo.toLowerCase())
     .sort()
     .join(",");
-  const sourceText = owners || repos ? `${owners}\n${repos}` : "";
+  const sourceText = options.salt
+    ? `${owners}\n${repos}\n${options.salt}`
+    : owners || repos
+      ? `${owners}\n${repos}`
+      : "";
   const sources = sourceText ? `:sources-${cacheHash(sourceText)}` : "";
   return `dashboard:v${schemaVersion}:${slugOwner(options.owner)}:${flags}${sources}`;
 }
@@ -303,7 +308,11 @@ export function filterRepo(
   if (!options.includeArchived && repo.archived) {
     return false;
   }
-  if ((options.excludeRepos || []).includes(repo.full_name)) {
+  if (
+    (options.excludeRepos || [])
+      .map((value) => value.toLowerCase())
+      .includes(repo.full_name.toLowerCase())
+  ) {
     return false;
   }
   return !repo.private;

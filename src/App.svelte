@@ -50,6 +50,8 @@
   );
   let settingsOpen = false;
   let sourceInput = "";
+  let profileSaving = false;
+  let profileMessage = "";
   let errorMessage = "";
   let paletteText = "";
   let generatedLabel = "loading";
@@ -99,12 +101,18 @@
         ),
       ].sort((a, b) => a.localeCompare(b))
     : [];
-  $: sourceCount = initialRoute.extraOwners.length + initialRoute.repos.length;
+  $: publicProfile = data?.profile ?? null;
+  $: publicSourceCount =
+    (publicProfile?.includeOwners.length ?? 0) + (publicProfile?.includeRepos.length ?? 0);
+  $: sourceCount = publicSourceCount + initialRoute.extraOwners.length + initialRoute.repos.length;
   $: hiddenCount = hiddenOwners.size + hiddenRepos.size;
   $: settingsSummary = `${sourceCount === 0 ? "default sources" : `${numberFormat.format(sourceCount)} added`} · ${
     hiddenCount === 0 ? "all visible" : `${numberFormat.format(hiddenCount)} hidden`
   }`;
   $: connectionStatus = authStatus();
+  $: canEditPublicDefault =
+    Boolean(auth?.user && initialRoute.owner) &&
+    auth?.user?.login.toLowerCase() === initialRoute.owner?.toLowerCase();
   $: commandActions = defineActions(
     buildCommands(
       filteredProjects,
@@ -131,7 +139,7 @@
     }
     if (payload.owners.length > 0) {
       const [first] = payload.owners;
-      const extraCount = payload.owners.length - 1 + initialRoute.repos.length;
+      const extraCount = initialRoute.extraOwners.length + initialRoute.repos.length;
       return `${first ? `@${first.login}` : "custom"}${extraCount > 0 ? ` +${extraCount}` : ""}`;
     }
     if (initialRoute.repos.length === 1) {
@@ -228,6 +236,77 @@
     url.searchParams.set(key, values.join(","));
     localStorage.setItem("releasedeck:custom-sources", url.search);
     location.assign(url.toString());
+  }
+
+  function mergedProfileSources(): { includeOwners: string[]; includeRepos: string[] } {
+    const includeOwners = [
+      ...(publicProfile?.includeOwners ?? []),
+      ...initialRoute.extraOwners,
+    ].filter((owner) => !hiddenOwners.has(owner.toLowerCase()));
+    return {
+      includeOwners: [...new Set(includeOwners)].sort(),
+      includeRepos: [
+        ...new Set([...(publicProfile?.includeRepos ?? []), ...initialRoute.repos]),
+      ]
+        .filter((repo) => !hiddenRepos.has(repo.toLowerCase()))
+        .sort(),
+    };
+  }
+
+  function mergedHiddenOwners(): string[] {
+    return [...new Set([...(publicProfile?.hiddenOwners ?? []), ...hiddenOwners])].sort();
+  }
+
+  function mergedHiddenRepos(): string[] {
+    return [...new Set([...(publicProfile?.hiddenRepos ?? []), ...hiddenRepos])].sort();
+  }
+
+  async function savePublicDefault(): Promise<void> {
+    if (!initialRoute.owner || !canEditPublicDefault) return;
+    profileSaving = true;
+    profileMessage = "";
+    const { includeOwners, includeRepos } = mergedProfileSources();
+    try {
+      const response = await fetch(`/api/profile/${encodeURIComponent(initialRoute.owner)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          includeOwners,
+          includeRepos,
+          hiddenOwners: mergedHiddenOwners(),
+          hiddenRepos: mergedHiddenRepos(),
+        }),
+      });
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error ?? `save failed: ${response.status}`);
+      }
+      location.assign(`/${encodeURIComponent(initialRoute.owner)}`);
+    } catch (error) {
+      profileMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      profileSaving = false;
+    }
+  }
+
+  async function resetPublicDefault(): Promise<void> {
+    if (!initialRoute.owner || !canEditPublicDefault) return;
+    profileSaving = true;
+    profileMessage = "";
+    try {
+      const response = await fetch(`/api/profile/${encodeURIComponent(initialRoute.owner)}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error ?? `reset failed: ${response.status}`);
+      }
+      location.assign(`/${encodeURIComponent(initialRoute.owner)}`);
+    } catch (error) {
+      profileMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      profileSaving = false;
+    }
   }
 
   function openOwner(owner: string): void {
@@ -777,6 +856,14 @@
 
   {#if settingsOpen}
     <div class="settings-panel" aria-label="Dashboard settings" data-open>
+      <button
+        class="settings-close"
+        type="button"
+        aria-label="Close settings"
+        onclick={() => (settingsOpen = false)}
+      >
+        <span aria-hidden="true">×</span>
+      </button>
       <div>
         <strong>dashboard</strong>
         <p>{settingsSummary}</p>
@@ -791,6 +878,19 @@
           />
           <button type="submit">add</button>
         </form>
+        {#if canEditPublicDefault}
+          <div class="profile-actions">
+            <button type="button" disabled={profileSaving} onclick={savePublicDefault}>
+              save default
+            </button>
+            <button type="button" disabled={profileSaving} onclick={resetPublicDefault}>
+              reset
+            </button>
+          </div>
+          <p class="profile-status">
+            {profileMessage || "Save custom sources and visibility as the public default for this route."}
+          </p>
+        {/if}
       </div>
       <section>
         <h2>owners</h2>

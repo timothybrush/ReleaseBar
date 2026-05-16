@@ -100,12 +100,23 @@ export type ApiQuota = {
   resource: string | null;
 };
 
+export type DashboardProfile = {
+  owner: string;
+  includeOwners: string[];
+  includeRepos: string[];
+  hiddenOwners: string[];
+  hiddenRepos: string[];
+  updatedAt: string;
+  updatedBy: string;
+};
+
 export type DashboardPayload = {
   title: string;
   subtitle: string;
   canonicalDomain: string;
   generatedAt: string;
   owners: Owner[];
+  profile?: DashboardProfile;
   options?: {
     includeForks: boolean;
     includeArchived: boolean;

@@ -26,6 +26,7 @@ import type {
   AuthInstallation,
   AuthPayload,
   AuthUser,
+  DashboardProfile,
   DashboardPayload,
   Owner,
   Project,
@@ -104,7 +105,7 @@ const locks = new Map<string, Promise<DashboardPayload>>();
 const buildPending = Symbol("build-pending");
 const corsHeaders = {
   "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET, OPTIONS",
+  "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
   "access-control-allow-headers": "content-type",
 };
 const workerFetch: typeof fetch = (input, init) => fetch(input, init);
@@ -112,6 +113,7 @@ const workerFetch: typeof fetch = (input, init) => fetch(input, init);
 type DashboardRequest = {
   owners: Owner[];
   includeRepos: string[];
+  profile: DashboardProfile | null;
   subtitle: string;
   key: string;
   url: URL;
@@ -124,6 +126,13 @@ type RequestToken = {
   token: string;
   quotaSource: "app";
   quotaAccount: string | null;
+};
+
+type ProfileInput = {
+  includeOwners?: unknown;
+  includeRepos?: unknown;
+  hiddenOwners?: unknown;
+  hiddenRepos?: unknown;
 };
 
 type BuildLock = {
@@ -346,6 +355,10 @@ function repoListFromUrl(url: URL): string[] {
         .filter(validRepoSlug),
     ),
   ];
+}
+
+function uniqueSorted(values: string[]): string[] {
+  return [...new Set(values)].sort((a, b) => a.localeCompare(b));
 }
 
 function dashboardSubtitle(owners: Owner[], repos: string[]): string {
@@ -1148,6 +1161,25 @@ async function readCached(env: Env, key: string): Promise<DashboardPayload | nul
   return raw ? tryJsonParse<DashboardPayload>(raw, `dashboard ${key}`) : null;
 }
 
+function profileKey(owner: string): string {
+  return `profile:v1:${slugOwner(owner)}`;
+}
+
+async function readProfile(env: Env, owner: string): Promise<DashboardProfile | null> {
+  const raw = await env.DASHBOARD_CACHE?.get(profileKey(owner));
+  if (!raw) return null;
+  const parsed = tryJsonParse<DashboardProfile>(raw, `profile ${owner}`);
+  return parsed?.owner === slugOwner(owner) ? parsed : null;
+}
+
+async function writeProfile(env: Env, profile: DashboardProfile): Promise<void> {
+  await env.DASHBOARD_CACHE?.put(profileKey(profile.owner), JSON.stringify(profile));
+}
+
+async function deleteProfile(env: Env, owner: string): Promise<void> {
+  await env.DASHBOARD_CACHE?.delete?.(profileKey(owner));
+}
+
 async function writeCached(
   env: Env,
   key: string,
@@ -1179,6 +1211,35 @@ function hotScore(project: Project): number {
   const prs = Math.log1p(project.openPullRequests) * 2;
   const ci = project.ciState === "failure" ? 15 : project.ciState === "running" ? 5 : 0;
   return commits * 4 + stars + recency + prs + ci;
+}
+
+function withProfile(
+  payload: DashboardPayload,
+  profile: DashboardProfile | null,
+): DashboardPayload {
+  if (!profile) return payload;
+  const hiddenOwners = new Set(profile.hiddenOwners);
+  const hiddenRepos = new Set(profile.hiddenRepos);
+  const projects = payload.projects.filter(
+    (project) =>
+      !hiddenOwners.has(project.owner.toLowerCase()) &&
+      !hiddenRepos.has(project.fullName.toLowerCase()),
+  );
+  const released = projects.filter((project) => project.releaseDate).length;
+  return {
+    ...payload,
+    profile,
+    totals: {
+      repos: projects.length,
+      released,
+      unreleased: projects.length - released,
+      commitsSinceRelease: projects.reduce(
+        (sum, project) => sum + (project.commitsSinceRelease ?? 0),
+        0,
+      ),
+    },
+    projects,
+  };
 }
 
 async function readCachedDashboards(env: Env): Promise<DashboardPayload[]> {
@@ -1372,6 +1433,7 @@ async function rebuild(dashboard: DashboardRequest, env: Env): Promise<Dashboard
       canonicalDomain: env.RELEASEDECK_CANONICAL_DOMAIN ?? "release.bar",
       owners: dashboard.owners,
       includeRepos: dashboard.includeRepos,
+      excludeRepos: dashboard.profile?.hiddenRepos,
       ...optionsFromUrl(dashboard.url),
       repoLimit,
       token: dashboard.token ?? env.GITHUB_TOKEN,
@@ -1381,9 +1443,10 @@ async function rebuild(dashboard: DashboardRequest, env: Env): Promise<Dashboard
       fetch: workerFetch,
       projectCache: env.DASHBOARD_CACHE,
     });
-    await writeCached(env, dashboard.key, payload);
-    await rememberHotDashboard(env, dashboard.key, payload);
-    return payload;
+    const profiled = withProfile(payload, dashboard.profile);
+    await writeCached(env, dashboard.key, profiled);
+    await rememberHotDashboard(env, dashboard.key, profiled);
+    return profiled;
   })();
 
   locks.set(dashboard.key, promise);
@@ -1421,6 +1484,7 @@ function errorPayload(dashboard: DashboardRequest, env: Env, message: string): D
 function unresolvedDashboardRequest(
   ownerSlugs: string[],
   includeRepos: string[],
+  profile: DashboardProfile | null,
   key: string,
   url: URL,
   token?: RequestToken | null,
@@ -1428,6 +1492,7 @@ function unresolvedDashboardRequest(
   return dashboardRequest(
     ownerSlugs.map((login) => ({ type: "user", login })),
     includeRepos,
+    profile,
     key,
     url,
     token,
@@ -1466,6 +1531,7 @@ function statusPayload(
     canonicalDomain: env.RELEASEDECK_CANONICAL_DOMAIN ?? "release.bar",
     generatedAt,
     owners: dashboard.owners,
+    ...(dashboard.profile ? { profile: dashboard.profile } : {}),
     options: {
       ...optionsFromUrl(dashboard.url),
       repoLimit,
@@ -1489,6 +1555,92 @@ function statusPayload(
   };
 }
 
+function stringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+function profileFromInput(owner: string, input: ProfileInput, user: AuthUser): DashboardProfile {
+  const normalizedOwner = slugOwner(owner);
+  const includeOwners = uniqueSorted(
+    stringList(input.includeOwners)
+      .map(slugOwner)
+      .filter((value) => validOwnerSlug(value) && value !== normalizedOwner),
+  );
+  const includeRepos = uniqueSorted(
+    stringList(input.includeRepos)
+      .map((value) => value.trim().replace(/^@/, "").toLowerCase())
+      .filter(validRepoSlug),
+  );
+  if (includeOwners.length + includeRepos.length > maxCustomSources) {
+    throw new Error(`too many custom sources; max ${maxCustomSources}`);
+  }
+  return {
+    owner: normalizedOwner,
+    includeOwners,
+    includeRepos,
+    hiddenOwners: uniqueSorted(
+      stringList(input.hiddenOwners).map(slugOwner).filter(validOwnerSlug),
+    ),
+    hiddenRepos: uniqueSorted(
+      stringList(input.hiddenRepos)
+        .map((value) => value.trim().replace(/^@/, "").toLowerCase())
+        .filter(validRepoSlug),
+    ),
+    updatedAt: new Date().toISOString(),
+    updatedBy: user.login,
+  };
+}
+
+async function profileResponse(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const owner = slugOwner(url.pathname.replace(/^\/api\/profile\//, "").split("/")[0] ?? "");
+  if (!validOwnerSlug(owner)) {
+    return jsonResponse({ error: "invalid owner" }, 400, { "cache-control": "no-store" });
+  }
+  const session = await currentSession(request, env);
+  const canEdit = session?.user.login.toLowerCase() === owner;
+
+  if (request.method === "GET") {
+    return jsonResponse({ profile: await readProfile(env, owner), canEdit }, 200, {
+      "cache-control": "no-store",
+    });
+  }
+  if (!session) {
+    return jsonResponse({ error: "login required" }, 401, { "cache-control": "no-store" });
+  }
+  if (!canEdit) {
+    return jsonResponse({ error: "only the dashboard owner can edit this default" }, 403, {
+      "cache-control": "no-store",
+    });
+  }
+  if (request.method === "DELETE") {
+    await deleteProfile(env, owner);
+    await env.DASHBOARD_CACHE?.delete?.(hotCacheKey);
+    return jsonResponse({ profile: null, canEdit: true }, 200, { "cache-control": "no-store" });
+  }
+  if (request.method !== "POST") {
+    return jsonResponse({ error: "method not allowed" }, 405, {
+      allow: "GET, POST, DELETE",
+      "cache-control": "no-store",
+    });
+  }
+
+  const input = (await request.json().catch(() => null)) as ProfileInput | null;
+  if (!input) {
+    return jsonResponse({ error: "invalid profile" }, 400, { "cache-control": "no-store" });
+  }
+  try {
+    const profile = profileFromInput(owner, input, session.user);
+    await writeProfile(env, profile);
+    await env.DASHBOARD_CACHE?.delete?.(hotCacheKey);
+    return jsonResponse({ profile, canEdit: true }, 200, { "cache-control": "no-store" });
+  } catch (error) {
+    return jsonResponse({ error: errorMessage(error) }, 400, { "cache-control": "no-store" });
+  }
+}
+
 async function ownerResponse(
   request: Request,
   env: Env,
@@ -1502,8 +1654,19 @@ async function ownerResponse(
   }
 
   const options = optionsFromUrl(url);
-  const extraOwnerSlugs = ownerListFromUrl(url, primaryOwner ?? undefined);
-  const includeRepos = repoListFromUrl(url);
+  const profile = primaryOwner ? await readProfile(env, primaryOwner) : null;
+  const hiddenProfileOwners = new Set(profile?.hiddenOwners ?? []);
+  const hiddenProfileRepos = new Set(profile?.hiddenRepos ?? []);
+  const extraOwnerSlugs = uniqueSorted([
+    ...(profile?.includeOwners ?? []),
+    ...ownerListFromUrl(url, primaryOwner ?? undefined),
+  ]).filter((owner) => owner !== primaryOwner && !hiddenProfileOwners.has(owner));
+  const includeRepos = uniqueSorted([
+    ...(profile?.includeRepos ?? []),
+    ...repoListFromUrl(url),
+  ]).filter(
+    (repo) => !hiddenProfileOwners.has(repo.split("/")[0] ?? "") && !hiddenProfileRepos.has(repo),
+  );
   if (extraOwnerSlugs.length + includeRepos.length > maxCustomSources) {
     return jsonResponse({ error: `too many custom sources; max ${maxCustomSources}` }, 400, {
       "cache-control": "no-store",
@@ -1512,11 +1675,15 @@ async function ownerResponse(
   if (!primaryOwner && extraOwnerSlugs.length === 0 && includeRepos.length === 0) {
     return jsonResponse({ error: "at least one owner or repo is required" }, 400);
   }
-  const ownerSlugs = primaryOwner ? [primaryOwner, ...extraOwnerSlugs] : extraOwnerSlugs;
+  const ownerSlugs =
+    primaryOwner && !hiddenProfileOwners.has(primaryOwner)
+      ? [primaryOwner, ...extraOwnerSlugs]
+      : extraOwnerSlugs;
   const key = dashboardCacheKey({
     owner: primaryOwner ?? "custom",
     owners: extraOwnerSlugs,
     repos: includeRepos,
+    salt: profile?.updatedAt,
     ...options,
     schemaVersion,
   });
@@ -1562,7 +1729,14 @@ async function ownerResponse(
   try {
     owners = await resolveOwners(ownerSlugs, env, token?.token);
   } catch (error) {
-    const dashboard = unresolvedDashboardRequest(ownerSlugs, includeRepos, key, url, token);
+    const dashboard = unresolvedDashboardRequest(
+      ownerSlugs,
+      includeRepos,
+      profile,
+      key,
+      url,
+      token,
+    );
     const payload = errorPayload(dashboard, env, dashboardErrorMessage(error));
     await writeCached(env, key, payload, 5 * 60);
     return jsonResponse(payload, errorStatus(error), retryAfterHeaders(error));
@@ -1573,7 +1747,7 @@ async function ownerResponse(
     });
   }
 
-  const dashboard = dashboardRequest(owners, includeRepos, key, url, token);
+  const dashboard = dashboardRequest(owners, includeRepos, profile, key, url, token);
   const build = rebuildWithBuildLock(dashboard, env);
   try {
     const payload = await Promise.race([
@@ -1603,12 +1777,13 @@ function cachedDashboardRequest(
   url: URL,
   token?: RequestToken | null,
 ): DashboardRequest {
-  return dashboardRequest(payload.owners, includeRepos, key, url, token);
+  return dashboardRequest(payload.owners, includeRepos, payload.profile ?? null, key, url, token);
 }
 
 function dashboardRequest(
   owners: Owner[],
   includeRepos: string[],
+  profile: DashboardProfile | null,
   key: string,
   url: URL,
   token?: RequestToken | null,
@@ -1616,6 +1791,7 @@ function dashboardRequest(
   return {
     owners,
     includeRepos,
+    profile,
     subtitle: dashboardSubtitle(owners, includeRepos),
     key,
     url,
@@ -1690,7 +1866,10 @@ export default {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
-    if (request.method !== "GET" && !isHead) {
+    const profileWrite =
+      url.pathname.startsWith("/api/profile/") &&
+      (request.method === "POST" || request.method === "DELETE");
+    if (request.method !== "GET" && !isHead && !profileWrite) {
       return jsonResponse({ error: "method not allowed" }, 405, { allow: "GET" });
     }
     const response = await routeRequest(request, env, context, url);
@@ -1719,6 +1898,9 @@ async function routeRequest(
   }
   if (url.pathname === "/api/me") {
     return meResponse(request, env);
+  }
+  if (url.pathname.startsWith("/api/profile/")) {
+    return profileResponse(request, env);
   }
   if (url.pathname.startsWith("/api/auth/")) {
     return authResponse(request, env);

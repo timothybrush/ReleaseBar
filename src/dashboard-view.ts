@@ -38,6 +38,10 @@ export function filterLabel(value: DashboardFilter): string {
   return value === "attention" ? "need attention" : value;
 }
 
+export function sortLabel(value: SortKey): string {
+  return value === "since" ? "commits since" : value;
+}
+
 export function needsAttention(project: Project): boolean {
   return attentionFreshness.includes(project.freshness);
 }

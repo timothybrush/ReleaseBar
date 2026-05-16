@@ -1245,7 +1245,7 @@ body.dev-mode .dev-only {
   }
 
   .since-cell::before {
-    content: "since";
+    content: "commits since";
   }
 
   .activity-cell::before {

@@ -17,6 +17,7 @@
     matchesFilter,
     needsAttention,
     parseViewState,
+    sortLabel,
     sortOptions,
     sortProjects,
     viewStateSearch,
@@ -598,10 +599,10 @@
   function sortCommand(key: SortKey): CommandAction {
     return {
       actionId: `sort:${key}`,
-      title: `Sort by ${key}`,
+      title: `Sort by ${sortLabel(key)}`,
       subTitle: sortKey === key ? `currently ${sortDirection}` : "table order",
       group: "View",
-      keywords: ["order", "table", key],
+      keywords: ["order", "table", key, sortLabel(key)],
       onRun: () => setSort(key),
     };
   }
@@ -1108,7 +1109,7 @@
           data-direction={sortKey === key ? sortDirection : ""}
           onclick={() => setSort(key)}
         >
-          {key}
+          {sortLabel(key)}
         </button>
       {/each}
     </div>

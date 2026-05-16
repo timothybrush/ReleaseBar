@@ -83,10 +83,13 @@ type ExecutionContext = {
 };
 
 const fullTtlMs = 60 * 60 * 1000;
-const staleTtlSeconds = 3 * 24 * 60 * 60;
+const dashboardStorageTtlSeconds = 30 * 24 * 60 * 60;
+const progressTtlSeconds = 3 * 24 * 60 * 60;
+const maxDisplayStaleMs = 14 * 24 * 60 * 60 * 1000;
 const installationTokenTtlSeconds = 50 * 60;
 const coldBuildWaitMs = 15 * 1000;
 const progressiveBuildBudgetMs = 25 * 1000;
+const progressWriteIntervalMs = 1100;
 const buildLockTtlMs = 2 * 60 * 1000;
 const buildLockRefreshMs = 30 * 1000;
 const repoLimit = 200;
@@ -1178,6 +1181,16 @@ async function readCached(env: Env, key: string): Promise<DashboardPayload | nul
   return raw ? tryJsonParse<DashboardPayload>(raw, `dashboard ${key}`) : null;
 }
 
+function cacheAgeMs(payload: DashboardPayload | null): number {
+  if (!payload) return Number.POSITIVE_INFINITY;
+  const generatedAt = Date.parse(payload.generatedAt);
+  return Number.isFinite(generatedAt) ? Date.now() - generatedAt : Number.POSITIVE_INFINITY;
+}
+
+function canDisplayCached(payload: DashboardPayload | null): payload is DashboardPayload {
+  return cacheAgeMs(payload) <= maxDisplayStaleMs;
+}
+
 function profileKey(owner: string): string {
   return `profile:v1:${slugOwner(owner)}`;
 }
@@ -1201,7 +1214,7 @@ async function writeCached(
   env: Env,
   key: string,
   payload: DashboardPayload,
-  ttlSeconds = staleTtlSeconds,
+  ttlSeconds = dashboardStorageTtlSeconds,
 ): Promise<void> {
   await env.DASHBOARD_CACHE?.put(key, JSON.stringify(payload), {
     expirationTtl: ttlSeconds,
@@ -1223,7 +1236,7 @@ async function readProgress(env: Env, key: string): Promise<StoredBuildProgress 
 
 async function writeProgress(env: Env, key: string, progress: StoredBuildProgress): Promise<void> {
   await env.DASHBOARD_CACHE?.put(progressKey(key), JSON.stringify(progress), {
-    expirationTtl: staleTtlSeconds,
+    expirationTtl: progressTtlSeconds,
   });
 }
 
@@ -1322,7 +1335,7 @@ async function partialDashboardPayload(
     await Promise.all([...new Set(keys)].map((key) => readCached(env, key)))
   ).filter(
     (payload): payload is DashboardPayload =>
-      payload !== null && payload.cache?.state !== "error" && payload.projects.length > 0,
+      canDisplayCached(payload) && payload.cache?.state !== "error" && payload.projects.length > 0,
   );
   if (dashboards.length === 0) return null;
 
@@ -1385,7 +1398,7 @@ async function readCachedDashboards(env: Env): Promise<DashboardPayload[]> {
     const raw = await env.DASHBOARD_CACHE.get(key);
     if (!raw) continue;
     const payload = tryJsonParse<DashboardPayload>(raw, `dashboard ${key}`);
-    if (!payload) continue;
+    if (!canDisplayCached(payload)) continue;
     if (
       payload.cache?.state === "error" ||
       payload.options?.includeForks ||
@@ -1417,7 +1430,7 @@ async function rememberHotDashboard(
   const keys = await readHotIndex(env);
   const next = [key, ...keys.filter((existing) => existing !== key)].slice(0, hotIndexLimit);
   await env.DASHBOARD_CACHE?.put(hotIndexKey, JSON.stringify(next), {
-    expirationTtl: staleTtlSeconds,
+    expirationTtl: dashboardStorageTtlSeconds,
   });
 }
 
@@ -1479,8 +1492,8 @@ function hotDashboardPayload(
 
 async function hotResponse(env: Env): Promise<Response> {
   const cached = await readCached(env, hotCacheKey);
-  const ageMs = cached ? Date.now() - Date.parse(cached.generatedAt) : Number.POSITIVE_INFINITY;
-  if (cached && ageMs < hotCacheTtlMs) {
+  const ageMs = cacheAgeMs(cached);
+  if (cached && canDisplayCached(cached) && ageMs < hotCacheTtlMs) {
     return jsonResponse(withCacheState(cached, "fresh"));
   }
 
@@ -1711,8 +1724,8 @@ async function discoverResponse(env: Env, url: URL): Promise<Response> {
   const language = discoverLanguage(url);
   const key = discoverCacheKey(period, language);
   const cached = await readCached(env, key);
-  const ageMs = cached ? Date.now() - Date.parse(cached.generatedAt) : Number.POSITIVE_INFINITY;
-  if (cached && ageMs < discoverCacheTtlMs) {
+  const ageMs = cacheAgeMs(cached);
+  if (cached && canDisplayCached(cached) && ageMs < discoverCacheTtlMs) {
     return jsonResponse(withCacheState(cached, "fresh"));
   }
 
@@ -1721,7 +1734,7 @@ async function discoverResponse(env: Env, url: URL): Promise<Response> {
     await writeCached(env, key, payload);
     return jsonResponse(payload);
   } catch (error) {
-    if (cached) {
+    if (canDisplayCached(cached)) {
       return jsonResponse(
         withCacheState(cached, "stale", `${discoveryErrorMessage(error)} Showing cached search.`),
       );
@@ -1729,6 +1742,108 @@ async function discoverResponse(env: Env, url: URL): Promise<Response> {
     const payload = discoverErrorPayload(period, language, env, error);
     return jsonResponse(payload, errorStatus(error), retryAfterHeaders(error));
   }
+}
+
+async function dashboardEventParts(url: URL, env: Env): Promise<{ key: string } | null> {
+  const rawOwner =
+    url.pathname
+      .replace(/^\/api\//, "")
+      .replace(/\/events$/, "")
+      .split("/")[0] ?? "";
+  const primaryOwner = rawOwner === "dashboard" ? null : slugOwner(rawOwner);
+  if (primaryOwner !== null && !validOwnerSlug(primaryOwner)) {
+    return null;
+  }
+  const options = optionsFromUrl(url);
+  const profile = primaryOwner ? await readProfile(env, primaryOwner) : null;
+  const hiddenProfileOwners = new Set(profile?.hiddenOwners ?? []);
+  const hiddenProfileRepos = new Set(profile?.hiddenRepos ?? []);
+  const extraOwnerSlugs = uniqueSorted([
+    ...(profile?.includeOwners ?? []),
+    ...ownerListFromUrl(url, primaryOwner ?? undefined),
+  ]).filter((owner) => owner !== primaryOwner && !hiddenProfileOwners.has(owner));
+  const includeRepos = uniqueSorted([
+    ...(profile?.includeRepos ?? []),
+    ...repoListFromUrl(url),
+  ]).filter(
+    (repo) => !hiddenProfileOwners.has(repo.split("/")[0] ?? "") && !hiddenProfileRepos.has(repo),
+  );
+  if (extraOwnerSlugs.length + includeRepos.length > maxCustomSources) {
+    return null;
+  }
+  if (!primaryOwner && extraOwnerSlugs.length === 0 && includeRepos.length === 0) {
+    return null;
+  }
+  return {
+    key: dashboardCacheKey({
+      owner: primaryOwner ?? "custom",
+      owners: extraOwnerSlugs,
+      repos: includeRepos,
+      salt: profile?.updatedAt,
+      ...options,
+      schemaVersion: dashboardSchemaVersion,
+    }),
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function dashboardStreamState(
+  payload: DashboardPayload,
+): NonNullable<DashboardPayload["cache"]>["state"] {
+  if (payload.cache?.progress?.done === false) return "partial";
+  return cacheAgeMs(payload) < fullTtlMs ? "fresh" : "stale";
+}
+
+async function ownerEventsResponse(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const parts = await dashboardEventParts(url, env);
+  if (!parts) {
+    return jsonResponse({ error: "invalid dashboard event stream" }, 400, {
+      "cache-control": "no-store",
+    });
+  }
+
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (event: string, data: unknown) => {
+        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      };
+      controller.enqueue(encoder.encode("retry: 5000\n\n"));
+      let lastSignature = "";
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        const payload = await readCached(env, parts.key);
+        if (canDisplayCached(payload)) {
+          const state = dashboardStreamState(payload);
+          const next = withCacheState(payload, state);
+          const signature = `${next.generatedAt}:${state}:${next.cache?.progress?.scanned ?? ""}:${next.projects.length}`;
+          if (signature !== lastSignature) {
+            lastSignature = signature;
+            send("dashboard", next);
+          }
+          if (state === "fresh") break;
+        } else {
+          send("ping", { state: "waiting" });
+        }
+        await sleep(5000);
+      }
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-store",
+      "x-accel-buffering": "no",
+      ...corsHeaders,
+    },
+  });
 }
 
 async function acquireBuildLock(env: Env, key: string): Promise<BuildLock | null> {
@@ -1791,10 +1906,17 @@ async function rebuild(dashboard: DashboardRequest, env: Env): Promise<Dashboard
     const storedProgress = await readProgress(env, dashboard.key);
     const scannedRepos = new Set(storedProgress?.scannedRepos ?? []);
     const progressProjects = storedProgress?.projects ?? [];
+    let lastProgressWriteAt = 0;
     const saveProgress = async (payload: DashboardPayload, scannedRepo: string) => {
       if (scannedRepo) {
         scannedRepos.add(scannedRepo.toLowerCase());
       }
+      const done = payload.cache?.progress?.done !== false;
+      const now = Date.now();
+      if (!done && now - lastProgressWriteAt < progressWriteIntervalMs) {
+        return;
+      }
+      lastProgressWriteAt = now;
       const profiled = withProfile(payload, dashboard.profile);
       await writeCached(env, dashboard.key, profiled);
       await writeProgress(env, dashboard.key, {
@@ -2089,11 +2211,12 @@ async function ownerResponse(
     schemaVersion: dashboardSchemaVersion,
   });
   const cached = await readCached(env, key);
-  const ageMs = cached ? Date.now() - Date.parse(cached.generatedAt) : Number.POSITIVE_INFINITY;
+  const ageMs = cacheAgeMs(cached);
+  const displayCached = canDisplayCached(cached);
   const tokenSources = { owners: ownerSlugs, repos: includeRepos };
   const requestToken = () => requestInstallationToken(request, env, tokenSources);
 
-  if (cached?.cache?.state === "error") {
+  if (displayCached && cached.cache?.state === "error") {
     context.waitUntil(
       requestToken()
         .catch(() => null)
@@ -2109,11 +2232,11 @@ async function ownerResponse(
     });
   }
 
-  if (cached && cached.cache?.progress?.done !== false && ageMs < fullTtlMs) {
+  if (displayCached && cached.cache?.progress?.done !== false && ageMs < fullTtlMs) {
     return jsonResponse(withCacheState(cached, "fresh"));
   }
 
-  if (cached) {
+  if (displayCached) {
     context.waitUntil(
       requestToken()
         .catch(() => null)
@@ -2171,7 +2294,7 @@ async function ownerResponse(
           .catch((error) => cacheBuildError(dashboard, env, error)),
       );
       const progressive = await readCached(env, key);
-      if (progressive?.projects.length) {
+      if (canDisplayCached(progressive) && progressive.projects.length) {
         return jsonResponse(withCacheState(progressive, "partial"), 200, {
           "cache-control": "no-store",
         });
@@ -2340,6 +2463,9 @@ async function routeRequest(
   }
   if (url.pathname === "/api/_discover") {
     return discoverResponse(env, url);
+  }
+  if (url.pathname.startsWith("/api/") && url.pathname.endsWith("/events")) {
+    return ownerEventsResponse(request, env);
   }
   if (url.pathname.startsWith("/api/")) {
     return ownerResponse(request, env, context);

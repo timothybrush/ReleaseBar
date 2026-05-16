@@ -67,6 +67,8 @@
   let generatedLabel = "loading";
   let generatedDetail = "";
   let mounted = false;
+  let dashboardRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let dashboardEventSource: EventSource | null = null;
 
   const numberFormat = new Intl.NumberFormat("en", { notation: "compact" });
   const dateFormat = new Intl.DateTimeFormat("en", {
@@ -522,6 +524,63 @@
     return (await response.json().catch(() => null)) as DashboardPayload | { error?: string } | null;
   }
 
+  function shouldAutoRefresh(payload: DashboardPayload): boolean {
+    return (
+      payload.cache?.state === "rebuilding" ||
+      payload.cache?.state === "partial" ||
+      payload.cache?.state === "stale"
+    );
+  }
+
+  function scheduleDashboardRefresh(attempt: number): void {
+    if (dashboardRefreshTimer !== null) {
+      globalThis.clearTimeout(dashboardRefreshTimer);
+    }
+    if (attempt >= 60) return;
+    const delay = attempt < 24 ? 5000 : 15000;
+    dashboardRefreshTimer = globalThis.setTimeout(() => {
+      dashboardRefreshTimer = null;
+      if (document.hidden) {
+        scheduleDashboardRefresh(attempt);
+        return;
+      }
+      void loadDashboard(attempt + 1).catch(() => undefined);
+    }, delay);
+  }
+
+  function closeDashboardStream(): void {
+    dashboardEventSource?.close();
+    dashboardEventSource = null;
+  }
+
+  function dashboardEventsPath(apiPath: string): string | null {
+    const url = new URL(apiPath, location.origin);
+    if (url.pathname === "/api/_hot" || url.pathname === "/api/_discover") return null;
+    url.pathname = `${url.pathname.replace(/\/$/, "")}/events`;
+    return url.toString();
+  }
+
+  function startDashboardStream(attempt: number): boolean {
+    if (typeof EventSource === "undefined") return false;
+    const eventsPath = dashboardEventsPath(initialRoute.apiPath);
+    if (!eventsPath) return false;
+    closeDashboardStream();
+    dashboardEventSource = new EventSource(eventsPath);
+    dashboardEventSource.addEventListener("dashboard", (event) => {
+      const next = JSON.parse((event as MessageEvent).data) as DashboardPayload;
+      data = next;
+      updateStatus();
+      if (!shouldAutoRefresh(next)) {
+        closeDashboardStream();
+      }
+    });
+    dashboardEventSource.onerror = () => {
+      closeDashboardStream();
+      scheduleDashboardRefresh(attempt);
+    };
+    return true;
+  }
+
   async function loadAuth(): Promise<void> {
     try {
       const url = new URL("/api/me", location.origin);
@@ -541,13 +600,12 @@
     if (response.ok && body && "projects" in body) {
       data = body;
       updateStatus();
-      if (
-        (data.cache?.state === "rebuilding" || data.cache?.state === "partial") &&
-        attempt < 24
-      ) {
-        globalThis.setTimeout(() => {
-          void loadDashboard(attempt + 1);
-        }, 5000);
+      if (shouldAutoRefresh(data)) {
+        if (!startDashboardStream(attempt)) {
+          scheduleDashboardRefresh(attempt);
+        }
+      } else {
+        closeDashboardStream();
       }
       return;
     }
@@ -859,6 +917,10 @@
   });
 
   onDestroy(() => {
+    if (dashboardRefreshTimer !== null) {
+      globalThis.clearTimeout(dashboardRefreshTimer);
+    }
+    closeDashboardStream();
     document.body.classList.remove("dev-mode");
   });
 </script>

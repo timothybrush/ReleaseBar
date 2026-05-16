@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Kept dashboard cache entries longer, limited very old stale fallbacks, and auto-refreshed stale dashboards while rebuilds finish.
 - Renamed the table `since` header to `commits since`.
 - Combined the version and release table columns and removed version sorting.
 - Added a GitHub Hot root dashboard backed by cached GitHub repository search, with today/week/month/year and language filters.

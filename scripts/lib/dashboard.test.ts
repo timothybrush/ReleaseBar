@@ -505,7 +505,7 @@ test("worker falls back to stale discovery cache when GitHub search is rate limi
         ...cached,
         title: "GitHub Hot",
         owners: [],
-        generatedAt: "2020-01-01T00:00:00Z",
+        generatedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
       }),
     }),
   };
@@ -659,6 +659,27 @@ test("worker preserves cached quota metadata on fresh responses", async () => {
   assert.equal(body.cache?.quota?.remaining, 4900);
 });
 
+test("worker streams cached dashboard snapshots over owner events", async () => {
+  const key = dashboardCacheKey({ owner: "owner", schemaVersion: 5 });
+  const dashboard = testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]);
+  dashboard.generatedAt = new Date().toISOString();
+  if (dashboard.cache) {
+    dashboard.cache.generatedAt = dashboard.generatedAt;
+  }
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/owner/events"),
+    { DASHBOARD_CACHE: kvStore({ [key]: JSON.stringify(dashboard) }) },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "text/event-stream; charset=utf-8");
+  const text = await response.text();
+  assert.match(text, /event: dashboard/);
+  assert.match(text, /owner\/repo/);
+});
+
 test("worker returns rebuilding while another isolate owns the dashboard build lock", async () => {
   const originalFetch = globalThis.fetch;
   let repoFetches = 0;
@@ -693,6 +714,47 @@ test("worker returns rebuilding while another isolate owns the dashboard build l
     const body = (await response.json()) as DashboardPayload;
     assert.equal(body.cache?.state, "rebuilding");
     assert.equal(repoFetches, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker does not display dashboard data past the stale display window", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/users/old") {
+      return Response.json({ login: "old", type: "User" });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const busyLocks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async () => new Response(null, { status: 409 }),
+    }),
+  };
+  const key = dashboardCacheKey({ owner: "old", schemaVersion: 5 });
+  const dashboard = testDashboard("old", [testProject({ owner: "old", name: "ancient" })]);
+  dashboard.generatedAt = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
+  if (dashboard.cache) {
+    dashboard.cache.generatedAt = dashboard.generatedAt;
+  }
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/old"),
+      {
+        DASHBOARD_CACHE: kvStore({ [key]: JSON.stringify(dashboard) }),
+        DASHBOARD_LOCKS: busyLocks,
+        GITHUB_TOKEN: "shared-token",
+      },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 202);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.cache?.state, "rebuilding");
+    assert.equal(body.projects.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }

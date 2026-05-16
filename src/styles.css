@@ -642,9 +642,10 @@ button:focus-visible {
 .table-head,
 .project {
   display: grid;
-  grid-template-columns:
-    minmax(280px, 1.7fr) minmax(110px, 0.55fr) minmax(150px, 0.7fr) minmax(90px, 0.45fr)
-    minmax(140px, 0.6fr);
+  grid-template-columns: minmax(280px, 1.75fr) minmax(190px, 0.9fr) minmax(90px, 0.45fr) minmax(
+      140px,
+      0.6fr
+    );
   gap: 0;
   align-items: stretch;
 }
@@ -652,8 +653,8 @@ button:focus-visible {
 body.dev-mode .table-head,
 body.dev-mode .project {
   grid-template-columns:
-    minmax(250px, 1.45fr) minmax(100px, 0.48fr) minmax(140px, 0.62fr) minmax(78px, 0.34fr)
-    minmax(125px, 0.52fr) minmax(74px, 0.32fr) minmax(64px, 0.28fr) minmax(110px, 0.5fr);
+    minmax(250px, 1.45fr) minmax(190px, 0.76fr) minmax(78px, 0.34fr) minmax(125px, 0.52fr)
+    minmax(74px, 0.32fr) minmax(64px, 0.28fr) minmax(110px, 0.5fr);
 }
 
 .dev-only {
@@ -917,16 +918,25 @@ body.dev-mode .dev-only {
   font-size: 12px;
 }
 
-.version-cell {
-  overflow: hidden;
-}
-
-.version-cell a {
+.release-version {
   display: block;
   max-width: 100%;
-  padding-right: 6px;
-  overflow-wrap: anywhere;
-  line-height: 1.16;
+  margin-top: 8px;
+  overflow: hidden;
+  color: var(--green);
+  font-size: 13px;
+  line-height: 1.18;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.release-version:hover,
+.release-version:focus-visible {
+  color: var(--green-strong);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
 }
 
 .since-cell a,
@@ -1217,7 +1227,6 @@ body.dev-mode .dev-only {
     border-top: 0;
   }
 
-  .version-cell::before,
   .release-cell::before,
   .since-cell::before,
   .activity-cell::before,
@@ -1229,10 +1238,6 @@ body.dev-mode .dev-only {
     color: var(--muted);
     font-size: 11px;
     text-transform: uppercase;
-  }
-
-  .version-cell::before {
-    content: "version";
   }
 
   .release-cell::before {

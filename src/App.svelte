@@ -1170,11 +1170,17 @@
               <span class="tag">{project.freshness}</span>
             </div>
           </div>
-          <div class="version-cell">
-            <a href={project.releaseUrl} target="_blank" rel="noreferrer">{project.version}</a>
-          </div>
           <div class="release-cell">
             <strong>{absoluteDate(project.releaseDate)}</strong>
+            <a
+              class="release-version"
+              href={project.releaseUrl}
+              target="_blank"
+              rel="noreferrer"
+              title={`Open release ${project.version}`}
+            >
+              {project.version}
+            </a>
             <span>{relativeDate(project.releaseDate)}</span>
           </div>
           <div class="since-cell" class:muted={!project.compareUrl || project.commitsSinceRelease === null}>

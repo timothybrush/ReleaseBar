@@ -217,6 +217,14 @@ test("dashboard view state restores search, filters, sorting, and dev columns", 
     sortDirection: "desc",
     devMode: false,
   });
+  assert.deepEqual(parseViewState("?sort=version&dir=asc", false), {
+    query: "",
+    language: "",
+    filter: "all",
+    sortKey: "activity",
+    sortDirection: "desc",
+    devMode: false,
+  });
 
   const state: DashboardViewState = {
     query: "repo",

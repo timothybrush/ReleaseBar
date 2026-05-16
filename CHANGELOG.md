@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Combined the version and release table columns and removed version sorting.
 - Added a GitHub Hot root dashboard backed by cached GitHub repository search, with today/week/month/year and language filters.
 - Show signed-in GitHub avatars in the account menu trigger.
 - Linked single-owner dashboard subtitles to the GitHub user or organization.

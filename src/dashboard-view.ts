@@ -1,14 +1,6 @@
 import type { Freshness, Project } from "./types.js";
 
-export type SortKey =
-  | "repo"
-  | "version"
-  | "release"
-  | "since"
-  | "activity"
-  | "issues"
-  | "prs"
-  | "ci";
+export type SortKey = "repo" | "release" | "since" | "activity" | "issues" | "prs" | "ci";
 export type SortDirection = "asc" | "desc";
 export type DashboardFilter = Freshness | "all" | "attention";
 
@@ -23,7 +15,7 @@ export type DashboardViewState = {
 
 export const filterOptions: DashboardFilter[] = ["all", "attention", "hot", "busy", "fresh"];
 export const attentionFreshness: Freshness[] = ["hot", "busy"];
-export const sortOptions: SortKey[] = ["repo", "version", "release", "since", "activity"];
+export const sortOptions: SortKey[] = ["repo", "release", "since", "activity"];
 export const devSortOptions: SortKey[] = ["issues", "prs", "ci"];
 
 const filterValues = new Set<string>(filterOptions);
@@ -35,7 +27,7 @@ export function defaultSortKey(isDefaultRoute: boolean): SortKey {
 }
 
 export function defaultSortDirection(key: SortKey): SortDirection {
-  return key === "repo" || key === "version" ? "asc" : "desc";
+  return key === "repo" ? "asc" : "desc";
 }
 
 export function isDevSortKey(key: SortKey): boolean {
@@ -58,10 +50,13 @@ export function parseViewState(
   const params = new URLSearchParams(search);
   const rawFilter = params.get("filter") ?? "";
   const rawSort = params.get("sort") ?? "";
-  const sortKey = (sortValues.has(rawSort) ? rawSort : defaultSortKey(isDefaultRoute)) as SortKey;
+  const hasCustomSort = sortValues.has(rawSort);
+  const sortKey = (hasCustomSort ? rawSort : defaultSortKey(isDefaultRoute)) as SortKey;
   const rawDirection = params.get("dir") ?? "";
   const sortDirection = (
-    directionValues.has(rawDirection) ? rawDirection : defaultSortDirection(sortKey)
+    hasCustomSort && directionValues.has(rawDirection)
+      ? rawDirection
+      : defaultSortDirection(sortKey)
   ) as SortDirection;
   const devMode = params.get("dev") === "true" || persistedDevMode || isDevSortKey(sortKey);
 
@@ -109,8 +104,6 @@ export function sortValue(project: Project, key: SortKey): string | number {
   switch (key) {
     case "repo":
       return project.fullName.toLowerCase();
-    case "version":
-      return (project.version ?? "").toLowerCase();
     case "release":
       return timestamp(project.releaseDate);
     case "since":

@@ -19,6 +19,12 @@ import {
   workerApiOrigin,
   workersDevApiOrigin,
 } from "../../src/routing.js";
+import {
+  parseViewState,
+  sortProjects,
+  viewStateSearch,
+  type DashboardViewState,
+} from "../../src/dashboard-view.js";
 import type { DashboardPayload, Project } from "../../src/types.js";
 import worker from "../../worker/index.js";
 
@@ -166,6 +172,70 @@ test("owner route parsing keeps root hot board and owners API-backed", () => {
   assert.equal(
     dashboardRoute("/", "?owners=openclaw").fallbackApiPath,
     `${workersDevApiOrigin}/api/dashboard?owners=openclaw`,
+  );
+  assert.equal(
+    dashboardRoute("/openclaw", "?q=codex&filter=attention&sort=issues&dir=desc&dev=true").apiPath,
+    `${workerApiOrigin}/api/openclaw`,
+  );
+});
+
+test("dashboard view state restores search, filters, sorting, and dev columns", () => {
+  assert.deepEqual(parseViewState("?q=CodexBar&filter=attention&sort=issues&dir=asc", false), {
+    query: "CodexBar",
+    filter: "attention",
+    sortKey: "issues",
+    sortDirection: "asc",
+    devMode: true,
+  });
+  assert.deepEqual(parseViewState("?filter=nope&sort=nope&dir=sideways", true), {
+    query: "",
+    filter: "all",
+    sortKey: "since",
+    sortDirection: "desc",
+    devMode: false,
+  });
+
+  const state: DashboardViewState = {
+    query: "repo",
+    filter: "hot",
+    sortKey: "prs",
+    sortDirection: "desc",
+    devMode: true,
+  };
+  assert.equal(
+    viewStateSearch("?owners=openclaw&q=old", state, false),
+    "?owners=openclaw&q=repo&filter=hot&sort=prs&dir=desc&dev=true",
+  );
+  assert.equal(
+    viewStateSearch(
+      "?owners=openclaw&q=repo&filter=all&sort=activity&dir=desc&dev=true",
+      {
+        query: "",
+        filter: "all",
+        sortKey: "activity",
+        sortDirection: "desc",
+        devMode: false,
+      },
+      false,
+    ),
+    "?owners=openclaw",
+  );
+});
+
+test("dashboard project sorting handles dev issue and pull request counts numerically", () => {
+  const projects = [
+    testProject({ owner: "owner", name: "zero", openIssues: 0, openPullRequests: 0 }),
+    testProject({ owner: "owner", name: "many", openIssues: 37, openPullRequests: 3 }),
+    testProject({ owner: "owner", name: "some", openIssues: 4, openPullRequests: 12 }),
+  ];
+
+  assert.deepEqual(
+    sortProjects(projects, "issues", "desc").map((project) => project.name),
+    ["many", "some", "zero"],
+  );
+  assert.deepEqual(
+    sortProjects(projects, "prs", "desc").map((project) => project.name),
+    ["some", "many", "zero"],
   );
 });
 

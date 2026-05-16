@@ -8,29 +8,39 @@
   } from "svelte-command-palette";
   import { DropdownMenu } from "bits-ui";
 
+  import {
+    defaultSortDirection,
+    devSortOptions,
+    filterLabel,
+    filterOptions,
+    isDevSortKey,
+    matchesFilter,
+    needsAttention,
+    parseViewState,
+    sortOptions,
+    sortProjects,
+    viewStateSearch,
+    type DashboardFilter,
+    type SortDirection,
+    type SortKey,
+  } from "./dashboard-view.js";
   import { dashboardRoute, validRepoSlug } from "./routing.js";
-  import type { AuthPayload, CiState, DashboardPayload, Freshness, Project } from "./types.js";
-
-  type SortKey = "repo" | "version" | "release" | "since" | "activity" | "issues" | "prs" | "ci";
-  type SortDirection = "asc" | "desc";
-  type DashboardFilter = Freshness | "all" | "attention";
+  import type { AuthPayload, DashboardPayload, Project } from "./types.js";
 
   const initialRoute = dashboardRoute(location.pathname, location.search);
+  const storedDevMode = localStorage.getItem("releasedeck:dev-mode") === "true";
+  const initialView = parseViewState(location.search, initialRoute.isDefault, storedDevMode);
   const routeScope = initialRoute.owner ?? "default";
   const hiddenOwnersKey = `releasedeck:${routeScope}:hidden-owners`;
   const hiddenReposKey = `releasedeck:${routeScope}:hidden-repos`;
-  const filterOptions: DashboardFilter[] = ["all", "attention", "hot", "busy", "fresh"];
-  const attentionFreshness: Freshness[] = ["hot", "busy"];
-  const sortOptions: SortKey[] = ["repo", "version", "release", "since", "activity"];
-  const devSortOptions: SortKey[] = ["issues", "prs", "ci"];
 
   let data: DashboardPayload | null = null;
   let auth: AuthPayload | null = null;
-  let query = "";
-  let filter: DashboardFilter = "all";
-  let sortKey: SortKey = initialRoute.isDefault ? "since" : "activity";
-  let sortDirection: SortDirection = "desc";
-  let devMode = localStorage.getItem("releasedeck:dev-mode") === "true";
+  let query = initialView.query;
+  let filter: DashboardFilter = initialView.filter;
+  let sortKey: SortKey = initialView.sortKey;
+  let sortDirection: SortDirection = initialView.sortDirection;
+  let devMode = initialView.devMode;
   let hiddenOwners = new Set<string>(
     JSON.parse(localStorage.getItem(hiddenOwnersKey) || "[]") as string[],
   );
@@ -42,6 +52,7 @@
   let errorMessage = "";
   let paletteText = "";
   let generatedLabel = "loading";
+  let mounted = false;
 
   const numberFormat = new Intl.NumberFormat("en", { notation: "compact" });
   const dateFormat = new Intl.DateTimeFormat("en", {
@@ -90,6 +101,7 @@
   );
   $: document.body.classList.toggle("dev-mode", devMode);
   $: document.title = `${label} · ReleaseBar`;
+  $: syncViewState(query, filter, sortKey, sortDirection, devMode);
 
   function ownerLabel(payload: DashboardPayload): string {
     if (initialRoute.isDefault) {
@@ -129,20 +141,6 @@
     const months = Math.round(days / 30);
     if (Math.abs(months) < 18) return relativeFormat.format(months, "month");
     return relativeFormat.format(Math.round(months / 12), "year");
-  }
-
-  function filterLabel(value: DashboardFilter): string {
-    return value === "attention" ? "need attention" : value;
-  }
-
-  function needsAttention(project: Project): boolean {
-    return attentionFreshness.includes(project.freshness);
-  }
-
-  function matchesFilter(project: Project, value: DashboardFilter): boolean {
-    if (value === "all") return true;
-    if (value === "attention") return needsAttention(project);
-    return project.freshness === value;
   }
 
   function matchesBase(
@@ -262,77 +260,49 @@
       : "Connect GitHub to manage dashboard access.";
   }
 
-  function timestamp(value: string | null): number {
-    return value ? Date.parse(value) : 0;
-  }
-
-  function ciRank(project: Project): number {
-    const rank: Record<CiState, number> = {
-      failure: 7,
-      cancelled: 6,
-      running: 5,
-      pending: 4,
-      unknown: 3,
-      skipped: 2,
-      neutral: 1,
-      success: 0,
-    };
-    return rank[project.ciState];
-  }
-
-  function sortValue(project: Project, key: SortKey): string | number {
-    switch (key) {
-      case "repo":
-        return project.fullName.toLowerCase();
-      case "version":
-        return (project.version ?? "").toLowerCase();
-      case "release":
-        return timestamp(project.releaseDate);
-      case "since":
-        return project.commitsSinceRelease ?? -1;
-      case "activity":
-        return timestamp(project.latestCommitDate || project.pushedAt);
-      case "issues":
-        return project.openIssues;
-      case "prs":
-        return project.openPullRequests;
-      case "ci":
-        return ciRank(project);
-    }
-  }
-
-  function sortProjects(
-    projects: Project[],
-    activeSortKey: SortKey,
-    activeSortDirection: SortDirection,
-  ): Project[] {
-    const direction = activeSortDirection === "asc" ? 1 : -1;
-    return [...projects].sort((a, b) => {
-      const aValue = sortValue(a, activeSortKey);
-      const bValue = sortValue(b, activeSortKey);
-      if (typeof aValue === "string" && typeof bValue === "string") {
-        return aValue.localeCompare(bValue) * direction;
-      }
-      return ((aValue as number) - (bValue as number)) * direction;
-    });
-  }
-
   function setSort(key: SortKey): void {
+    if (isDevSortKey(key) && !devMode) {
+      setDevMode(true);
+    }
     if (sortKey === key) {
       sortDirection = sortDirection === "asc" ? "desc" : "asc";
     } else {
       sortKey = key;
-      sortDirection = ["repo", "version"].includes(key) ? "asc" : "desc";
+      sortDirection = defaultSortDirection(key);
     }
   }
 
   function setDevMode(value: boolean): void {
     devMode = value;
-    if (!devMode && ["issues", "prs", "ci"].includes(sortKey)) {
+    if (!devMode && isDevSortKey(sortKey)) {
       sortKey = "activity";
-      sortDirection = "desc";
+      sortDirection = defaultSortDirection(sortKey);
     }
     localStorage.setItem("releasedeck:dev-mode", String(devMode));
+  }
+
+  function syncViewState(
+    activeQuery: string,
+    activeFilter: DashboardFilter,
+    activeSortKey: SortKey,
+    activeSortDirection: SortDirection,
+    devEnabled: boolean,
+  ): void {
+    if (!mounted) return;
+    const nextSearch = viewStateSearch(
+      location.search,
+      {
+        query: activeQuery,
+        filter: activeFilter,
+        sortKey: activeSortKey,
+        sortDirection: activeSortDirection,
+        devMode: devEnabled,
+      },
+      initialRoute.isDefault,
+    );
+    if (nextSearch === location.search) return;
+    const nextUrl = `${location.pathname}${nextSearch}${location.hash}`;
+    history.replaceState(history.state, "", nextUrl);
   }
 
   function ciLabel(project: Project): string {
@@ -647,6 +617,10 @@
   }
 
   onMount(() => {
+    mounted = true;
+    if (isDevSortKey(sortKey) && !devMode) {
+      devMode = true;
+    }
     const unsubscribe = paletteStore.subscribe((value: PaletteStoreParams) => {
       paletteText = value.textInput;
     });

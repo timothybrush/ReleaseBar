@@ -8,5 +8,11 @@
     "rootDir": ".",
     "sourceMap": false
   },
-  "include": ["scripts/**/*.ts", "src/routing.ts", "src/types.ts", "worker/**/*.ts"]
+  "include": [
+    "scripts/**/*.ts",
+    "src/dashboard-view.ts",
+    "src/routing.ts",
+    "src/types.ts",
+    "worker/**/*.ts"
+  ]
 }

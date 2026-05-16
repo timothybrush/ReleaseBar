@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Made repository language tags clickable filters and exposed language filters in the command palette.
+- Replaced GitHub Pages deploys with automatic Cloudflare Worker deploys and live asset smoke checks.
 - Added URL-restored dashboard view state for search, filters, sort order, and dev columns.
 - Added a `need attention` dashboard filter for hot and busy repositories, with the metric tile acting as a shortcut.
 - Migrated the app shell to Svelte/Vite with keyboard-accessible account dropdowns, a Cmd-K command palette, and tighter ReleaseBar-themed controls.
@@ -26,5 +27,5 @@
 - Updated the header owner label to `@steipete`.
 - Added a dev mode toggle for open issues, open pull requests, and latest CI status.
 - Skipped repositories that do not have any GitHub releases.
-- Added CI for static checks, Pages deploys, and dependency updates.
+- Added CI for static checks and dependency updates.
 - Added TypeScript sources, Oxlint/Oxfmt checks, sortable dashboard columns, and day-level relative dates.

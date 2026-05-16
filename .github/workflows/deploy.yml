@@ -1,0 +1,45 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-cloudflare
+  cancel-in-progress: true
+
+jobs:
+  cloudflare:
+    name: Cloudflare Worker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check:static
+      - name: Deploy Worker Assets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm exec --yes --package wrangler -- wrangler deploy
+      - name: Smoke release.bar assets
+        run: |
+          set -euo pipefail
+          expected_js="$(grep -Eo '/assets/index-[^"]+\.js' dist/index.html | head -n 1)"
+          expected_css="$(grep -Eo '/assets/index-[^"]+\.css' dist/index.html | head -n 1)"
+          live_html="$(curl -fsSL "https://release.bar/steipete?ship=${GITHUB_SHA}")"
+          live_js="$(printf '%s\n' "$live_html" | grep -Eo '/assets/index-[^"]+\.js' | head -n 1)"
+          live_css="$(printf '%s\n' "$live_html" | grep -Eo '/assets/index-[^"]+\.css' | head -n 1)"
+          test "$live_js" = "$expected_js"
+          test "$live_css" = "$expected_css"
+          curl -fsSL "https://release.bar${live_js}" >/dev/null
+          curl -fsSL "https://release.bar${live_css}" >/dev/null

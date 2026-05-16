@@ -11,7 +11,7 @@ const publicDir = path.join(root, "src");
 const checkOnly = process.argv.includes("--check");
 const assetsOnly = process.argv.includes("--assets-only");
 
-async function finishStaticAssets(config: ReleaseBarConfig): Promise<void> {
+async function finishStaticAssets(): Promise<void> {
   await mkdir(path.join(distDir, "data"), { recursive: true });
 
   for (const file of [
@@ -25,14 +25,13 @@ async function finishStaticAssets(config: ReleaseBarConfig): Promise<void> {
     await copyFile(path.join(publicDir, file), path.join(distDir, file));
   }
 
-  await writeFile(path.join(distDir, "CNAME"), `${config.canonicalDomain}\n`);
   await copyFile(path.join(distDir, "index.html"), path.join(distDir, "404.html"));
 }
 
 async function main() {
   const config = JSON.parse(await readFile(configPath, "utf8")) as ReleaseBarConfig;
   if (assetsOnly) {
-    await finishStaticAssets(config);
+    await finishStaticAssets();
     return;
   }
 
@@ -48,7 +47,7 @@ async function main() {
     return;
   }
 
-  await finishStaticAssets(config);
+  await finishStaticAssets();
   await writeFile(
     path.join(distDir, "data", "projects.json"),
     `${JSON.stringify(payload, null, 2)}\n`,

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Made project owners link to their ReleaseBar dashboards while repository names still open GitHub.
 - Show cached partial source data while cold combined dashboards rebuild in the background.
 - Added owner-only public dashboard defaults so saved sources and visibility apply at clean owner URLs.
 - Added a close button to the dashboard settings panel.

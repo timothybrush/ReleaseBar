@@ -14,6 +14,7 @@ import {
 } from "./dashboard.js";
 import {
   dashboardRoute,
+  ownerDashboardPath,
   optionsFromSearch,
   ownerFromPath,
   workerApiOrigin,
@@ -152,6 +153,7 @@ test("owner route parsing keeps root hot board and owners API-backed", () => {
   assert.equal(ownerFromPath("/index.html"), null);
   assert.equal(ownerFromPath("/OpenClaw"), "OpenClaw");
   assert.equal(ownerFromPath("/bad_owner"), null);
+  assert.equal(ownerDashboardPath("@Steipete"), "/steipete");
 
   assert.deepEqual(dashboardRoute("/", "").isDefault, true);
   assert.equal(dashboardRoute("/", "").apiPath, `${workerApiOrigin}/api/_hot`);

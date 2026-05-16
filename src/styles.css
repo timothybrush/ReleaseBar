@@ -754,13 +754,48 @@ body.dev-mode .dev-only {
   background: rgba(156, 255, 87, 0.035);
 }
 
+.repo-title {
+  display: flex;
+  max-width: 100%;
+  align-items: baseline;
+  overflow: hidden;
+  gap: 4px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.owner-link,
 .repo-link {
-  display: block;
+  min-width: 0;
   overflow: hidden;
   color: var(--text);
   font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.owner-link {
+  flex: 0 1 auto;
+  color: var(--green);
+}
+
+.repo-link {
+  flex: 1 1 auto;
+}
+
+.repo-separator {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.owner-link:hover,
+.owner-link:focus-visible,
+.repo-link:hover,
+.repo-link:focus-visible {
+  color: var(--green-strong);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
 }
 
 .description {

@@ -24,7 +24,7 @@
     type SortDirection,
     type SortKey,
   } from "./dashboard-view.js";
-  import { dashboardRoute, validRepoSlug } from "./routing.js";
+  import { dashboardRoute, ownerDashboardPath, validRepoSlug } from "./routing.js";
   import type { ApiQuota, AuthPayload, DashboardPayload, Project } from "./types.js";
 
   const initialRoute = dashboardRoute(location.pathname, location.search);
@@ -1036,13 +1036,19 @@
             <span>cached rows visible</span>
             <strong>{data?.cache?.message ?? "combined dashboard updating"}</strong>
           </div>
-        {/if}
+          {/if}
         {#each filteredProjects as project (project.fullName)}
         <article class="project" data-freshness={project.freshness}>
           <div class="repo-cell">
-            <a class="repo-link" target="_blank" rel="noreferrer" href={project.url}>
-              {project.fullName}
-            </a>
+            <div class="repo-title">
+              <a class="owner-link" href={ownerDashboardPath(project.owner)} title={`Open @${project.owner} dashboard`}>
+                {project.owner}
+              </a>
+              <span class="repo-separator" aria-hidden="true">/</span>
+              <a class="repo-link" target="_blank" rel="noreferrer" href={project.url} title="Open repo on GitHub">
+                {project.name}
+              </a>
+            </div>
             <p class="description">{project.description || "no description"}</p>
             <div class="tags">
               {#if project.language}

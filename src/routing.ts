@@ -56,6 +56,10 @@ export function validRepoSlug(repo: string): boolean {
   return /^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?\/[a-z\d._-]{1,100}$/i.test(repo);
 }
 
+export function ownerDashboardPath(owner: string): string {
+  return `/${encodeURIComponent(owner.trim().replace(/^@/, "").toLowerCase())}`;
+}
+
 export function dashboardRoute(
   pathname: string,
   search = "",

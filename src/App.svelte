@@ -1677,9 +1677,9 @@
                 href={project.releaseUrl}
                 target="_blank"
                 rel="noreferrer"
-                title={`Open release ${project.version}`}
+                title={project.releaseDate ? `Open release ${project.version}` : "Open repository"}
               >
-                {project.version}
+                {project.releaseDate ? project.version : "open repo"}
               </a>
               <span>{relativeDate(project.releaseDate)}</span>
             {/if}

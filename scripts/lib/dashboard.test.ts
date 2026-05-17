@@ -196,7 +196,11 @@ test("owner route parsing keeps root hot board and owners API-backed", () => {
   assert.equal(dashboardRoute("/openclaw", "").apiPath, `${workerApiOrigin}/api/openclaw`);
   assert.equal(
     dashboardRoute("/openclaw", "?forks=true&archived=true&unreleased=true").apiPath,
-    `${workerApiOrigin}/api/openclaw?forks=true&archived=true&unreleased=true`,
+    `${workerApiOrigin}/api/openclaw?forks=true&archived=true`,
+  );
+  assert.equal(
+    dashboardRoute("/openclaw", "?unreleased=false").apiPath,
+    `${workerApiOrigin}/api/openclaw?unreleased=false`,
   );
   assert.equal(
     dashboardRoute("/openclaw", "?owners=steipete,openclaw&repos=steipete/oracle").apiPath,
@@ -321,8 +325,8 @@ test("dashboard project sorting handles dev issue and pull request counts numeri
 });
 
 test("worker builds root hot dashboard from cached dashboards", async () => {
-  const alphaKey = dashboardCacheKey({ owner: "alpha", schemaVersion: 5 });
-  const betaKey = dashboardCacheKey({ owner: "beta", schemaVersion: 5 });
+  const alphaKey = dashboardCacheKey({ owner: "alpha", includeUnreleased: true, schemaVersion: 5 });
+  const betaKey = dashboardCacheKey({ owner: "beta", includeUnreleased: true, schemaVersion: 5 });
   const forksKey = dashboardCacheKey({ owner: "forks", includeForks: true, schemaVersion: 5 });
   const env = {
     DASHBOARD_CACHE: kvStore({
@@ -1478,7 +1482,7 @@ test("dashboard build records GitHub quota headers", async () => {
 });
 
 test("worker preserves cached quota metadata on fresh responses", async () => {
-  const key = dashboardCacheKey({ owner: "owner", schemaVersion: 5 });
+  const key = dashboardCacheKey({ owner: "owner", includeUnreleased: true, schemaVersion: 5 });
   const dashboard = testDashboard("owner", []);
   dashboard.generatedAt = new Date().toISOString();
   if (dashboard.cache) {
@@ -1511,7 +1515,7 @@ test("worker preserves cached quota metadata on fresh responses", async () => {
 });
 
 test("worker streams cached dashboard snapshots over owner events", async () => {
-  const key = dashboardCacheKey({ owner: "owner", schemaVersion: 5 });
+  const key = dashboardCacheKey({ owner: "owner", includeUnreleased: true, schemaVersion: 5 });
   const dashboard = testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]);
   dashboard.generatedAt = new Date().toISOString();
   if (dashboard.cache) {
@@ -1532,7 +1536,7 @@ test("worker streams cached dashboard snapshots over owner events", async () => 
 });
 
 test("worker keeps owner events working for the repos owner slug", async () => {
-  const key = dashboardCacheKey({ owner: "repos", schemaVersion: 5 });
+  const key = dashboardCacheKey({ owner: "repos", includeUnreleased: true, schemaVersion: 5 });
   const dashboard = testDashboard("repos", [testProject({ owner: "repos", name: "repo" })]);
   dashboard.generatedAt = new Date().toISOString();
   if (dashboard.cache) {
@@ -1654,8 +1658,8 @@ test("worker serves partial cached sources while combined dashboard rebuilds", a
       fetch: async () => new Response(null, { status: 409 }),
     }),
   };
-  const alphaKey = dashboardCacheKey({ owner: "alpha", schemaVersion: 5 });
-  const betaKey = dashboardCacheKey({ owner: "beta", schemaVersion: 5 });
+  const alphaKey = dashboardCacheKey({ owner: "alpha", includeUnreleased: true, schemaVersion: 5 });
+  const betaKey = dashboardCacheKey({ owner: "beta", includeUnreleased: true, schemaVersion: 5 });
 
   try {
     const response = await worker.fetch(
@@ -1767,7 +1771,11 @@ test("worker progressively resumes large owner dashboard builds from partial cac
     assert.equal(firstBody.cache?.state, "partial");
     assert.equal(firstBody.cache?.progress?.scanned, 12);
     assert.equal(firstBody.cache?.progress?.done, false);
-    assert.equal(firstBody.projects.length, 12);
+    assert.equal(firstBody.projects.length, 25);
+    assert.equal(
+      firstBody.projects.filter((project) => project.version === "repo search").length,
+      13,
+    );
 
     await Promise.all(waitUntil.splice(0));
 
@@ -1776,6 +1784,10 @@ test("worker progressively resumes large owner dashboard builds from partial cac
     assert.equal(secondBody.cache?.state, "fresh");
     assert.equal(secondBody.cache?.progress?.done, true);
     assert.equal(secondBody.projects.length, 25);
+    assert.equal(
+      secondBody.projects.filter((project) => project.version === "repo search").length,
+      0,
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2996,6 +3008,12 @@ test("query options are explicit booleans", () => {
     includeArchived: false,
     includeUnreleased: true,
   });
+  assert.deepEqual(optionsFromSearch("?unreleased=false"), {
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: false,
+  });
+  assert.equal(optionsFromSearch("").includeUnreleased, true);
 });
 
 test("build option normalization preserves config includeUnreleased", () => {
@@ -3708,6 +3726,7 @@ test("dashboard repo cap applies after visibility filters", async () => {
     owners: [{ type: "user", login: "owner" }],
     includeForks: false,
     includeArchived: false,
+    includeUnreleased: true,
     repoLimit: 2,
     fetch: async (url) => {
       const parsed = new URL(String(url));
@@ -3847,7 +3866,7 @@ test("dashboard repo cap applies per owner for custom dashboards", async () => {
   assert.equal(payload.cache?.capped, true);
 });
 
-test("dashboard repo cap applies after release eligibility", async () => {
+test("dashboard repo cap applies to visible rows before release hydration", async () => {
   const repo = (name: string) => ({
     owner: { login: "owner" },
     name,
@@ -3858,7 +3877,7 @@ test("dashboard repo cap applies after release eligibility", async () => {
     language: null,
     stargazers_count: 0,
     forks_count: 0,
-    open_issues_count: 0,
+    open_issues_count: name === "empty-a" ? 3 : 0,
     archived: false,
     pushed_at: null,
     updated_at: null,
@@ -3874,6 +3893,7 @@ test("dashboard repo cap applies after release eligibility", async () => {
     owners: [{ type: "user", login: "owner" }],
     includeForks: false,
     includeArchived: false,
+    includeUnreleased: true,
     repoLimit: 2,
     fetch: async (url) => {
       const path = new URL(String(url)).pathname;
@@ -3916,6 +3936,113 @@ test("dashboard repo cap applies after release eligibility", async () => {
         });
       }
       if (path.endsWith("/pulls")) {
+        return Response.json(name === "empty-a" ? [{}] : []);
+      }
+      if (path.endsWith("/check-runs")) {
+        return Response.json({
+          check_runs:
+            name === "empty-a"
+              ? [
+                  {
+                    name: "ci",
+                    status: "completed",
+                    conclusion: "success",
+                    html_url: "https://github.com/owner/empty-a/actions/runs/1",
+                    completed_at: "2026-01-02T00:00:00Z",
+                    started_at: "2026-01-02T00:00:00Z",
+                  },
+                ]
+              : [],
+        });
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+  });
+
+  assert.deepEqual(
+    payload.projects.map((project) => project.name),
+    ["empty-a", "empty-b"],
+  );
+  assert.deepEqual(
+    payload.projects.map((project) => project.version),
+    ["unreleased", "unreleased"],
+  );
+  assert.equal(payload.projects[0]?.latestCommitSha, "abcdef1");
+  assert.equal(payload.projects[0]?.openIssues, 2);
+  assert.equal(payload.projects[0]?.openPullRequests, 1);
+  assert.equal(payload.projects[0]?.ciState, "success");
+  assert.equal(payload.cache?.capped, true);
+});
+
+test("dashboard released-only repo cap scans past unreleased repositories", async () => {
+  const repo = (name: string) => ({
+    owner: { login: "owner" },
+    name,
+    full_name: `owner/${name}`,
+    description: null,
+    html_url: `https://github.com/owner/${name}`,
+    default_branch: "main",
+    language: null,
+    stargazers_count: 0,
+    forks_count: 0,
+    open_issues_count: 0,
+    archived: false,
+    pushed_at: null,
+    updated_at: null,
+    fork: false,
+    private: false,
+  });
+  const released = new Set(["one", "two", "three"]);
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: false,
+    repoLimit: 2,
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      if (path === "/users/owner/repos") {
+        return Response.json([
+          repo("empty-a"),
+          repo("empty-b"),
+          repo("empty-c"),
+          repo("one"),
+          repo("two"),
+          repo("three"),
+        ]);
+      }
+      const name = path.split("/")[3];
+      if (path.endsWith("/releases")) {
+        return Response.json(
+          released.has(name)
+            ? [
+                {
+                  tag_name: "v1.0.0",
+                  name: null,
+                  html_url: `https://github.com/owner/${name}/releases/v1.0.0`,
+                  draft: false,
+                  published_at: "2026-01-01T00:00:00Z",
+                },
+              ]
+            : [],
+        );
+      }
+      if (path.endsWith("/commits/main")) {
+        return Response.json({
+          sha: "abcdef123456",
+          commit: { committer: { date: "2026-01-02T00:00:00Z" } },
+        });
+      }
+      if (path.includes("/compare/")) {
+        return Response.json({
+          total_commits: 0,
+          html_url: "https://github.com/owner/repo/compare",
+        });
+      }
+      if (path.endsWith("/pulls")) {
         return Response.json([]);
       }
       if (path.endsWith("/check-runs")) {
@@ -3929,6 +4056,8 @@ test("dashboard repo cap applies after release eligibility", async () => {
     payload.projects.map((project) => project.name),
     ["one", "two"],
   );
+  assert.equal(payload.totals.repos, 2);
+  assert.equal(payload.totals.unreleased, 0);
   assert.equal(payload.cache?.capped, true);
 });
 
@@ -3959,6 +4088,7 @@ test("dashboard repo scan cap stops giant owners after recent repos", async () =
     owners: [{ type: "user", login: "owner" }],
     includeForks: false,
     includeArchived: false,
+    includeUnreleased: true,
     repoLimit: 2,
     repoScanLimit: 2,
     fetch: async (url) => {
@@ -3970,12 +4100,28 @@ test("dashboard repo scan cap stops giant owners after recent repos", async () =
         releaseFetches.push(path.split("/")[3] ?? "");
         return Response.json([]);
       }
+      if (path.endsWith("/commits/main")) {
+        return Response.json({
+          sha: "abcdef123456",
+          commit: { committer: { date: "2026-01-02T00:00:00Z" } },
+        });
+      }
+      if (path.endsWith("/pulls")) {
+        return Response.json([]);
+      }
+      if (path.endsWith("/check-runs")) {
+        return Response.json({ check_runs: [] });
+      }
       throw new Error(`unexpected ${path}`);
     },
   });
 
   assert.deepEqual(releaseFetches, ["empty-a", "empty-b"]);
-  assert.equal(payload.totals.repos, 0);
+  assert.deepEqual(
+    payload.projects.map((project) => project.name),
+    ["empty-a", "empty-b"],
+  );
+  assert.equal(payload.totals.repos, 2);
   assert.equal(payload.cache?.capped, true);
   assert.match(payload.cache?.message ?? "", /scanned 2 recently pushed repos/);
 });
@@ -4007,6 +4153,7 @@ test("dashboard repo scan cap marks full page boundary truncation as capped", as
     owners: [{ type: "user", login: "owner" }],
     includeForks: false,
     includeArchived: false,
+    includeUnreleased: true,
     repoLimit: 200,
     repoScanLimit: 100,
     fetch: async (url) => {
@@ -4019,12 +4166,24 @@ test("dashboard repo scan cap marks full page boundary truncation as capped", as
       if (path.endsWith("/releases")) {
         return Response.json([]);
       }
+      if (path.endsWith("/commits/main")) {
+        return Response.json({
+          sha: "abcdef123456",
+          commit: { committer: { date: "2026-01-02T00:00:00Z" } },
+        });
+      }
+      if (path.endsWith("/pulls")) {
+        return Response.json([]);
+      }
+      if (path.endsWith("/check-runs")) {
+        return Response.json({ check_runs: [] });
+      }
       throw new Error(`unexpected ${path}`);
     },
   });
 
-  assert.deepEqual(pages, ["1"]);
-  assert.equal(payload.totals.repos, 0);
+  assert.deepEqual(pages, ["1", "2"]);
+  assert.equal(payload.totals.repos, 100);
   assert.equal(payload.cache?.capped, true);
   assert.match(payload.cache?.message ?? "", /scanned 100 recently pushed repos/);
 });

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Show visible repository rows before release data finishes scanning, then progressively hydrate them.
 - Added avatar, release version, and commits-since-release detail to social cards.
 - Added compact owner avatars to mixed-owner repository lists.
 - Added GitHub owner avatars to owner dashboard hero headings.

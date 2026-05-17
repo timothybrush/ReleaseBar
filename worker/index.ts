@@ -1706,7 +1706,7 @@ function optionsFromUrl(url: URL) {
   return {
     includeForks: url.searchParams.get("forks") === "true",
     includeArchived: url.searchParams.get("archived") === "true",
-    includeUnreleased: url.searchParams.get("unreleased") === "true",
+    includeUnreleased: url.searchParams.get("unreleased") !== "false",
   };
 }
 

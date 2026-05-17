@@ -349,6 +349,53 @@ export function freshness(project: Pick<Project, "commitsSinceRelease">): Freshn
   return "hot";
 }
 
+function repoSearchProject(repo: GitHubRepo): Project {
+  const openPullRequests = repo.open_pull_requests_total ?? 0;
+  return {
+    owner: repo.owner.login,
+    name: repo.name,
+    fullName: repo.full_name,
+    description: repo.description,
+    url: repo.html_url,
+    defaultBranch: repo.default_branch,
+    language: repo.language,
+    topics: repo.topics ?? [],
+    stars: repo.stargazers_count,
+    forks: repo.forks_count,
+    openIssues: repo.open_issues_total ?? Math.max(repo.open_issues_count - openPullRequests, 0),
+    openPullRequests,
+    issuesUrl: `${repo.html_url}/issues`,
+    pullRequestsUrl: `${repo.html_url}/pulls`,
+    archived: repo.archived,
+    pushedAt: repo.pushed_at,
+    updatedAt: repo.updated_at,
+    latestCommitSha: null,
+    latestCommitDate: null,
+    version: "repo search",
+    releaseName: null,
+    releaseUrl: `${repo.html_url}/releases`,
+    releaseDate: null,
+    commitsSinceRelease: null,
+    compareUrl: null,
+    ciState: "unknown",
+    ciStatus: null,
+    ciConclusion: null,
+    ciWorkflow: null,
+    ciUrl: null,
+    ciRunDate: null,
+    freshness: "hot",
+  };
+}
+
+function isRepoSearchProject(project: Project): boolean {
+  return (
+    project.version === "repo search" &&
+    project.releaseDate === null &&
+    project.commitsSinceRelease === null &&
+    project.compareUrl === null
+  );
+}
+
 function githubClient(
   token = "",
   fetcher: typeof fetch = fetch,
@@ -721,8 +768,10 @@ async function repoSummary(
   includeUnreleased: boolean,
 ): Promise<Omit<Project, "freshness"> | null> {
   const release = await latestRelease(client, repo);
-  if (!release?.tag_name && !includeUnreleased) {
-    return null;
+  if (!release?.tag_name) {
+    if (!includeUnreleased) {
+      return null;
+    }
   }
 
   let commitsSinceRelease: number | null = null;
@@ -926,12 +975,18 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
     };
   }
 
-  async function addRepo(repo: GitHubRepo, countLabel: string, force = false): Promise<void> {
-    if (projects.some((project) => project.fullName === repo.full_name)) {
-      return;
+  async function addRepo(repo: GitHubRepo, countLabel: string, force = false): Promise<boolean> {
+    const existingIndex = projects.findIndex(
+      (project) => project.fullName.toLowerCase() === repo.full_name.toLowerCase(),
+    );
+    if (existingIndex >= 0 && !isRepoSearchProject(projects[existingIndex]!)) {
+      return true;
     }
-    if ((!force && seen.has(repo.full_name.toLowerCase())) || !filterRepo(repo, options)) {
-      return;
+    if (
+      (!force && existingIndex < 0 && seen.has(repo.full_name.toLowerCase())) ||
+      !filterRepo(repo, options)
+    ) {
+      return false;
     }
     seen.add(repo.full_name.toLowerCase());
     options.log?.(`fetch ${countLabel} ${repo.full_name}`);
@@ -939,47 +994,88 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
     const cached = await readProjectCache(options.projectCache, repo, includeUnreleased);
     const project = cached ?? (await repoSummary(client, repo, includeUnreleased));
     if (!project) {
+      if (existingIndex >= 0) {
+        projects.splice(existingIndex, 1);
+      }
       options.log?.(`skip ${repo.full_name}: no releases`);
-      return;
+      return false;
     }
     if (!cached) {
       await writeProjectCache(options.projectCache, repo, includeUnreleased, project);
     }
-    projects.push({ ...project, freshness: freshness(project) });
+    const hydrated = { ...project, freshness: freshness(project) };
+    if (existingIndex >= 0) {
+      projects[existingIndex] = hydrated;
+    } else {
+      projects.push(hydrated);
+    }
+    return true;
   }
 
   if (options.repoLimit) {
     for (const owner of options.owners) {
-      const ownerStart = projects.length;
       const ownerExisting = projects.filter(
         (project) => project.owner.toLowerCase() === owner.login.toLowerCase(),
       ).length;
-      let scanned = 0;
+      let ownerVisible = ownerExisting;
+      let hydratedThisOwner = 0;
       let page = 1;
       const scanLimit = options.repoScanLimit ?? Number.POSITIVE_INFINITY;
-      while (
-        ownerExisting + projects.length - ownerStart <= options.repoLimit &&
-        scanned < scanLimit
-      ) {
+      while (ownerVisible < options.repoLimit || hydratedThisOwner < scanLimit) {
         const repos = await ownerRepos(client, owner, page);
         if (repos.length === 0) {
           break;
         }
-        for (const repo of repos) {
-          if (skippedRepos.has(repo.full_name.toLowerCase())) {
+        let exhaustedPage = false;
+        let visibleAddedThisPage = 0;
+        for (const [index, repo] of repos.entries()) {
+          const fullName = repo.full_name.toLowerCase();
+          if (!filterRepo(repo, options)) {
             continue;
           }
-          if (scanned >= scanLimit) {
+          const existingIndex = projects.findIndex(
+            (project) => project.fullName.toLowerCase() === fullName,
+          );
+          let seededVisibleRow = false;
+          if (existingIndex < 0 && options.includeUnreleased) {
+            if (ownerVisible >= options.repoLimit) {
+              capped = true;
+              exhaustedPage = true;
+              break;
+            }
+            projects.push(repoSearchProject(repo));
+            seen.add(fullName);
+            ownerVisible += 1;
+            visibleAddedThisPage += 1;
+            seededVisibleRow = true;
+          }
+          if (skippedRepos.has(fullName)) {
+            continue;
+          }
+          if (hydratedThisOwner >= scanLimit) {
             capped = true;
             if (options.repoScanTarget) {
               scanIncomplete = true;
             }
-            break;
+            if (ownerVisible >= options.repoLimit) {
+              exhaustedPage = true;
+              break;
+            }
+            continue;
           }
-          scanned += 1;
+          hydratedThisOwner += 1;
           scannedThisRun += 1;
-          const ownerCount = ownerExisting + projects.length - ownerStart;
-          await addRepo(repo, `${owner.login} ${ownerCount + 1}/${options.repoLimit}`);
+          const added = await addRepo(repo, `${owner.login} ${ownerVisible}/${options.repoLimit}`);
+          if (added && !seededVisibleRow && existingIndex < 0) {
+            ownerVisible += 1;
+            visibleAddedThisPage += 1;
+            if (ownerVisible >= options.repoLimit) {
+              if (index < repos.length - 1 || repos.length === 100) {
+                capped = true;
+              }
+              exhaustedPage = true;
+            }
+          }
           const progressPayload = payload("partial");
           if (progressPayload.cache?.progress) {
             progressPayload.cache.progress.done = false;
@@ -989,25 +1085,20 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             scanned: skippedRepos.size + scannedThisRun,
             done: false,
           });
-          if (ownerExisting + projects.length - ownerStart > options.repoLimit) {
-            capped = true;
+          if (exhaustedPage) {
             break;
           }
         }
         if (repos.length < 100) {
           break;
         }
-        if (scanned >= scanLimit) {
-          capped = true;
-          if (options.repoScanTarget) {
-            scanIncomplete = true;
-          }
+        if (exhaustedPage) {
+          break;
+        }
+        if (hydratedThisOwner >= scanLimit && visibleAddedThisPage === 0) {
           break;
         }
         page += 1;
-      }
-      if (ownerExisting + projects.length - ownerStart > options.repoLimit) {
-        projects.splice(ownerStart + Math.max(0, options.repoLimit - ownerExisting));
       }
     }
   } else {

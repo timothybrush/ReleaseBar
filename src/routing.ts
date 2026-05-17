@@ -57,7 +57,7 @@ export function optionsFromSearch(search: string): RouteOptions {
   return {
     includeForks: params.get("forks") === "true",
     includeArchived: params.get("archived") === "true",
-    includeUnreleased: params.get("unreleased") === "true",
+    includeUnreleased: params.get("unreleased") !== "false",
   };
 }
 
@@ -138,7 +138,7 @@ export function dashboardRoute(
   const query = new URLSearchParams();
   if (options.includeForks) query.set("forks", "true");
   if (options.includeArchived) query.set("archived", "true");
-  if (options.includeUnreleased) query.set("unreleased", "true");
+  if (!options.includeUnreleased) query.set("unreleased", "false");
   if (extraOwners.length > 0) query.set(ownerListKey, extraOwners.join(","));
   if (repos.length > 0) query.set(repoListKey, repos.join(","));
   const suffix = query.size > 0 ? `?${query}` : "";

@@ -36,9 +36,17 @@ jobs:
           set -euo pipefail
           expected_js="$(grep -Eo '/assets/index-[^"]+\.js' dist/index.html | head -n 1)"
           expected_css="$(grep -Eo '/assets/index-[^"]+\.css' dist/index.html | head -n 1)"
-          live_html="$(curl -fsSL "https://release.bar/steipete?ship=${GITHUB_SHA}")"
-          live_js="$(printf '%s\n' "$live_html" | grep -Eo '/assets/index-[^"]+\.js' | head -n 1)"
-          live_css="$(printf '%s\n' "$live_html" | grep -Eo '/assets/index-[^"]+\.css' | head -n 1)"
+          live_js=""
+          live_css=""
+          for _ in $(seq 1 40); do
+            live_html="$(curl -fsSL "https://release.bar/steipete?ship=${GITHUB_SHA}")"
+            live_js="$(printf '%s\n' "$live_html" | grep -Eo '/assets/index-[^"]+\.js' | head -n 1)"
+            live_css="$(printf '%s\n' "$live_html" | grep -Eo '/assets/index-[^"]+\.css' | head -n 1)"
+            if [ "$live_js" = "$expected_js" ] && [ "$live_css" = "$expected_css" ]; then
+              break
+            fi
+            sleep 3
+          done
           test "$live_js" = "$expected_js"
           test "$live_css" = "$expected_css"
           for _ in $(seq 1 20); do

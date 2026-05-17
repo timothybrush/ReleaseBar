@@ -92,17 +92,41 @@ a:hover {
   text-decoration-color: currentColor;
 }
 
-.eyebrow {
-  display: inline-block;
+.eyebrow-nav {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
   margin: 0 0 8px;
+}
+
+.eyebrow-nav > span {
+  color: var(--line-strong);
+  font-size: 13px;
+}
+
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   color: var(--green);
   font-size: 13px;
   letter-spacing: 0;
   text-transform: uppercase;
 }
 
-.eyebrow:hover {
+.eyebrow:hover,
+.eyebrow:focus-visible {
   color: var(--text);
+}
+
+.eyebrow-back {
+  color: var(--muted);
+}
+
+.eyebrow-back:hover,
+.eyebrow-back:focus-visible {
+  color: var(--green);
 }
 
 h1 {
@@ -1147,12 +1171,122 @@ body.dev-mode .table-head .since-heading .label-compact {
   padding-top: 12px;
 }
 
-.spark-bars span {
+.spark-bars button {
+  position: relative;
+  width: 100%;
   min-height: 4px;
+  margin: 0;
+  padding: 0;
+  border: 0;
   border-radius: 3px 3px 0 0;
   background:
     linear-gradient(180deg, rgba(232, 244, 223, 0.85), rgba(156, 255, 87, 0.78)), var(--green);
   box-shadow: 0 0 12px rgba(156, 255, 87, 0.08);
+  outline: 0;
+  transition:
+    background 140ms ease,
+    box-shadow 140ms ease,
+    filter 140ms ease,
+    opacity 140ms ease,
+    transform 140ms ease;
+}
+
+.spark-bars:hover button,
+.spark-bars:focus-within button {
+  opacity: 0.48;
+}
+
+.spark-bars button:hover,
+.spark-bars button:focus-visible {
+  z-index: 3;
+  background:
+    linear-gradient(180deg, rgba(252, 255, 237, 0.98), rgba(178, 255, 99, 0.96)), var(--green);
+  box-shadow:
+    0 0 0 1px rgba(232, 244, 223, 0.42),
+    0 0 24px rgba(156, 255, 87, 0.28);
+  filter: saturate(1.15);
+  opacity: 1;
+  transform: translateY(-2px);
+}
+
+.spark-bars button::after {
+  position: absolute;
+  bottom: calc(100% + 12px);
+  left: 50%;
+  min-width: max-content;
+  max-width: 210px;
+  padding: 7px 9px;
+  border: 1px solid rgba(156, 255, 87, 0.42);
+  border-radius: 5px;
+  background: rgba(8, 11, 8, 0.96);
+  box-shadow:
+    0 10px 28px rgba(0, 0, 0, 0.5),
+    0 0 16px rgba(156, 255, 87, 0.12);
+  color: var(--text);
+  content: attr(data-tooltip);
+  font-size: 12px;
+  line-height: 1;
+  opacity: 0;
+  pointer-events: none;
+  text-align: center;
+  transform: translate(-50%, 4px);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+  white-space: nowrap;
+}
+
+.spark-bars button::before {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  width: 8px;
+  height: 8px;
+  border-right: 1px solid rgba(156, 255, 87, 0.42);
+  border-bottom: 1px solid rgba(156, 255, 87, 0.42);
+  background: rgba(8, 11, 8, 0.96);
+  content: "";
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, 4px) rotate(45deg);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+}
+
+.spark-bars button:hover::after,
+.spark-bars button:focus-visible::after {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+.spark-bars button:hover::before,
+.spark-bars button:focus-visible::before {
+  opacity: 1;
+  transform: translate(-50%, 0) rotate(45deg);
+}
+
+.spark-bars button:nth-child(-n + 4)::after {
+  left: 0;
+  text-align: left;
+  transform: translate(0, 4px);
+}
+
+.spark-bars button:nth-child(-n + 4):hover::after,
+.spark-bars button:nth-child(-n + 4):focus-visible::after {
+  transform: translate(0, 0);
+}
+
+.spark-bars button:nth-last-child(-n + 4)::after {
+  right: 0;
+  left: auto;
+  text-align: right;
+  transform: translate(0, 4px);
+}
+
+.spark-bars button:nth-last-child(-n + 4):hover::after,
+.spark-bars button:nth-last-child(-n + 4):focus-visible::after {
+  transform: translate(0, 0);
 }
 
 .detail-empty {

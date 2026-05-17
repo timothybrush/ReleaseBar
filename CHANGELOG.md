@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added repo detail breadcrumbs back to the owner dashboard.
+- Improved repository commit graph hover states with styled, keyboard-accessible tooltips.
 - Added repository detail pages with cached releases, contributors, language mix, commit graphs, and churn stats.
 - Clarified GitHub Hot release scan placeholders while background hydration is queued or skipped.
 - Added a stars table column, repository topic tags, clearer GitHub Hot placeholders, and automatic release scanning for the top Hot repositories.

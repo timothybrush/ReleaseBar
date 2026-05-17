@@ -743,7 +743,10 @@
       return { response, body };
     };
     let { response, body } = await read(repoRoute.apiPath);
-    if (!response.ok && repoRoute.fallbackApiPath) {
+    if (
+      repoRoute.fallbackApiPath &&
+      (!response.ok || !body || !("project" in body))
+    ) {
       ({ response, body } = await read(repoRoute.fallbackApiPath));
     }
     if (body && "project" in body) {
@@ -1093,7 +1096,16 @@
 <main class="shell">
   <header class="topline">
     <div>
-      <a class="eyebrow" href="/">ReleaseBar</a>
+      <nav class="eyebrow-nav" aria-label="Page navigation">
+        <a class="eyebrow" href="/">ReleaseBar</a>
+        {#if repoRoute}
+          <span aria-hidden="true">/</span>
+          <a class="eyebrow eyebrow-back" href={ownerDashboardPath(repoRoute.owner)}>
+            <span aria-hidden="true">←</span>
+            @{repoRoute.owner}
+          </a>
+        {/if}
+      </nav>
       <h1>{label}</h1>
       <p class="subtitle">
         {#if subtitleOwner}
@@ -1323,10 +1335,12 @@
             {#if repoDetail.commitActivity.length > 0}
               <div class="spark-bars" aria-label="Weekly commits">
                 {#each repoDetail.commitActivity as week}
-                  <span
-                    title={`${shortDate(week.week)} · ${week.total} commits`}
+                  <button
+                    type="button"
+                    aria-label={`${shortDate(week.week)} · ${numberFormat.format(week.total)} commits`}
+                    data-tooltip={`${shortDate(week.week)} · ${numberFormat.format(week.total)} commits`}
                     style={`height: ${percent(week.total, detailMaxCommits)}%`}
-                  ></span>
+                  ></button>
                 {/each}
               </div>
             {:else}

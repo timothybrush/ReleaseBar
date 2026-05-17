@@ -1729,7 +1729,7 @@
   <a href="https://github.com/steipete" target="_blank" rel="noreferrer">@steipete</a>
   <span>Steinberger</span>
   <span class="footer-separator" aria-hidden="true">.</span>
-  <a href="https://github.com/steipete/ReleaseDeck/blob/main/LICENSE" target="_blank" rel="noreferrer">MIT Licensed</a>
+  <a href="https://github.com/steipete/ReleaseBar/blob/main/LICENSE" target="_blank" rel="noreferrer">MIT Licensed</a>
 </footer>
 
 <CommandPalette

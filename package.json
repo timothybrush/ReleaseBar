@@ -1,22 +1,22 @@
 {
-  "name": "releasedeck",
+  "name": "releasebar",
   "version": "0.1.0",
   "private": true,
   "description": "Release freshness dashboard for open source maintainers.",
   "type": "module",
   "scripts": {
-    "build": "npm run build:script && npm run build:app && node node_modules/.cache/releasedeck-build/scripts/build.js",
+    "build": "npm run build:script && npm run build:app && node node_modules/.cache/releasebar-build/scripts/build.js",
     "build:app": "vite build",
-    "build:assets": "node node_modules/.cache/releasedeck-build/scripts/build.js --assets-only",
+    "build:assets": "node node_modules/.cache/releasebar-build/scripts/build.js --assets-only",
     "build:script": "tsc -p tsconfig.build.json",
     "check": "npm run check:static && npm run check:data",
-    "check:data": "node node_modules/.cache/releasedeck-build/scripts/build.js --check",
+    "check:data": "node node_modules/.cache/releasebar-build/scripts/build.js --check",
     "check:static": "npm run typecheck && npm run lint && npm run format:check && npm run build:script && npm run build:app && npm run build:assets && npm run test",
     "dev": "vite dev --host 127.0.0.1",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint .",
-    "test": "npm run build:script && node node_modules/.cache/releasedeck-build/scripts/lib/dashboard.test.js",
+    "test": "npm run build:script && node node_modules/.cache/releasebar-build/scripts/lib/dashboard.test.js",
     "typecheck": "tsc --noEmit && svelte-check --tsconfig ./tsconfig.svelte.json"
   },
   "dependencies": {

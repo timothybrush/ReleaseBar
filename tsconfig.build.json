@@ -4,7 +4,7 @@
     "allowImportingTsExtensions": false,
     "declaration": false,
     "noEmit": false,
-    "outDir": "node_modules/.cache/releasedeck-build",
+    "outDir": "node_modules/.cache/releasebar-build",
     "rootDir": ".",
     "sourceMap": false
   },

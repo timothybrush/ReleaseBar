@@ -6,7 +6,7 @@ import type { ReleaseBarConfig } from "../src/types.js";
 
 const root = process.cwd();
 const distDir = path.join(root, "dist");
-const configPath = path.join(root, "releasedeck.config.json");
+const configPath = path.join(root, "releasebar.config.json");
 const publicDir = path.join(root, "src");
 const checkOnly = process.argv.includes("--check");
 const assetsOnly = process.argv.includes("--assets-only");

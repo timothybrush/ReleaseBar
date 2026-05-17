@@ -1,0 +1,18 @@
+{
+  "title": "ReleaseBar",
+  "subtitle": "Open source release freshness across steipete and OpenClaw.",
+  "canonicalDomain": "release.bar",
+  "owners": [
+    {
+      "type": "user",
+      "login": "steipete"
+    },
+    {
+      "type": "org",
+      "login": "openclaw"
+    }
+  ],
+  "includeForks": false,
+  "includeArchived": false,
+  "excludeRepos": ["steipete/steipete"]
+}

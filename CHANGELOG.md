@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Updated project metadata and links for the renamed `steipete/ReleaseBar` repository.
 - Added a footer with Peter Steinberger, GitHub, and MIT license links.
 - Simplified the dev-mode toggle so the selected border carries the state without a duplicate checkbox glyph.
 - Show visible repository rows before release data finishes scanning, then progressively hydrate them.

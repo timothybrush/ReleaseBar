@@ -2,7 +2,9 @@
 
 Release freshness dashboard for public GitHub users and orgs.
 
-ReleaseBar tracks latest version, latest release date, commits since release, activity, stars, language, and quick search. Repositories without any GitHub releases are skipped unless unreleased repositories are explicitly included. Dev mode adds open issue counts, open PR counts, and latest CI status.
+ReleaseBar tracks public GitHub repository release health: latest version, release date, commits since release, activity, stars, language, topics, open work, and CI status. It serves cached dashboards for routes like `https://release.bar/steipete`, `https://release.bar/openclaw`, and `https://release.bar/microsoft`.
+
+Owner dashboards show visible public repositories immediately with lightweight repo metadata, then progressively hydrate release, commit, PR, and CI data in the background.
 
 ## Configure
 
@@ -11,6 +13,7 @@ Edit `releasebar.config.json`:
 - `owners`: GitHub users or orgs to scan
 - `includeForks`: include forked repositories
 - `includeArchived`: include archived repositories
+- `includeUnreleased`: include repositories without GitHub releases in static builds
 - `excludeRepos`: full `owner/name` entries to hide
 - `canonicalDomain`: primary public dashboard domain
 
@@ -20,13 +23,13 @@ Edit `releasebar.config.json`:
 npm run build
 ```
 
-Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token.
+Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token. Static builds read `releasebar.config.json`; the public service reads owner routes through the Worker API.
 
 ## Generic Dashboards
 
 - `/` loads `ReleaseBar Hot`, a cached board built from recently requested public dashboards
 - `/:owner` loads the Worker API for that owner
-- query options: `forks=true`, `archived=true`, `unreleased=true`
+- query options: `forks=true`, `archived=true`, `unreleased=false`
 - add public sources with `owners=openclaw,steipete` or `repos=owner/name`
 - the settings panel can add public users, orgs, or explicit repos to the current URL
 - custom URLs are capped at 8 added public sources
@@ -36,7 +39,18 @@ Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token
 - GitHub App installation gives ReleaseBar dedicated GitHub API quota for the selected account/repositories; public dashboards still fall back to the shared server token and cache
 - private repositories are ignored even when selected in GitHub App installation; ReleaseBar only stores and renders public repository metadata
 
-The Worker in `worker/index.ts` serves both the static app shell and the generic owner API. It validates public GitHub owners, progressively builds a capped public dashboard from the 200 most recently pushed public repositories per owner in 12-repository batches, stores dashboards and repo fragments in KV, serves fresh cache for 1h, serves stale or partial cache while revalidating, and builds the root hot board from existing cached dashboards. A Durable Object binding prevents repeated cold requests from stampeding GitHub. Configure `DASHBOARD_CACHE`, `DASHBOARD_LOCKS`, and `GITHUB_TOKEN` before deploying the Worker.
+## API And Cache
+
+The Worker in `worker/index.ts` serves both the static app shell and the generic owner API:
+
+- `GET /api/:owner` returns a cached dashboard for a public GitHub user or org
+- `GET /api/:owner/events` streams cache updates for progressive rebuilds
+- `GET /api/repos/:owner/:repo` returns repository detail stats
+- `GET /api/_discover` and `GET /api/_hot` power the root dashboard
+
+Dashboard builds validate public GitHub owners, scan up to the 200 most recently pushed public repositories per owner, and hydrate repositories in 12-repository batches. Dashboard payloads, repo fragments, hot boards, profile settings, and auth session data live in Cloudflare KV. A Durable Object binding (`DASHBOARD_LOCKS`) prevents repeated cold requests from stampeding GitHub.
+
+Fresh dashboard cache is served for about 1h. Stale or partial cache is shown while a background rebuild continues, so large owners can show useful rows before all release data finishes.
 
 ### GitHub App Login
 
@@ -62,3 +76,5 @@ wrangler deploy
 ```
 
 `wrangler.toml` binds `dist` as Worker static assets, `DASHBOARD_CACHE` as KV, and `DASHBOARD_LOCKS` as the Durable Object single-flight lock. The Worker runs first so `/api/*` stays dynamic and owner routes like `/openclaw` return the app shell with HTTP 200.
+
+The deployed Worker service is still named `releasedeck-api` in Cloudflare for continuity. The canonical product, repo, package, and config names are ReleaseBar / `releasebar`.

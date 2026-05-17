@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Refreshed README and agent notes for ReleaseBar routing, cache behavior, deploys, and renamed config.
 - Updated project metadata and links for the renamed `steipete/ReleaseBar` repository.
 - Added a footer with Peter Steinberger, GitHub, and MIT license links.
 - Simplified the dev-mode toggle so the selected border carries the state without a duplicate checkbox glyph.

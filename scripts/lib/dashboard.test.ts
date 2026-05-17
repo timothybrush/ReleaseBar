@@ -1860,6 +1860,204 @@ test("worker reports GitHub App installation coverage for signed-in users", asyn
   }
 });
 
+test("worker detects the signed-in user's GitHub App install with app auth fallback", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs1", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const sessionId = "session-app-fallback";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: kvStore({
+      [`auth:session:${sessionId}`]: JSON.stringify({
+        user: {
+          id: 1,
+          login: "steipete",
+          name: null,
+          avatarUrl: "https://avatars.githubusercontent.com/u/1",
+          url: "https://github.com/steipete",
+        },
+        accessToken: "user-token",
+        iat: exp - 600,
+        exp,
+      }),
+    }),
+    GITHUB_APP_CLIENT_ID: "Iv123",
+    GITHUB_APP_CLIENT_SECRET: "client-secret",
+    GITHUB_APP_ID: "123",
+    GITHUB_APP_PRIVATE_KEY: privateKey,
+    GITHUB_APP_SLUG: "releasebar-app",
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    const authorization = new Headers(init?.headers).get("authorization");
+    if (url.pathname === "/user/installations") {
+      return Response.json({ installations: [] });
+    }
+    if (url.pathname === "/app/installations") {
+      assert.match(authorization ?? "", /^Bearer [^.]+\.[^.]+\.[^.]+$/);
+      return Response.json([
+        {
+          id: 99,
+          account: {
+            login: "steipete",
+            type: "User",
+            avatar_url: "https://avatars.githubusercontent.com/u/1",
+            html_url: "https://github.com/steipete",
+          },
+          html_url: "https://github.com/settings/installations/99",
+          repository_selection: "all",
+          target_type: "User",
+        },
+        {
+          id: 100,
+          account: {
+            login: "someone-else",
+            type: "User",
+            avatar_url: "https://avatars.githubusercontent.com/u/2",
+            html_url: "https://github.com/someone-else",
+          },
+          html_url: "https://github.com/settings/installations/100",
+          repository_selection: "all",
+          target_type: "User",
+        },
+      ]);
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/me?returnTo=/steipete", {
+        headers: { cookie: `rd_session=${authCookie}` },
+      }),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.installNeeded, false);
+    assert.equal(body.installReason, null);
+    assert.deepEqual(
+      body.installations.map((installation: { accountLogin: string }) => installation.accountLogin),
+      ["steipete"],
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker does not prompt signed-in users to install the app for third-party repos", async () => {
+  const sessionId = "session-third-party";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: kvStore({
+      [`auth:session:${sessionId}`]: JSON.stringify({
+        user: {
+          id: 1,
+          login: "steipete",
+          name: null,
+          avatarUrl: "https://avatars.githubusercontent.com/u/1",
+          url: "https://github.com/steipete",
+        },
+        accessToken: "user-token",
+        iat: exp - 600,
+        exp,
+      }),
+    }),
+    GITHUB_APP_CLIENT_ID: "Iv123",
+    GITHUB_APP_CLIENT_SECRET: "client-secret",
+    GITHUB_APP_ID: "123",
+    GITHUB_APP_PRIVATE_KEY: "private-key",
+    GITHUB_APP_SLUG: "releasebar-app",
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/user/installations") {
+      return Response.json({ installations: [] });
+    }
+    if (url.pathname === "/app/installations") {
+      return Response.json([]);
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/me?returnTo=/-/f/prompts.chat", {
+        headers: { cookie: `rd_session=${authCookie}` },
+      }),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.installNeeded, false);
+    assert.match(body.installReason, /shared API quota unless f\/prompts\.chat installs/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker still prompts signed-in users to install the app for owner dashboards", async () => {
+  const sessionId = "session-owner-install";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: kvStore({
+      [`auth:session:${sessionId}`]: JSON.stringify({
+        user: {
+          id: 1,
+          login: "steipete",
+          name: null,
+          avatarUrl: "https://avatars.githubusercontent.com/u/1",
+          url: "https://github.com/steipete",
+        },
+        accessToken: "user-token",
+        iat: exp - 600,
+        exp,
+      }),
+    }),
+    GITHUB_APP_CLIENT_ID: "Iv123",
+    GITHUB_APP_CLIENT_SECRET: "client-secret",
+    GITHUB_APP_ID: "123",
+    GITHUB_APP_PRIVATE_KEY: "private-key",
+    GITHUB_APP_SLUG: "releasebar-app",
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/user/installations") {
+      return Response.json({ installations: [] });
+    }
+    if (url.pathname === "/app/installations") {
+      return Response.json([]);
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/me?returnTo=/openclaw", {
+        headers: { cookie: `rd_session=${authCookie}` },
+      }),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.installNeeded, true);
+    assert.match(body.installReason, /Install the GitHub App for @openclaw/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("worker remembers a just-completed GitHub App install while GitHub catches up", async () => {
   const { privateKey } = generateKeyPairSync("rsa", {
     modulusLength: 2048,

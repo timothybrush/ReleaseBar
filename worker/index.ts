@@ -604,7 +604,7 @@ async function meResponse(request: Request, env: Env): Promise<Response> {
     ? fallbackInstallations(session, liveInstallations)
     : [];
   const installations = session
-    ? mergeInstallations(liveInstallations ?? [], acknowledgedInstallations)
+    ? await resolvedInstallations(env, session, liveInstallations, acknowledgedInstallations)
     : [];
   if (record && liveInstallations && liveInstallations.length > 0) {
     await writeSessionRecord(env, record.id, {
@@ -614,6 +614,16 @@ async function meResponse(request: Request, env: Env): Promise<Response> {
         acknowledgedInstallations.length > 0
           ? record.session.installationsUpdatedAt
           : new Date().toISOString(),
+    });
+  } else if (
+    record &&
+    installations.length > 0 &&
+    JSON.stringify(record.session.installations ?? []) !== JSON.stringify(installations)
+  ) {
+    await writeSessionRecord(env, record.id, {
+      ...record.session,
+      installations,
+      installationsUpdatedAt: new Date().toISOString(),
     });
   } else if (
     record &&
@@ -628,7 +638,13 @@ async function meResponse(request: Request, env: Env): Promise<Response> {
     });
   }
   const coverage = session
-    ? sourceCoverage(installations, currentReturnTo(url), url.origin, appTokenConfigured(env))
+    ? sourceCoverage(
+        installations,
+        currentReturnTo(url),
+        url.origin,
+        appTokenConfigured(env),
+        session.user.login,
+      )
     : { needed: false, reason: null };
   const body: AuthPayload = {
     configured: authConfigured(env),
@@ -772,6 +788,55 @@ async function githubInstallations(accessToken: string): Promise<AuthInstallatio
   );
 }
 
+async function githubAppInstallationsForSession(
+  env: Env,
+  session: StoredAuthSession,
+): Promise<AuthInstallation[]> {
+  if (!appTokenConfigured(env)) return [];
+  const jwt = await githubAppJwt(env);
+  const accountLogin = session.user.login.toLowerCase();
+  const installations: AuthInstallation[] = [];
+  for (let page = 1; page <= 10; page += 1) {
+    const response = await workerFetch(
+      `https://api.github.com/app/installations?per_page=100&page=${page}`,
+      {
+        headers: {
+          accept: "application/vnd.github+json",
+          authorization: `Bearer ${jwt}`,
+          "user-agent": "ReleaseBar",
+          "x-github-api-version": "2022-11-28",
+        },
+      },
+    );
+    if (!response.ok) break;
+    const result = parseGitHubResponse(
+      v.array(gitHubInstallationSchema),
+      await response.json(),
+      "app installation list",
+    );
+    const batch = result;
+    for (const installation of batch) {
+      const account = installation.account;
+      if (!account || account.login.toLowerCase() !== accountLogin) continue;
+      const repositories =
+        installation.repository_selection === "selected"
+          ? await githubAppInstallationRepositories(env, installation.id)
+          : [];
+      installations.push({
+        id: installation.id,
+        accountLogin,
+        accountType: account.type === "Organization" ? "org" : "user",
+        accountUrl: account.html_url,
+        avatarUrl: account.avatar_url,
+        repositorySelection: installation.repository_selection,
+        repositories,
+      });
+    }
+    if (batch.length < 100) break;
+  }
+  return installations;
+}
+
 async function githubInstallationRepositories(
   accessToken: string,
   installationId: number,
@@ -823,6 +888,25 @@ function fallbackInstallations(
         (installation) => !liveInstallations.some((live) => live.id === installation.id),
       )
     : [];
+}
+
+async function resolvedInstallations(
+  env: Env,
+  session: StoredAuthSession,
+  liveInstallations: AuthInstallation[] | null,
+  acknowledgedInstallations = fallbackInstallations(session, liveInstallations),
+): Promise<AuthInstallation[]> {
+  const appInstallations =
+    liveInstallations &&
+    liveInstallations.some(
+      (installation) => installation.accountLogin === session.user.login.toLowerCase(),
+    )
+      ? []
+      : await githubAppInstallationsForSession(env, session).catch(() => []);
+  return mergeInstallations(liveInstallations ?? [], [
+    ...acknowledgedInstallations,
+    ...appInstallations,
+  ]);
 }
 
 function inferredInstallation(
@@ -1129,7 +1213,8 @@ async function requestInstallationToken(
   if (!appTokenConfigured(env)) return null;
   const session = await currentSession(request, env);
   if (!session) return null;
-  const installations = await githubInstallations(session.accessToken);
+  const liveInstallations = await githubInstallations(session.accessToken).catch(() => null);
+  const installations = await resolvedInstallations(env, session, liveInstallations);
   const installation = matchingInstallation(installations, sources);
   const token = installation ? await cachedInstallationToken(env, installation.id) : null;
   return token
@@ -1178,6 +1263,7 @@ function sourceCoverage(
   returnTo: string,
   origin: string,
   quotaConfigured: boolean,
+  viewerLogin?: string,
 ): { needed: boolean; reason: string | null } {
   const sources = returnToSources(returnTo, origin);
   if (!quotaConfigured) {
@@ -1223,6 +1309,13 @@ function sourceCoverage(
 
   if (uncoveredOwners.length > 0 || uncoveredRepos.length > 0) {
     const target = uncoveredOwners[0] ? `@${uncoveredOwners[0]}` : uncoveredRepos[0];
+    const account = (uncoveredOwners[0] ?? uncoveredRepos[0]?.split("/")[0] ?? "").toLowerCase();
+    if (uncoveredOwners.length === 0 && viewerLogin && account !== viewerLogin.toLowerCase()) {
+      return {
+        needed: false,
+        reason: `This dashboard uses shared API quota unless ${target} installs the GitHub App.`,
+      };
+    }
     return {
       needed: true,
       reason: `Install the GitHub App for ${target} to use dedicated API quota.`,
@@ -1232,27 +1325,19 @@ function sourceCoverage(
   return { needed: false, reason: null };
 }
 
-async function storedSessionCookie(env: Env, user: AuthUser, accessToken: string): Promise<string> {
+async function storedSessionCookie(env: Env, session: StoredAuthSession): Promise<string> {
   if (!env.AUTH_COOKIE_SECRET) {
     throw new Error("missing auth cookie secret");
   }
   if (!env.DASHBOARD_CACHE) {
     throw new Error("missing auth session storage");
   }
-  const now = Math.floor(Date.now() / 1000);
   const id = randomNonce();
-  const exp = now + sessionMaxAgeSeconds;
-  const stored: StoredAuthSession = {
-    user,
-    accessToken,
-    iat: now,
-    exp,
-  };
-  await env.DASHBOARD_CACHE.put(`auth:session:${id}`, JSON.stringify(stored), {
+  await env.DASHBOARD_CACHE.put(`auth:session:${id}`, JSON.stringify(session), {
     expirationTtl: sessionMaxAgeSeconds,
   });
-  const session = await signedJson(env.AUTH_COOKIE_SECRET, { id, exp });
-  return authCookie(session);
+  const token = await signedJson(env.AUTH_COOKIE_SECRET, { id, exp: session.exp });
+  return authCookie(token);
 }
 
 async function callbackResponse(request: Request, env: Env): Promise<Response> {
@@ -1272,13 +1357,26 @@ async function callbackResponse(request: Request, env: Env): Promise<Response> {
     }
     const accessToken = await exchangeCode(url, env);
     const user = await githubUser(accessToken);
-    const sessionCookieValue = await storedSessionCookie(env, user, accessToken);
-    const installations = await githubInstallations(accessToken).catch(() => []);
+    const now = Math.floor(Date.now() / 1000);
+    const session: StoredAuthSession = {
+      user,
+      accessToken,
+      iat: now,
+      exp: now + sessionMaxAgeSeconds,
+    };
+    const liveInstallations = await githubInstallations(accessToken).catch(() => null);
+    const installations = await resolvedInstallations(env, session, liveInstallations);
+    if (installations.length > 0) {
+      session.installations = installations;
+      session.installationsUpdatedAt = new Date().toISOString();
+    }
+    const sessionCookieValue = await storedSessionCookie(env, session);
     const coverage = sourceCoverage(
       installations,
       state.returnTo,
       url.origin,
       appTokenConfigured(env),
+      user.login,
     );
     if (coverage.needed) {
       const installReturn = await signedJson(env.AUTH_COOKIE_SECRET, {

@@ -476,6 +476,157 @@ test("worker serves escaped dotted repository detail paths as app shell", async 
   assert.match(html, /openclaw\/react\.dev · ReleaseBar/);
 });
 
+test("worker social cards include owner avatars and repository release metrics", async () => {
+  const generatedAt = new Date().toISOString();
+  const repoPayload: RepoDetailPayload = {
+    fullName: "acme/releasebar",
+    generatedAt,
+    cache: {
+      state: "fresh",
+      stale: false,
+      generatedAt,
+    },
+    project: testProject({
+      owner: "acme",
+      name: "releasebar",
+      description: "Release freshness for maintainers",
+      version: "v2.0.0",
+      commitsSinceRelease: 42,
+    }),
+    releases: [],
+    contributors: [],
+    commitActivity: [],
+    codeFrequency: [],
+    languages: [],
+  };
+  const env = {
+    DASHBOARD_CACHE: kvStore({
+      "repo-detail:v1:acme/releasebar": JSON.stringify(repoPayload),
+    }),
+  };
+
+  const repoResponse = await worker.fetch(
+    new Request("https://release.bar/og/acme%2Freleasebar.svg"),
+    env,
+    { waitUntil: () => undefined },
+  );
+  assert.equal(repoResponse.status, 200);
+  const repoSvg = await repoResponse.text();
+  assert.match(repoSvg, /acme\/releasebar/);
+  assert.match(repoSvg, /v2\.0\.0 · 42 commits since release/);
+  assert.match(repoSvg, /https:\/\/github\.com\/acme\.png\?size=240/);
+
+  const ownerResponse = await worker.fetch(
+    new Request("https://release.bar/og/openclaw.svg"),
+    env,
+    { waitUntil: () => undefined },
+  );
+  const ownerSvg = await ownerResponse.text();
+  assert.match(ownerSvg, /@openclaw/);
+  assert.match(ownerSvg, /https:\/\/github\.com\/openclaw\.png\?size=240/);
+
+  const coldStore = kvStore();
+  const originalFetch = globalThis.fetch;
+  const coldCalls: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    coldCalls.push(url.pathname);
+    assert.equal((init?.headers as Record<string, string>)?.authorization, "Bearer shared-token");
+    if (url.pathname === "/repos/cold/repo") {
+      return Response.json({
+        owner: { login: "cold" },
+        name: "repo",
+        full_name: "cold/repo",
+        private: false,
+        fork: false,
+        archived: false,
+        html_url: "https://github.com/cold/repo",
+        description: "Cold social repository",
+        default_branch: "main",
+        language: "TypeScript",
+        topics: [],
+        stargazers_count: 10,
+        forks_count: 1,
+        open_issues_count: 0,
+        pushed_at: "2026-05-16T12:00:00Z",
+        updated_at: "2026-05-16T12:00:00Z",
+      });
+    }
+    if (url.pathname === "/repos/cold/repo/releases") {
+      return Response.json([
+        {
+          tag_name: "v3.0.0",
+          name: "v3",
+          html_url: "https://github.com/cold/repo/releases/tag/v3.0.0",
+          draft: false,
+          prerelease: false,
+          published_at: "2026-05-16T12:00:00Z",
+        },
+      ]);
+    }
+    if (url.pathname === "/repos/cold/repo/compare/v3.0.0...main") {
+      return Response.json({
+        total_commits: 9,
+        html_url: "https://github.com/cold/repo/compare/v3.0.0...main",
+      });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const coldResponse = await worker.fetch(
+      new Request("https://release.bar/og/cold%2Frepo.svg"),
+      { DASHBOARD_CACHE: coldStore, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    const coldSvg = await coldResponse.text();
+    assert.match(coldSvg, /v3\.0\.0 · 9 commits since release/);
+    assert.deepEqual(coldCalls, [
+      "/repos/cold/repo",
+      "/repos/cold/repo/releases",
+      "/repos/cold/repo/compare/v3.0.0...main",
+    ]);
+    assert.notEqual(await coldStore.get("social-repo:v3:cold/repo"), null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const stalePayload: RepoDetailPayload = {
+    ...repoPayload,
+    fullName: "stale/repo",
+    generatedAt: new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString(),
+    project: testProject({
+      owner: "stale",
+      name: "repo",
+      version: "v9.9.9",
+      commitsSinceRelease: 7,
+    }),
+  };
+  const queued: Promise<unknown>[] = [];
+  let backgroundCalls = 0;
+  globalThis.fetch = async () => {
+    backgroundCalls += 1;
+    throw new Error("queued refresh only");
+  };
+  try {
+    const staleResponse = await worker.fetch(
+      new Request("https://release.bar/og/stale%2Frepo.svg"),
+      {
+        DASHBOARD_CACHE: kvStore({
+          "repo-detail:v1:stale/repo": JSON.stringify(stalePayload),
+        }),
+      },
+      { waitUntil: (promise) => queued.push(promise) },
+    );
+    const staleSvg = await staleResponse.text();
+    assert.match(staleSvg, /v9\.9\.9 · 7 commits since release/);
+    assert.equal(queued.length, 1);
+    await Promise.all(queued);
+    assert.equal(backgroundCalls > 0, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("worker serves cached GitHub discovery dashboards from repository search", async () => {
   const originalFetch = globalThis.fetch;
   const searchItems = Array.from({ length: 13 }, (_, index) => {

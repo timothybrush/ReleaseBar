@@ -128,6 +128,7 @@ const previousDashboardCachePrefix = `dashboard:v${previousDashboardSchemaVersio
 const dashboardCachePrefixes = [dashboardCachePrefix, previousDashboardCachePrefix];
 const hotCacheKey = `hot:v${auxiliaryCacheSchemaVersion}`;
 const hotIndexKey = `hot:index:v${auxiliaryCacheSchemaVersion}`;
+const socialRepoCachePrefix = `social-repo:v${auxiliaryCacheSchemaVersion}:`;
 const sessionCookie = "rd_session";
 const installReturnCookie = "rd_install_return";
 const sessionMaxAgeSeconds = 30 * 24 * 60 * 60;
@@ -185,6 +186,11 @@ type StoredBuildProgress = {
   scannedRepos: string[];
   projects: Project[];
   updatedAt: string;
+};
+
+type StoredSocialRepo = {
+  generatedAt: string;
+  project: Project;
 };
 
 type AuthState = {
@@ -538,16 +544,221 @@ function socialLabel(url: URL): string {
   return repos.length > 1 ? `custom deck +${repos.length}` : "ReleaseBar Hot";
 }
 
-function socialImage(label: string): Response {
-  const title = escapeHtml(label);
-  const titleSize = label.length > 24 ? 64 : label.length > 17 ? 82 : label.length > 12 ? 100 : 118;
+type SocialCard = {
+  title: string;
+  avatarUrl: string | null;
+  detail: string;
+  metric: string;
+};
+
+const socialNumberFormat = new Intl.NumberFormat("en", { notation: "compact" });
+
+function ownerAvatarUrl(owner: string, size = 240): string {
+  return `https://github.com/${encodeURIComponent(owner)}.png?size=${size}`;
+}
+
+function socialOwnerFromLabel(label: string): string | null {
+  const repo = validRepoSlug(label) ? label.split("/")[0] : null;
+  if (repo) return repo;
+  const owner = label.match(/^@([a-z\d](?:[a-z\d-]{0,37}[a-z\d])?)/i)?.[1];
+  return owner ? slugOwner(owner) : null;
+}
+
+function socialRepoMetric(project: Project | null): string {
+  if (!project) return "release freshness dashboard";
+  const commits =
+    project.commitsSinceRelease === null
+      ? "commits n/a"
+      : `${socialNumberFormat.format(project.commitsSinceRelease)} commits since release`;
+  return `${project.version} · ${commits}`;
+}
+
+function socialLine(value: string, maxLength: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function socialRepoCacheKey(owner: string, repo: string): string {
+  return `${socialRepoCachePrefix}${slugOwner(owner)}/${repo.toLowerCase()}`;
+}
+
+function socialRepoAgeMs(entry: StoredSocialRepo | null): number {
+  if (!entry) return Number.POSITIVE_INFINITY;
+  const generatedAt = Date.parse(entry.generatedAt);
+  return Number.isFinite(generatedAt) ? Date.now() - generatedAt : Number.POSITIVE_INFINITY;
+}
+
+async function readSocialRepo(
+  env: Env,
+  owner: string,
+  repo: string,
+): Promise<StoredSocialRepo | null> {
+  const raw = await env.DASHBOARD_CACHE?.get(socialRepoCacheKey(owner, repo));
+  const parsed = raw ? tryJsonParse<StoredSocialRepo>(raw, `social repo ${owner}/${repo}`) : null;
+  return parsed?.project?.fullName?.toLowerCase() === `${slugOwner(owner)}/${repo.toLowerCase()}`
+    ? parsed
+    : null;
+}
+
+async function writeSocialRepo(env: Env, project: Project): Promise<void> {
+  await env.DASHBOARD_CACHE?.put(
+    socialRepoCacheKey(project.owner, project.name),
+    JSON.stringify({
+      generatedAt: new Date().toISOString(),
+      project,
+    } satisfies StoredSocialRepo),
+    { expirationTtl: dashboardStorageTtlSeconds },
+  );
+}
+
+async function refreshSocialRepo(
+  owner: string,
+  repo: string,
+  request: Request,
+  env: Env,
+): Promise<void> {
+  const project = await buildSocialRepoProject(owner, repo, request, env);
+  if (project) {
+    await writeSocialRepo(env, project);
+  }
+}
+
+async function buildSocialRepoProject(
+  owner: string,
+  repoName: string,
+  request: Request,
+  env: Env,
+): Promise<Project | null> {
+  const fullName = `${slugOwner(owner)}/${repoName.toLowerCase()}`;
+  const requestToken = await requestInstallationToken(request, env, {
+    owners: [],
+    repos: [fullName],
+  }).catch(() => null);
+  const token = requestToken?.token ?? env.GITHUB_TOKEN ?? null;
+  const quotaSource = requestToken?.quotaSource ?? (env.GITHUB_TOKEN ? "shared" : "anonymous");
+  const quotaAccount = requestToken?.quotaAccount ?? null;
+  const onQuota = (_quota: ApiQuota) => undefined;
+  const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}`;
+  const repo = await detailGitHubJson(
+    path,
+    gitHubRepositorySchema,
+    "repository social card",
+    token,
+    quotaSource,
+    quotaAccount,
+    onQuota,
+  );
+  if (repo.private) return null;
+  const releases = await detailGitHubJson(
+    `${path}/releases?per_page=5`,
+    v.array(gitHubReleaseSchema),
+    "repository social card releases",
+    token,
+    quotaSource,
+    quotaAccount,
+    onQuota,
+  );
+  const latestRelease = releases.find((release) => !release.draft) ?? null;
+  const compare = latestRelease
+    ? await optionalRepoDetail(
+        detailGitHubJson(
+          `${path}/compare/${encodeURIComponent(latestRelease.tag_name)}...${encodeURIComponent(repo.default_branch)}`,
+          gitHubCompareSchema,
+          "repository social card compare",
+          token,
+          quotaSource,
+          quotaAccount,
+          onQuota,
+        ),
+        null,
+      )
+    : null;
+  const project = releaseProject(repo);
+  project.version = latestRelease?.tag_name ?? "unreleased";
+  project.releaseName = latestRelease?.name ?? null;
+  project.releaseUrl = latestRelease?.html_url ?? repo.html_url;
+  project.releaseDate = latestRelease?.published_at ?? null;
+  project.commitsSinceRelease = compare?.total_commits ?? null;
+  project.compareUrl = compare?.html_url ?? null;
+  project.freshness = freshnessForDetail(project.commitsSinceRelease);
+  return project;
+}
+
+async function socialRepoProject(
+  label: string,
+  request: Request,
+  env: Env,
+  context: ExecutionContext,
+): Promise<Project | null> {
+  if (!validRepoSlug(label)) return null;
+  const [owner, repo] = label.split("/");
+  if (!owner || !repo) return null;
+  const key = repoDetailCacheKey(owner, repo);
+  const cached = await readRepoDetail(env, key);
+  const ageMs = repoDetailAgeMs(cached);
+  if (cached && ageMs > repoDetailCacheTtlMs) {
+    context.waitUntil(refreshRepoDetail(key, owner, repo, request, env).catch(() => undefined));
+  }
+  if (cached && ageMs <= maxDisplayStaleMs) return cached.project;
+  const social = await readSocialRepo(env, owner, repo);
+  const socialAgeMs = socialRepoAgeMs(social);
+  if (social && socialAgeMs > repoDetailCacheTtlMs) {
+    context.waitUntil(refreshSocialRepo(owner, repo, request, env).catch(() => undefined));
+  }
+  if (social && socialAgeMs <= maxDisplayStaleMs) return social.project;
+  try {
+    const project = await buildSocialRepoProject(owner, repo, request, env);
+    if (project) {
+      await writeSocialRepo(env, project);
+    }
+    return project;
+  } catch {
+    return null;
+  }
+}
+
+async function socialCardForLabel(
+  label: string,
+  request: Request,
+  env: Env,
+  context: ExecutionContext,
+): Promise<SocialCard> {
+  const project = await socialRepoProject(label, request, env, context);
+  const owner = project?.owner ?? socialOwnerFromLabel(label);
+  return {
+    title: label,
+    avatarUrl: owner ? ownerAvatarUrl(owner) : null,
+    detail: project?.description ?? "Open source release freshness",
+    metric: socialRepoMetric(project),
+  };
+}
+
+function socialImage(card: SocialCard): Response {
+  const title = escapeHtml(socialLine(card.title, 42));
+  const detail = escapeHtml(socialLine(card.detail, 68));
+  const metric = escapeHtml(socialLine(card.metric, 58));
+  const avatar = card.avatarUrl ? escapeHtml(card.avatarUrl) : null;
+  const titleSize =
+    card.title.length > 34 ? 54 : card.title.length > 24 ? 66 : card.title.length > 17 ? 82 : 104;
+  const titleX = avatar ? 276 : 96;
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <clipPath id="avatarClip"><rect x="96" y="198" width="148" height="148" rx="28"/></clipPath>
+  </defs>
   <rect width="1200" height="630" fill="#080908"/>
   <path d="M0 124H1200M0 248H1200M0 372H1200M0 496H1200M160 0V630M400 0V630M640 0V630M880 0V630M1120 0V630" stroke="#182014" stroke-width="1"/>
   <rect x="72" y="70" width="1056" height="490" rx="0" fill="none" stroke="#8cff4b" stroke-width="2"/>
   <text x="96" y="148" fill="#a8ff6b" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="38" letter-spacing="0">ReleaseBar</text>
-  <text x="92" y="354" fill="#f2ffe9" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="${titleSize}" font-weight="700" letter-spacing="0">${title}</text>
-  <text x="96" y="444" fill="#8f9b89" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="34" letter-spacing="0">release freshness dashboard</text>
+  ${
+    avatar
+      ? `<rect x="96" y="198" width="148" height="148" rx="28" fill="#121b0f" stroke="#8cff4b" stroke-width="2"/>
+  <image x="96" y="198" width="148" height="148" href="${avatar}" preserveAspectRatio="xMidYMid slice" clip-path="url(#avatarClip)"/>`
+      : ""
+  }
+  <text x="${titleX}" y="318" fill="#f2ffe9" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="${titleSize}" font-weight="700" letter-spacing="0">${title}</text>
+  <text x="96" y="424" fill="#a8ff6b" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="34" font-weight="700" letter-spacing="0">${metric}</text>
+  <text x="96" y="474" fill="#8f9b89" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="28" letter-spacing="0">${detail}</text>
   <text x="96" y="506" fill="#52604d" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="24" letter-spacing="0">release.bar</text>
 </svg>`;
   return new Response(svg, {
@@ -3496,7 +3707,7 @@ async function routeRequest(
     const label = decodeURIComponent(url.pathname.replace(/^\/og\//, "").replace(/\.svg$/, ""));
     const title =
       label.startsWith("@") || label.includes("/") || !validOwnerSlug(label) ? label : `@${label}`;
-    return socialImage(title);
+    return socialImage(await socialCardForLabel(title, request, env, context));
   }
   if (url.pathname === "/api/me") {
     return meResponse(request, env);

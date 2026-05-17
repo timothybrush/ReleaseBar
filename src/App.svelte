@@ -795,6 +795,13 @@
     );
   }
 
+  function repositorySearchStatus(): string {
+    if (data?.cache?.progress?.done === false) return "release scan queued";
+    if (data?.cache?.message?.startsWith("release scan skipped")) return "release scan skipped";
+    if (data?.cache?.progress?.done === true) return "outside hot scan batch";
+    return "release not scanned";
+  }
+
   function buildCommands(
     projects: Project[],
     owners: string[],
@@ -1299,7 +1306,9 @@
               <a class="release-version" href={project.url} target="_blank" rel="noreferrer">
                 open repo
               </a>
-              <span>release not scanned</span>
+              <span class:scan-pending={data?.cache?.progress?.done === false}>
+                {repositorySearchStatus()}
+              </span>
             {:else}
               <strong>{absoluteDate(project.releaseDate)}</strong>
               <a

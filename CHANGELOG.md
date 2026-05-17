@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Clarified GitHub Hot release scan placeholders while background hydration is queued or skipped.
 - Added a stars table column, repository topic tags, clearer GitHub Hot placeholders, and automatic release scanning for the top Hot repositories.
 - Improved responsive table and settings controls, including a compact `since` header and centered settings close button.
 - Let fresh public dashboard API responses use a short edge cache and compact JSON payloads.

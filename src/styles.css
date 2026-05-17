@@ -1032,6 +1032,10 @@ body.dev-mode .table-head .since-heading .label-compact {
   color: var(--muted);
 }
 
+.release-cell .scan-pending {
+  color: var(--amber);
+}
+
 .error-message {
   margin: 0;
   padding: 18px;

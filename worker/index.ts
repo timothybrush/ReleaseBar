@@ -26,6 +26,7 @@ import {
   gitHubReleaseSchema,
   gitHubRepositorySchema,
   gitHubSearchRepositoryListSchema,
+  gitHubSearchCountSchema,
   hotIndexSchema,
   parseGitHubResponse,
   safeJsonParse,
@@ -44,6 +45,7 @@ import type {
   Owner,
   Project,
   RepoDetailPayload,
+  RepoDetailWorkTrend,
 } from "../src/types.js";
 
 type KVNamespace = {
@@ -95,9 +97,9 @@ type ExecutionContext = {
 };
 
 const fullTtlMs = 60 * 60 * 1000;
-const dashboardStorageTtlSeconds = 30 * 24 * 60 * 60;
-const progressTtlSeconds = 3 * 24 * 60 * 60;
-const maxDisplayStaleMs = 14 * 24 * 60 * 60 * 1000;
+const dashboardStorageTtlSeconds = 90 * 24 * 60 * 60;
+const progressTtlSeconds = 7 * 24 * 60 * 60;
+const maxDisplayStaleMs = 30 * 24 * 60 * 60 * 1000;
 const installationTokenTtlSeconds = 50 * 60;
 const installationAcknowledgementGraceMs = 15 * 60 * 1000;
 const coldBuildWaitMs = 15 * 1000;
@@ -2260,6 +2262,74 @@ async function detailGitHubCount(
   return Array.isArray(body) ? body.length : 0;
 }
 
+async function detailGitHubSearchCount(
+  query: string,
+  token: string | null,
+  quotaSource: ApiQuota["source"],
+  quotaAccount: string | null,
+  onQuota: (quota: ApiQuota) => void,
+): Promise<number> {
+  const result = await detailGitHubJson(
+    `/search/issues?q=${encodeURIComponent(query)}&per_page=1`,
+    gitHubSearchCountSchema,
+    "repository issue search",
+    token,
+    quotaSource,
+    quotaAccount,
+    onQuota,
+  );
+  return result.total_count ?? 0;
+}
+
+async function buildWorkTrend(
+  fullName: string,
+  token: string | null,
+  quotaSource: ApiQuota["source"],
+  quotaAccount: string | null,
+  onQuota: (quota: ApiQuota) => void,
+): Promise<RepoDetailWorkTrend> {
+  const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const repoQuery = `repo:${fullName}`;
+  const [issuesOpened30d, issuesClosed30d, pullRequestsOpened30d, pullRequestsClosed30d] =
+    await Promise.all([
+      detailGitHubSearchCount(
+        `${repoQuery} is:issue created:>=${since}`,
+        token,
+        quotaSource,
+        quotaAccount,
+        onQuota,
+      ),
+      detailGitHubSearchCount(
+        `${repoQuery} is:issue closed:>=${since}`,
+        token,
+        quotaSource,
+        quotaAccount,
+        onQuota,
+      ),
+      detailGitHubSearchCount(
+        `${repoQuery} is:pr created:>=${since}`,
+        token,
+        quotaSource,
+        quotaAccount,
+        onQuota,
+      ),
+      detailGitHubSearchCount(
+        `${repoQuery} is:pr closed:>=${since}`,
+        token,
+        quotaSource,
+        quotaAccount,
+        onQuota,
+      ),
+    ]);
+  return {
+    since,
+    issuesOpened30d,
+    issuesClosed30d,
+    pullRequestsOpened30d,
+    pullRequestsClosed30d,
+  };
+}
+
 function lastPageFromLink(link: string | null): number | null {
   if (!link) return null;
   const last = link
@@ -2310,7 +2380,7 @@ function releaseProject(repo: InferOutput<typeof gitHubRepositorySchema>): Proje
 }
 
 function repoDetailCacheKey(owner: string, repo: string): string {
-  return `repo-detail:v1:${slugOwner(owner)}/${repo.toLowerCase()}`;
+  return `repo-detail:v2:${slugOwner(owner)}/${repo.toLowerCase()}`;
 }
 
 async function readRepoDetail(env: Env, key: string): Promise<RepoDetailPayload | null> {
@@ -2472,7 +2542,7 @@ async function buildRepoDetail(
       )
     : null;
 
-  const [commitActivity, codeFrequency] = await Promise.all([
+  const [commitActivity, codeFrequency, workTrend] = await Promise.all([
     detailGitHubStats(
       `${path}/stats/commit_activity`,
       gitHubCommitActivitySchema,
@@ -2489,6 +2559,7 @@ async function buildRepoDetail(
       quotaAccount,
       onQuota,
     ),
+    buildWorkTrend(repo.full_name, token, quotaSource, quotaAccount, onQuota).catch(() => null),
   ]);
   const statsWarming = [commitActivity, codeFrequency].some((stat) => stat.state === "warming");
   const project = releaseProject(repo);
@@ -2551,6 +2622,7 @@ async function buildRepoDetail(
     languages: Object.entries(languages)
       .map(([name, bytes]) => ({ name, bytes }))
       .sort((a, b) => b.bytes - a.bytes),
+    workTrend,
   };
 }
 

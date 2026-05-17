@@ -78,6 +78,11 @@ export const gitHubSearchRepositoryListSchema = v.looseObject({
   message: v.optional(v.string()),
 });
 
+export const gitHubSearchCountSchema = v.looseObject({
+  total_count: v.optional(v.number()),
+  message: v.optional(v.string()),
+});
+
 export const gitHubRepositorySchema = v.looseObject({
   owner: v.looseObject({
     login: v.string(),

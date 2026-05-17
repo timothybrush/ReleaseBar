@@ -58,3 +58,11 @@ jobs:
           done
           curl -fsSL "https://release.bar${live_js}" >/dev/null
           curl -fsSL "https://release.bar${live_css}" >/dev/null
+      - name: Smoke release.bar routes
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://release.bar/?ship=${GITHUB_SHA}" >/dev/null
+          curl -fsSL "https://release.bar/steipete?ship=${GITHUB_SHA}" >/dev/null
+          curl -fsSL "https://release.bar/openclaw/openclaw?ship=${GITHUB_SHA}" >/dev/null
+          curl -fsSL "https://release.bar/api/_discover?period=week&ship=${GITHUB_SHA}" \
+            | node -e 'let body="";process.stdin.on("data",d=>body+=d);process.stdin.on("end",()=>{const json=JSON.parse(body); if (!Array.isArray(json.projects)) process.exit(1);})'

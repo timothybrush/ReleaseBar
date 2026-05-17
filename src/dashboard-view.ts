@@ -17,6 +17,9 @@ export const filterOptions: DashboardFilter[] = ["all", "attention", "hot", "bus
 export const attentionFreshness: Freshness[] = ["hot", "busy"];
 export const sortOptions: SortKey[] = ["repo", "stars", "release", "since", "activity"];
 export const devSortOptions: SortKey[] = ["issues", "prs", "ci"];
+const staleReleaseDays = 90;
+const pullRequestPressure = 10;
+const issuePressure = 100;
 
 const filterValues = new Set<string>(filterOptions);
 const sortValues = new Set<string>([...sortOptions, ...devSortOptions]);
@@ -43,7 +46,48 @@ export function sortLabel(value: SortKey): string {
 }
 
 export function needsAttention(project: Project): boolean {
-  return attentionFreshness.includes(project.freshness);
+  return attentionReasons(project).length > 0;
+}
+
+function isUnhydratedSearchProject(project: Project): boolean {
+  return (
+    project.version === "repo search" &&
+    project.releaseDate === null &&
+    project.commitsSinceRelease === null &&
+    project.compareUrl === null
+  );
+}
+
+export function attentionReasons(project: Project, now = Date.now()): string[] {
+  const reasons: string[] = [];
+  const unhydratedSearchProject = isUnhydratedSearchProject(project);
+  if (attentionFreshness.includes(project.freshness)) {
+    if (unhydratedSearchProject) {
+      reasons.push("release scan pending");
+    } else if (project.commitsSinceRelease !== null) {
+      reasons.push(`${project.commitsSinceRelease} commits since release`);
+    } else if (project.releaseDate) {
+      reasons.push("commits since release unknown");
+    }
+  }
+  if (project.releaseDate) {
+    const ageDays = Math.floor((now - Date.parse(project.releaseDate)) / 86400000);
+    if (Number.isFinite(ageDays) && ageDays >= staleReleaseDays) {
+      reasons.push(`last release ${ageDays} days ago`);
+    }
+  } else if (!unhydratedSearchProject) {
+    reasons.push("no GitHub release");
+  }
+  if (project.ciState === "failure" || project.ciState === "cancelled") {
+    reasons.push(`CI ${project.ciState === "failure" ? "failing" : "cancelled"}`);
+  }
+  if (project.openPullRequests >= pullRequestPressure) {
+    reasons.push(`${project.openPullRequests} open PRs`);
+  }
+  if (project.openIssues >= issuePressure) {
+    reasons.push(`${project.openIssues} open issues`);
+  }
+  return reasons;
 }
 
 export function parseViewState(

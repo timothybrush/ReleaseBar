@@ -15,6 +15,7 @@
     filterOptions,
     isDevSortKey,
     matchesFilter,
+    attentionReasons,
     needsAttention,
     parseViewState,
     sortLabel,
@@ -193,6 +194,8 @@
     (sum, language) => sum + language.bytes,
     0,
   );
+  $: releaseCadence = cadenceSummary(repoDetail?.releases ?? []);
+  $: workTrend = repoDetail?.workTrend ?? null;
 
   function ownerLabel(payload: DashboardPayload): string {
     if (initialRoute.isDefault) {
@@ -291,6 +294,45 @@
 
   function codeTotal(kind: "additions" | "deletions"): number {
     return (repoDetail?.codeFrequency ?? []).reduce((sum, week) => sum + week[kind], 0);
+  }
+
+  function median(values: number[]): number | null {
+    const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
+    if (sorted.length === 0) return null;
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0
+      ? Math.round(((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2)
+      : Math.round(sorted[middle] ?? 0);
+  }
+
+  function cadenceSummary(releases: RepoDetailPayload["releases"]): {
+    medianDays: number | null;
+    latestGapDays: number | null;
+    releaseCount: number;
+  } {
+    const dates = releases
+      .map((release) => (release.publishedAt ? Date.parse(release.publishedAt) : Number.NaN))
+      .filter(Number.isFinite)
+      .sort((a, b) => b - a);
+    const gaps = dates
+      .slice(0, -1)
+      .map((date, index) => Math.round((date - (dates[index + 1] ?? date)) / 86400000))
+      .filter((days) => days >= 0);
+    return {
+      medianDays: median(gaps),
+      latestGapDays: gaps[0] ?? null,
+      releaseCount: dates.length,
+    };
+  }
+
+  function formatDays(value: number | null): string {
+    if (value === null) return "n/a";
+    return `${numberFormat.format(value)}d`;
+  }
+
+  function attentionText(project: Project): string {
+    const reasons = attentionReasons(project).slice(0, 3);
+    return reasons.length > 0 ? reasons.join(" · ") : "looks okay";
   }
 
   function matchesBase(
@@ -815,6 +857,31 @@
     language = activeLanguage(nextLanguage) ? "" : nextLanguage;
   }
 
+  function focusSearch(): void {
+    document.querySelector<HTMLInputElement>(".prompt input")?.focus();
+  }
+
+  async function copyDashboardUrl(): Promise<void> {
+    await navigator.clipboard?.writeText(location.href);
+  }
+
+  function rowActivationTarget(event: Event): HTMLElement | null {
+    return (event.target as HTMLElement | null)?.closest("a, button, input, label") ?? null;
+  }
+
+  function rowClick(event: MouseEvent, fullName: string): void {
+    if (event.defaultPrevented || rowActivationTarget(event)) return;
+    location.assign(repoDetailPath(fullName));
+  }
+
+  function rowKeydown(event: KeyboardEvent, fullName: string): void {
+    if (event.defaultPrevented) return;
+    if (rowActivationTarget(event)) return;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    location.assign(repoDetailPath(fullName));
+  }
+
   function setTopicSearch(topic: string): void {
     query = query.trim().toLowerCase() === topic.toLowerCase() ? "" : topic;
   }
@@ -1003,6 +1070,14 @@
         keywords: ["home", "root", "hot", "discover", "trending"],
         onRun: () => location.assign("/"),
       },
+      ...discoverPeriods.map((period) => ({
+        actionId: `dashboard:discover:${period.value}`,
+        title: `Open ${period.label}`,
+        subTitle: period.value === "releasebar" ? "cached ReleaseBar dashboards" : "GitHub Hot",
+        group: "Dashboards",
+        keywords: ["hot", "discover", "trending", period.value, period.label],
+        onRun: () => location.assign(discoverHref(period.value)),
+      })),
       {
         actionId: "dashboard:releasebar",
         title: "Open ReleaseBar Hot",
@@ -1017,6 +1092,22 @@
       ...filterOptions.map(filterCommand),
       ...sortOptions.map(sortCommand),
       ...(devEnabled ? devSortOptions.map(sortCommand) : []),
+      {
+        actionId: "view:search",
+        title: "Focus search",
+        subTitle: "filter visible rows",
+        group: "View",
+        keywords: ["search", "find", "filter"],
+        onRun: focusSearch,
+      },
+      {
+        actionId: "view:copy-url",
+        title: "Copy dashboard URL",
+        subTitle: "share current filters",
+        group: "View",
+        keywords: ["copy", "share", "url", "link"],
+        onRun: () => void copyDashboardUrl(),
+      },
       {
         actionId: "view:dev",
         title: `${devEnabled ? "Disable" : "Enable"} dev columns`,
@@ -1272,6 +1363,14 @@
       <div>
         <strong>dashboard</strong>
         <p>{settingsSummary}</p>
+        <p class="profile-badge">
+          {publicProfile
+            ? `public profile config · saved by @${publicProfile.updatedBy}`
+            : canEditPublicDefault
+              ? "public profile config · not saved yet"
+              : "local view settings"}
+        </p>
+        <p class="public-note">Only public GitHub repositories are listed, stored, and selectable.</p>
         <p class="connection-status">{connectionStatus}</p>
         <form class="source-form" onsubmit={handleSourceSubmit}>
           <input
@@ -1335,7 +1434,14 @@
   {#if repoRoute}
     <section class="repo-detail" aria-label="Repository detail">
       {#if errorMessage}
-        <p class="error-message">{errorMessage}</p>
+        <div class="error-state">
+          <span class="loading-kicker">repository unavailable</span>
+          <strong>{errorMessage}</strong>
+          <small>ReleaseBar only reads public GitHub metadata. Connected GitHub App quota can make public repo refreshes more reliable.</small>
+          {#if auth?.configured && !auth.user}
+            <button type="button" onclick={login}>Connect GitHub</button>
+          {/if}
+        </div>
       {:else if !repoDetail}
         <div class="loading-state" aria-live="polite">
           <span class="loading-kicker">fetching repository</span>
@@ -1375,6 +1481,11 @@
               <span class="panel-kicker">open work</span>
               <strong>{numberFormat.format(repoDetail.project.openIssues + repoDetail.project.openPullRequests)}</strong>
               <small>{repoDetail.project.openIssues} issues · {repoDetail.project.openPullRequests} PRs</small>
+            </div>
+            <div>
+              <span class="panel-kicker">cadence</span>
+              <strong>{formatDays(releaseCadence.medianDays)}</strong>
+              <small>median release gap · {releaseCadence.releaseCount} recent releases</small>
             </div>
           </section>
 
@@ -1431,6 +1542,7 @@
                 <span class="panel-kicker">releases</span>
                 <h2>latest versions</h2>
               </div>
+              <strong>{formatDays(releaseCadence.latestGapDays)}</strong>
             </div>
             <div class="release-list">
               {#each repoDetail.releases.slice(0, 6) as release}
@@ -1441,6 +1553,41 @@
                 </a>
               {/each}
             </div>
+          </section>
+
+          <section class="detail-panel">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-kicker">open work trend</span>
+                <h2>last 30 days</h2>
+              </div>
+            </div>
+            {#if workTrend}
+              <div class="work-trend">
+                <div>
+                  <span>issues opened</span>
+                  <strong>{numberFormat.format(workTrend.issuesOpened30d)}</strong>
+                  <i style={`width: ${percent(workTrend.issuesOpened30d, Math.max(workTrend.issuesOpened30d, workTrend.issuesClosed30d, 1))}%`}></i>
+                </div>
+                <div>
+                  <span>issues closed</span>
+                  <strong>{numberFormat.format(workTrend.issuesClosed30d)}</strong>
+                  <i style={`width: ${percent(workTrend.issuesClosed30d, Math.max(workTrend.issuesOpened30d, workTrend.issuesClosed30d, 1))}%`}></i>
+                </div>
+                <div>
+                  <span>PRs opened</span>
+                  <strong>{numberFormat.format(workTrend.pullRequestsOpened30d)}</strong>
+                  <i style={`width: ${percent(workTrend.pullRequestsOpened30d, Math.max(workTrend.pullRequestsOpened30d, workTrend.pullRequestsClosed30d, 1))}%`}></i>
+                </div>
+                <div>
+                  <span>PRs merged/closed</span>
+                  <strong>{numberFormat.format(workTrend.pullRequestsClosed30d)}</strong>
+                  <i style={`width: ${percent(workTrend.pullRequestsClosed30d, Math.max(workTrend.pullRequestsOpened30d, workTrend.pullRequestsClosed30d, 1))}%`}></i>
+                </div>
+              </div>
+            {:else}
+              <p class="detail-empty">Issue and PR trend data is warming or unavailable.</p>
+            {/if}
           </section>
 
           <section class="detail-panel">
@@ -1508,27 +1655,46 @@
       </button>
     </div>
     <div class="metrics">
-      <div>
+      <button
+        class="metric-action"
+        class:active={sortKey === "repo"}
+        type="button"
+        aria-pressed={sortKey === "repo"}
+        onclick={() => setSort("repo")}
+      >
         <span>{numberFormat.format(visibleProjects.length)}</span>
         <small>repos</small>
-      </div>
-      <div>
+      </button>
+      <button
+        class="metric-action"
+        class:active={sortKey === "release"}
+        type="button"
+        aria-pressed={sortKey === "release"}
+        onclick={() => setSort("release")}
+      >
         <span>{numberFormat.format(visibleProjects.filter((project) => project.releaseDate).length)}</span>
         <small>released</small>
-      </div>
-      <div>
+      </button>
+      <button
+        class="metric-action"
+        class:active={sortKey === "since"}
+        type="button"
+        aria-pressed={sortKey === "since"}
+        onclick={() => setSort("since")}
+      >
         <span>
           {numberFormat.format(
             visibleProjects.reduce((sum, project) => sum + (project.commitsSinceRelease || 0), 0),
           )}
         </span>
         <small>commits since release</small>
-      </div>
+      </button>
       <button
         class="metric-action"
         class:active={filter === "attention"}
         type="button"
         aria-pressed={filter === "attention"}
+        title="Show repositories with unreleased commits, stale releases, failed CI, or open-work pressure"
         onclick={() => (filter = filter === "attention" ? "all" : "attention")}
       >
         <span>{numberFormat.format(visibleProjects.filter(needsAttention).length)}</span>
@@ -1572,7 +1738,14 @@
     </div>
     <div class="projects">
       {#if errorMessage}
-        <p class="error-message">{errorMessage}</p>
+        <div class="error-state">
+          <span class="loading-kicker">dashboard unavailable</span>
+          <strong>{errorMessage}</strong>
+          <small>Unknown owners, cold caches, and GitHub rate limits can all land here. Connecting GitHub gives ReleaseBar dedicated App quota for dashboards you can access.</small>
+          {#if auth?.configured && !auth.user}
+            <button type="button" onclick={login}>Connect GitHub</button>
+          {/if}
+        </div>
       {:else if dashboardFetching}
         <div class="loading-state" aria-live="polite">
           <span class="loading-kicker">fetching dashboard</span>
@@ -1593,12 +1766,40 @@
       {:else}
         {#if dashboardUpdating}
           <div class="partial-state" aria-live="polite">
-            <span>cached rows visible</span>
+            <span>cached rows visible · background update running</span>
             <strong>{data?.cache?.message ?? "combined dashboard updating"}</strong>
+            {#if data?.cache?.progress}
+              <div
+                class="scan-meter"
+                aria-label={`Scanned ${data.cache.progress.scanned} of ${data.cache.progress.limit ?? data.cache.repoLimit ?? data.cache.progress.scanned} repositories`}
+              >
+                <i
+                  style={`width: ${percent(
+                    data.cache.progress.scanned,
+                    data.cache.progress.limit ?? data.cache.repoLimit ?? data.cache.progress.scanned,
+                  )}%`}
+                ></i>
+              </div>
+              <small>
+                scanned {numberFormat.format(data.cache.progress.scanned)}
+                {#if data.cache.progress.limit}
+                  /{numberFormat.format(data.cache.progress.limit)}
+                {/if}
+                repositories; rows update automatically as GitHub responds
+              </small>
+            {/if}
           </div>
           {/if}
         {#each filteredProjects as project (project.fullName)}
-        <article class="project" data-freshness={project.freshness}>
+        <div
+          class="project"
+          data-freshness={project.freshness}
+          role="link"
+          tabindex="0"
+          aria-label={`${project.fullName}: ${attentionText(project)}`}
+          onclick={(event) => rowClick(event, project.fullName)}
+          onkeydown={(event) => rowKeydown(event, project.fullName)}
+        >
           <div class="repo-cell">
             <div class="repo-title">
               {#if showProjectOwnerAvatars}
@@ -1657,6 +1858,12 @@
               {#if project.archived}<span class="tag muted">archived</span>{/if}
               <span class="tag">{project.freshness}</span>
             </div>
+            {#if attentionReasons(project).length > 0}
+              <p class="attention-reasons">
+                <span>needs attention</span>
+                {attentionText(project)}
+              </p>
+            {/if}
           </div>
           <div class="stars-cell">
             <strong>{numberFormat.format(project.stars)}</strong>
@@ -1715,7 +1922,7 @@
               <span>{project.ciWorkflow || relativeDate(project.ciRunDate)}</span>
             {/if}
           </div>
-        </article>
+        </div>
         {/each}
       {/if}
     </div>

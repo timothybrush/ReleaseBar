@@ -181,6 +181,14 @@ export type RepoDetailLanguage = {
   bytes: number;
 };
 
+export type RepoDetailWorkTrend = {
+  since: string;
+  issuesOpened30d: number;
+  issuesClosed30d: number;
+  pullRequestsOpened30d: number;
+  pullRequestsClosed30d: number;
+};
+
 export type RepoDetailPayload = {
   fullName: string;
   generatedAt: string;
@@ -197,4 +205,5 @@ export type RepoDetailPayload = {
   commitActivity: RepoDetailWeek[];
   codeFrequency: RepoDetailCodeWeek[];
   languages: RepoDetailLanguage[];
+  workTrend: RepoDetailWorkTrend | null;
 };

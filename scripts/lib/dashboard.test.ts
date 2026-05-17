@@ -24,6 +24,8 @@ import {
   workersDevApiOrigin,
 } from "../../src/routing.js";
 import {
+  attentionReasons,
+  needsAttention,
   parseViewState,
   sortProjects,
   viewStateSearch,
@@ -324,6 +326,87 @@ test("dashboard project sorting handles dev issue and pull request counts numeri
   );
 });
 
+test("need attention explains release debt, stale releases, CI, and open work", () => {
+  const stale = testProject({
+    owner: "owner",
+    name: "stale",
+    releaseDate: "2026-01-01T00:00:00Z",
+  });
+  const pressured = testProject({
+    owner: "owner",
+    name: "pressure",
+    commitsSinceRelease: 42,
+    freshness: "hot",
+    ciState: "failure",
+    openPullRequests: 12,
+    openIssues: 120,
+  });
+
+  assert.equal(needsAttention(stale), true);
+  assert.deepEqual(attentionReasons(stale, Date.parse("2026-05-15T00:00:00Z")), [
+    "last release 134 days ago",
+  ]);
+  assert.equal(needsAttention(pressured), true);
+  assert.deepEqual(attentionReasons(pressured), [
+    "42 commits since release",
+    "CI failing",
+    "12 open PRs",
+    "120 open issues",
+  ]);
+  assert.equal(
+    attentionReasons(
+      testProject({ owner: "owner", name: "fresh" }),
+      Date.parse("2026-05-15T00:00:00Z"),
+    ).length,
+    0,
+  );
+  assert.deepEqual(
+    attentionReasons(
+      testProject({
+        owner: "owner",
+        name: "placeholder",
+        version: "repo search",
+        releaseDate: null,
+        commitsSinceRelease: null,
+        compareUrl: null,
+        freshness: "warm",
+      }),
+      Date.parse("2026-05-15T00:00:00Z"),
+    ),
+    [],
+  );
+  assert.deepEqual(
+    attentionReasons(
+      testProject({
+        owner: "owner",
+        name: "hot-placeholder",
+        version: "repo search",
+        releaseDate: null,
+        commitsSinceRelease: null,
+        compareUrl: null,
+        freshness: "hot",
+      }),
+      Date.parse("2026-05-15T00:00:00Z"),
+    ),
+    ["release scan pending"],
+  );
+  assert.deepEqual(
+    attentionReasons(
+      testProject({
+        owner: "owner",
+        name: "unreleased",
+        version: "unreleased",
+        releaseDate: null,
+        commitsSinceRelease: null,
+        compareUrl: null,
+        freshness: "hot",
+      }),
+      Date.parse("2026-05-15T00:00:00Z"),
+    ),
+    ["no GitHub release"],
+  );
+});
+
 test("worker builds root hot dashboard from cached dashboards", async () => {
   const alphaKey = dashboardCacheKey({ owner: "alpha", includeUnreleased: true, schemaVersion: 5 });
   const betaKey = dashboardCacheKey({ owner: "beta", includeUnreleased: true, schemaVersion: 5 });
@@ -502,10 +585,11 @@ test("worker social cards include owner avatars and repository release metrics",
     commitActivity: [],
     codeFrequency: [],
     languages: [],
+    workTrend: null,
   };
   const env = {
     DASHBOARD_CACHE: kvStore({
-      "repo-detail:v1:acme/releasebar": JSON.stringify(repoPayload),
+      "repo-detail:v2:acme/releasebar": JSON.stringify(repoPayload),
     }),
   };
 
@@ -616,7 +700,7 @@ test("worker social cards include owner avatars and repository release metrics",
       new Request("https://release.bar/og/stale%2Frepo.svg"),
       {
         DASHBOARD_CACHE: kvStore({
-          "repo-detail:v1:stale/repo": JSON.stringify(stalePayload),
+          "repo-detail:v2:stale/repo": JSON.stringify(stalePayload),
         }),
       },
       { waitUntil: (promise) => queued.push(promise) },
@@ -962,6 +1046,21 @@ test("worker builds cached repository detail with releases and stats", async () 
     if (path === "/repos/acme/releasebar/stats/code_frequency") {
       return Response.json([[1778889600, 120, -20]]);
     }
+    if (path === "/search/issues") {
+      const query = url.searchParams.get("q") ?? "";
+      if (query.includes("is:issue") && query.includes("created:>=")) {
+        return Response.json({ total_count: 5 });
+      }
+      if (query.includes("is:issue") && query.includes("closed:>=")) {
+        return Response.json({ total_count: 3 });
+      }
+      if (query.includes("is:pr") && query.includes("created:>=")) {
+        return Response.json({ total_count: 4 });
+      }
+      if (query.includes("is:pr") && query.includes("closed:>=")) {
+        return Response.json({ total_count: 2 });
+      }
+    }
     throw new Error(`unexpected fetch ${url.pathname}`);
   };
   const env = {
@@ -988,6 +1087,8 @@ test("worker builds cached repository detail with releases and stats", async () 
     assert.equal(body.commitActivity[0]?.total, 7);
     assert.equal(body.codeFrequency[0]?.additions, 120);
     assert.equal(body.codeFrequency[0]?.deletions, 20);
+    assert.equal(body.workTrend?.issuesOpened30d, 5);
+    assert.equal(body.workTrend?.pullRequestsClosed30d, 2);
     assert.deepEqual(
       body.languages.map((language) => language.name),
       ["TypeScript", "CSS"],
@@ -999,7 +1100,7 @@ test("worker builds cached repository detail with releases and stats", async () 
       { waitUntil: () => undefined },
     );
     assert.equal(cached.status, 200);
-    assert.equal(calls, 10);
+    assert.equal(calls, 14);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1022,6 +1123,7 @@ test("worker throttles cached warming repository detail refreshes", async () => 
     commitActivity: [],
     codeFrequency: [],
     languages: [],
+    workTrend: null,
   };
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input) => {
@@ -1032,7 +1134,7 @@ test("worker throttles cached warming repository detail refreshes", async () => 
       new Request("https://release.bar/api/repos/acme/warmbar"),
       {
         DASHBOARD_CACHE: kvStore({
-          "repo-detail:v1:acme/warmbar": JSON.stringify(payload),
+          "repo-detail:v2:acme/warmbar": JSON.stringify(payload),
         }),
         GITHUB_TOKEN: "shared-token",
       },
@@ -1041,6 +1143,44 @@ test("worker throttles cached warming repository detail refreshes", async () => 
     assert.equal(response.status, 202);
     const body = (await response.json()) as RepoDetailPayload;
     assert.equal(body.cache.state, "warming");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker rejects private repository detail payloads", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/repos/acme/private") {
+      return Response.json({
+        owner: { login: "acme" },
+        name: "private",
+        full_name: "acme/private",
+        private: true,
+        html_url: "https://github.com/acme/private",
+        description: null,
+        default_branch: "main",
+        language: null,
+        topics: [],
+        stargazers_count: 0,
+        forks_count: 0,
+        open_issues_count: 0,
+        pushed_at: "2026-05-16T12:00:00Z",
+        updated_at: "2026-05-16T12:00:00Z",
+      });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/private"),
+      { DASHBOARD_CACHE: kvStore(), GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    const body = (await response.json()) as { error?: string };
+    assert.equal(response.status, 502);
+    assert.match(body.error ?? "", /private repositories are not visible/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1283,6 +1423,70 @@ test("worker does not cache repository detail when optional calls are rate limit
       { waitUntil: () => undefined },
     );
     assert.equal(response.status, 429);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker keeps repository detail when work trend search is rate limited", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    const path = url.pathname;
+    if (path === "/repos/acme/trendbar") {
+      return Response.json({
+        owner: { login: "acme" },
+        name: "trendbar",
+        full_name: "acme/trendbar",
+        private: false,
+        fork: false,
+        archived: false,
+        html_url: "https://github.com/acme/trendbar",
+        description: "Trend dashboard",
+        default_branch: "main",
+        language: "TypeScript",
+        topics: [],
+        stargazers_count: 20,
+        forks_count: 1,
+        open_issues_count: 0,
+        pushed_at: "2026-05-16T12:00:00Z",
+        updated_at: "2026-05-16T12:00:00Z",
+      });
+    }
+    if (path === "/repos/acme/trendbar/releases") return Response.json([]);
+    if (path === "/repos/acme/trendbar/contributors") return Response.json([]);
+    if (path === "/repos/acme/trendbar/languages") return Response.json({});
+    if (path === "/repos/acme/trendbar/commits/main") {
+      return Response.json({
+        sha: "1234567890",
+        commit: { committer: { date: "2026-05-16T12:00:00Z" } },
+      });
+    }
+    if (path === "/repos/acme/trendbar/pulls") return Response.json([]);
+    if (path === "/repos/acme/trendbar/commits/1234567890/check-runs") {
+      return Response.json({ check_runs: [] });
+    }
+    if (path === "/repos/acme/trendbar/stats/commit_activity") return Response.json([]);
+    if (path === "/repos/acme/trendbar/stats/code_frequency") return Response.json([]);
+    if (path === "/search/issues") {
+      return Response.json(
+        { message: "API rate limit exceeded" },
+        { status: 403, headers: { "x-ratelimit-remaining": "0" } },
+      );
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const cache = kvStore();
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/trendbar"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as RepoDetailPayload;
+    assert.equal(body.workTrend, null);
+    assert.notEqual(await cache.get("repo-detail:v2:acme/trendbar"), null);
   } finally {
     globalThis.fetch = originalFetch;
   }

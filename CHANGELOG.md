@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added clearer public dashboard profile state, public-only settings copy, need-attention reasons, scan progress, richer repo detail cadence/work trends, command actions, mobile row cards, longer stale cache retention, and broader deploy smoke checks.
 - Refreshed README and agent notes for ReleaseBar routing, cache behavior, deploys, and renamed config.
 - Updated project metadata and links for the renamed `steipete/ReleaseBar` repository.
 - Added a footer with Peter Steinberger, GitHub, and MIT license links.

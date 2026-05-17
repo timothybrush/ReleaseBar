@@ -32,12 +32,15 @@ Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token
 - query options: `forks=true`, `archived=true`, `unreleased=false`
 - add public sources with `owners=openclaw,steipete` or `repos=owner/name`
 - the settings panel can add public users, orgs, or explicit repos to the current URL
+- signed-in dashboard owners can save added public sources and local visibility as the public default for their clean owner route
 - custom URLs are capped at 8 added public sources
 - settings can hide visible owners or repos locally without changing the shared cache
 - GitHub App login uses `/api/auth/login`, `/api/auth/callback`, `/api/auth/install`, `/api/auth/logout`, and `/api/me`
 - `Connect GitHub` signs the user in, checks GitHub App installations, and sends them to install the app when the current dashboard source is not covered
 - GitHub App installation gives ReleaseBar dedicated GitHub API quota for the selected account/repositories; public dashboards still fall back to the shared server token and cache
 - private repositories are ignored even when selected in GitHub App installation; ReleaseBar only stores and renders public repository metadata
+- the need-attention metric filters repos with unreleased commits, stale releases, failing/cancelled CI, or issue/PR pressure and rows show the reason inline
+- repository detail pages include release cadence, recent releases, contributors, languages, commit/churn charts, and 30-day issue/PR trend counts when GitHub provides them
 
 ## API And Cache
 
@@ -50,7 +53,7 @@ The Worker in `worker/index.ts` serves both the static app shell and the generic
 
 Dashboard builds validate public GitHub owners, scan up to the 200 most recently pushed public repositories per owner, and hydrate repositories in 12-repository batches. Dashboard payloads, repo fragments, hot boards, profile settings, and auth session data live in Cloudflare KV. A Durable Object binding (`DASHBOARD_LOCKS`) prevents repeated cold requests from stampeding GitHub.
 
-Fresh dashboard cache is served for about 1h. Stale or partial cache is shown while a background rebuild continues, so large owners can show useful rows before all release data finishes.
+Fresh dashboard cache is served for about 1h. Stale or partial cache is shown while a background rebuild continues, so large owners can show useful rows before all release data finishes. Dashboard records are retained longer than the fresh window so older public data can remain visible during GitHub outages or rate limits, with the UI marking stale/partial state.
 
 ### GitHub App Login
 
@@ -75,6 +78,6 @@ npm run build
 wrangler deploy
 ```
 
-`wrangler.toml` binds `dist` as Worker static assets, `DASHBOARD_CACHE` as KV, and `DASHBOARD_LOCKS` as the Durable Object single-flight lock. The Worker runs first so `/api/*` stays dynamic and owner routes like `/openclaw` return the app shell with HTTP 200.
+`wrangler.toml` binds `dist` as Worker static assets, `DASHBOARD_CACHE` as KV, and `DASHBOARD_LOCKS` as the Durable Object single-flight lock. The Worker runs first so `/api/*` stays dynamic and owner routes like `/openclaw` return the app shell with HTTP 200. Deploy CI smokes the root page, an owner page, a repository detail page, the discovery API, and live JS/CSS asset hashes after Wrangler deploys.
 
 The deployed Worker service is still named `releasedeck-api` in Cloudflare for continuity. The canonical product, repo, package, and config names are ReleaseBar / `releasebar`.

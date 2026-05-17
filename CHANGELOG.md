@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Kept the GitHub App menu state stable immediately after installation while GitHub installation data catches up.
 - Added repo detail breadcrumbs back to the owner dashboard.
 - Improved repository commit graph hover states with styled, keyboard-accessible tooltips.
 - Added repository detail pages with cached releases, contributors, language mix, commit graphs, and churn stats.

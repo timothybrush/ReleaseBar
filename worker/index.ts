@@ -16,6 +16,7 @@ import {
   gitHubCommitSchema,
   gitHubCompareSchema,
   gitHubContributorSchema,
+  gitHubInstallationSchema,
   gitHubInstallationListSchema,
   gitHubInstallationRepositoryListSchema,
   gitHubInstallationTokenSchema,
@@ -98,6 +99,7 @@ const dashboardStorageTtlSeconds = 30 * 24 * 60 * 60;
 const progressTtlSeconds = 3 * 24 * 60 * 60;
 const maxDisplayStaleMs = 14 * 24 * 60 * 60 * 1000;
 const installationTokenTtlSeconds = 50 * 60;
+const installationAcknowledgementGraceMs = 15 * 60 * 1000;
 const coldBuildWaitMs = 15 * 1000;
 const progressiveBuildBudgetMs = 25 * 1000;
 const progressWriteIntervalMs = 1100;
@@ -199,6 +201,8 @@ type StoredAuthSession = {
   accessToken: string;
   iat: number;
   exp: number;
+  installations?: AuthInstallation[];
+  installationsUpdatedAt?: string;
 };
 
 function isPublicInstallationRepository(repo: GitHubInstallationRepository): boolean {
@@ -358,6 +362,14 @@ function authUrls(
 }
 
 async function currentSession(request: Request, env: Env): Promise<StoredAuthSession | null> {
+  const record = await currentSessionRecord(request, env);
+  return record?.session ?? null;
+}
+
+async function currentSessionRecord(
+  request: Request,
+  env: Env,
+): Promise<{ id: string | null; session: StoredAuthSession } | null> {
   if (!env.AUTH_COOKIE_SECRET) return null;
   const token = parseCookies(request).get(sessionCookie);
   if (!token) return null;
@@ -368,11 +380,13 @@ async function currentSession(request: Request, env: Env): Promise<StoredAuthSes
   if (stored) {
     const session = safeJsonParse(storedAuthSessionSchema, stored, "auth session");
     if (!session) return null;
-    return session.exp < Math.floor(Date.now() / 1000) ? null : session;
+    return session.exp < Math.floor(Date.now() / 1000) ? null : { id: pointer.id, session };
   }
 
   const legacy = pointer as unknown as StoredAuthSession;
-  return legacy.user && legacy.exp >= Math.floor(Date.now() / 1000) ? legacy : null;
+  return legacy.user && legacy.exp >= Math.floor(Date.now() / 1000)
+    ? { id: null, session: legacy }
+    : null;
 }
 
 function ownerListFromUrl(url: URL, primaryOwner?: string): string[] {
@@ -579,10 +593,38 @@ function redirectResponse(
 
 async function meResponse(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  const session = await currentSession(request, env);
-  const installations = session
-    ? await githubInstallations(session.accessToken).catch(() => [])
+  const record = await currentSessionRecord(request, env);
+  const session = record?.session ?? null;
+  const liveInstallations = session
+    ? await githubInstallations(session.accessToken).catch(() => null)
+    : null;
+  const acknowledgedInstallations = session
+    ? fallbackInstallations(session, liveInstallations)
     : [];
+  const installations = session
+    ? mergeInstallations(liveInstallations ?? [], acknowledgedInstallations)
+    : [];
+  if (record && liveInstallations && liveInstallations.length > 0) {
+    await writeSessionRecord(env, record.id, {
+      ...record.session,
+      installations,
+      installationsUpdatedAt:
+        acknowledgedInstallations.length > 0
+          ? record.session.installationsUpdatedAt
+          : new Date().toISOString(),
+    });
+  } else if (
+    record &&
+    liveInstallations &&
+    installations.length === 0 &&
+    (record.session.installations?.length ?? 0) > 0
+  ) {
+    await writeSessionRecord(env, record.id, {
+      ...record.session,
+      installations: [],
+      installationsUpdatedAt: new Date().toISOString(),
+    });
+  }
   const coverage = session
     ? sourceCoverage(installations, currentReturnTo(url), url.origin, appTokenConfigured(env))
     : { needed: false, reason: null };
@@ -747,6 +789,173 @@ async function githubInstallationRepositories(
     if (batch.length < 100) break;
   }
   return repositories;
+}
+
+function mergeInstallations(
+  liveInstallations: AuthInstallation[],
+  acknowledgedInstallations: AuthInstallation[] = [],
+): AuthInstallation[] {
+  const merged = new Map<number, AuthInstallation>();
+  for (const installation of acknowledgedInstallations) {
+    merged.set(installation.id, installation);
+  }
+  for (const installation of liveInstallations) {
+    merged.set(installation.id, installation);
+  }
+  return [...merged.values()];
+}
+
+function fallbackInstallations(
+  session: StoredAuthSession,
+  liveInstallations: AuthInstallation[] | null,
+): AuthInstallation[] {
+  const acknowledged = session.installations ?? [];
+  if (acknowledged.length === 0) return [];
+  if (!liveInstallations) return acknowledged;
+  const acknowledgedAt = Date.parse(session.installationsUpdatedAt ?? "");
+  const recentlyAcknowledged =
+    Number.isFinite(acknowledgedAt) &&
+    Date.now() - acknowledgedAt <= installationAcknowledgementGraceMs;
+  return recentlyAcknowledged
+    ? acknowledged.filter(
+        (installation) => !liveInstallations.some((live) => live.id === installation.id),
+      )
+    : [];
+}
+
+function inferredInstallation(
+  installationId: number,
+  returnTo: string,
+  origin: string,
+  session: StoredAuthSession,
+): AuthInstallation {
+  const sources = returnToSources(returnTo, origin);
+  const accounts = sourceAccounts(sources);
+  const accountLogin = (accounts[0] ?? session.user.login).toLowerCase();
+  return {
+    id: installationId,
+    accountLogin,
+    accountType: accountLogin === session.user.login.toLowerCase() ? "user" : "org",
+    accountUrl: `https://github.com/${accountLogin}`,
+    avatarUrl: accountLogin === session.user.login.toLowerCase() ? session.user.avatarUrl : "",
+    repositorySelection: "selected",
+    repositories: sources.repos.filter((repo) => repo.split("/")[0] === accountLogin),
+  };
+}
+
+async function githubAppInstallation(
+  env: Env,
+  installationId: number,
+): Promise<AuthInstallation | null> {
+  if (!appTokenConfigured(env)) return null;
+  const jwt = await githubAppJwt(env);
+  const response = await workerFetch(`https://api.github.com/app/installations/${installationId}`, {
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${jwt}`,
+      "user-agent": "ReleaseBar",
+      "x-github-api-version": "2022-11-28",
+    },
+  });
+  if (!response.ok) return null;
+  const installation = parseGitHubResponse(
+    gitHubInstallationSchema,
+    await response.json(),
+    "app installation",
+  );
+  const account = installation.account;
+  if (!account) return null;
+  const repositories =
+    installation.repository_selection === "selected"
+      ? await githubAppInstallationRepositories(env, installationId)
+      : [];
+  return {
+    id: installation.id,
+    accountLogin: account.login.toLowerCase(),
+    accountType: account.type === "Organization" ? "org" : "user",
+    accountUrl: account.html_url,
+    avatarUrl: account.avatar_url,
+    repositorySelection: installation.repository_selection,
+    repositories,
+  };
+}
+
+async function githubAppInstallationRepositories(
+  env: Env,
+  installationId: number,
+): Promise<string[]> {
+  const token = await cachedInstallationToken(env, installationId);
+  if (!token) return [];
+  const repositories: string[] = [];
+  for (let page = 1; page <= 10; page += 1) {
+    const response = await workerFetch(
+      `https://api.github.com/installation/repositories?per_page=100&page=${page}`,
+      {
+        headers: {
+          accept: "application/vnd.github+json",
+          authorization: `Bearer ${token}`,
+          "user-agent": "ReleaseBar",
+          "x-github-api-version": "2022-11-28",
+        },
+      },
+    );
+    if (!response.ok) break;
+    const result = parseGitHubResponse(
+      gitHubInstallationRepositoryListSchema,
+      await response.json(),
+      "app installation repositories",
+    );
+    const batch = result.repositories ?? [];
+    repositories.push(
+      ...batch.filter(isPublicInstallationRepository).map((repo) => repo.full_name.toLowerCase()),
+    );
+    if (batch.length < 100) break;
+  }
+  return repositories;
+}
+
+async function writeSessionRecord(
+  env: Env,
+  id: string | null,
+  session: StoredAuthSession,
+): Promise<void> {
+  if (!id || !env.DASHBOARD_CACHE) return;
+  const ttl = Math.max(1, session.exp - Math.floor(Date.now() / 1000));
+  await env.DASHBOARD_CACHE.put(`auth:session:${id}`, JSON.stringify(session), {
+    expirationTtl: ttl,
+  });
+}
+
+async function acknowledgedInstallations(
+  request: Request,
+  env: Env,
+  returnTo: string,
+  installationId: number | null,
+): Promise<AuthInstallation[]> {
+  const record = await currentSessionRecord(request, env);
+  if (!record) return [];
+  const liveInstallations = await githubInstallations(record.session.accessToken).catch(() => []);
+  const acknowledged: AuthInstallation[] = [];
+  if (
+    installationId &&
+    !liveInstallations.some((installation) => installation.id === installationId)
+  ) {
+    const appInstallation = await githubAppInstallation(env, installationId).catch(() => null);
+    acknowledged.push(
+      appInstallation ??
+        inferredInstallation(installationId, returnTo, new URL(request.url).origin, record.session),
+    );
+  }
+  const installations = mergeInstallations(liveInstallations, [
+    ...(record.session.installations ?? []),
+    ...acknowledged,
+  ]);
+  await writeSessionRecord(env, record.id, {
+    ...record.session,
+    installations,
+    installationsUpdatedAt: new Date().toISOString(),
+  });
+  return installations;
 }
 
 function appTokenConfigured(env: Env): boolean {
@@ -1112,10 +1321,18 @@ async function installResponse(request: Request, env: Env): Promise<Response> {
   if (url.searchParams.has("installation_id") || url.searchParams.has("setup_action")) {
     const token = parseCookies(request).get(installReturnCookie);
     const state = token ? await verifySignedJson<AuthState>(env.AUTH_COOKIE_SECRET, token) : null;
-    const returnTo =
-      state && Math.floor(Date.now() / 1000) - state.iat <= stateMaxAgeSeconds
-        ? state.returnTo
-        : "/";
+    const stateIsFresh =
+      state !== null && Math.floor(Date.now() / 1000) - state.iat <= stateMaxAgeSeconds;
+    const returnTo = stateIsFresh ? state.returnTo : "/";
+    const installationId = Number(url.searchParams.get("installation_id"));
+    if (stateIsFresh) {
+      await acknowledgedInstallations(
+        request,
+        env,
+        returnTo,
+        Number.isFinite(installationId) ? installationId : null,
+      );
+    }
     return redirectResponse(returnTo, {
       "set-cookie": installReturnCookieValue("", 0),
     });

@@ -166,11 +166,23 @@ const authUserSchema = v.object({
   url: v.string(),
 });
 
+const authInstallationSchema = v.object({
+  id: v.number(),
+  accountLogin: v.string(),
+  accountType: v.picklist(["user", "org"]),
+  accountUrl: v.string(),
+  avatarUrl: v.string(),
+  repositorySelection: v.picklist(["all", "selected"]),
+  repositories: v.array(v.string()),
+});
+
 export const storedAuthSessionSchema = v.object({
   user: authUserSchema,
   accessToken: v.string(),
   iat: v.number(),
   exp: v.number(),
+  installations: v.optional(v.array(authInstallationSchema)),
+  installationsUpdatedAt: v.optional(v.string()),
 });
 
 export const hotIndexSchema = v.array(v.string());

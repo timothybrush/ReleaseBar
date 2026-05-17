@@ -1,6 +1,8 @@
 export type Owner = {
   type: "user" | "org";
   login: string;
+  avatarUrl?: string;
+  url?: string;
 };
 
 export type ReleaseBarConfig = {

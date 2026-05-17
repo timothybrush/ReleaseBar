@@ -43,6 +43,8 @@ type ProjectCache = {
 type GitHubOwner = {
   login: string;
   type?: "User" | "Organization";
+  avatar_url?: string;
+  html_url?: string;
 };
 
 type GitHubRepo = {
@@ -843,6 +845,8 @@ export async function resolveOwnerType(
   return {
     login: result.login,
     type: result.type === "Organization" ? "org" : "user",
+    avatarUrl: result.avatar_url,
+    url: result.html_url ?? `https://github.com/${result.login}`,
   };
 }
 

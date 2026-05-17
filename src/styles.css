@@ -169,6 +169,38 @@ h1 {
   letter-spacing: 0;
 }
 
+.hero-owner-title {
+  display: inline-flex;
+  align-items: center;
+  gap: clamp(12px, 1.8vw, 20px);
+  min-width: 0;
+}
+
+.hero-owner-link {
+  display: inline-flex;
+  align-items: center;
+  gap: clamp(12px, 1.8vw, 20px);
+  min-width: 0;
+}
+
+.hero-owner-link:hover,
+.hero-owner-link:focus-visible {
+  color: var(--text);
+}
+
+.hero-owner-avatar {
+  width: clamp(56px, 7vw, 88px);
+  height: clamp(56px, 7vw, 88px);
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, var(--green) 44%, var(--line-strong));
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.45),
+    0 0 34px rgba(156, 255, 87, 0.12);
+  object-fit: cover;
+}
+
 .status {
   position: relative;
   display: flex;

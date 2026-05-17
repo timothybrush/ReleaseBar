@@ -9,6 +9,7 @@ import {
   freshness,
   GitHubRateLimitError,
   normalizeBuildOptions,
+  resolveOwnerType,
   validOwnerSlug,
   validRepoSlug,
 } from "./dashboard.js";
@@ -2902,6 +2903,28 @@ test("owner slugs match public GitHub login rules", () => {
   assert.equal(validOwnerSlug("bad_owner"), false);
   assert.equal(validRepoSlug("steipete/oracle"), true);
   assert.equal(validRepoSlug("bad_owner/oracle"), false);
+});
+
+test("owner resolution keeps GitHub profile identity", async () => {
+  const owner = await resolveOwnerType("OpenClaw", {
+    fetch: async (input) => {
+      const url = new URL(String(input));
+      assert.equal(url.pathname, "/users/openclaw");
+      return Response.json({
+        login: "OpenClaw",
+        type: "Organization",
+        avatar_url: "https://avatars.githubusercontent.com/u/123",
+        html_url: "https://github.com/openclaw",
+      });
+    },
+  });
+
+  assert.deepEqual(owner, {
+    type: "org",
+    login: "OpenClaw",
+    avatarUrl: "https://avatars.githubusercontent.com/u/123",
+    url: "https://github.com/openclaw",
+  });
 });
 
 test("repo filtering respects forks, archived repos, private repos, and excludes", () => {

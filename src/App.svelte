@@ -37,6 +37,7 @@
     ApiQuota,
     AuthPayload,
     DashboardPayload,
+    Owner,
     Project,
     RepoDetailPayload,
   } from "./types.js";
@@ -102,6 +103,8 @@
   const discoverLanguages = ["TypeScript", "Python", "Rust", "Go", "Swift"];
 
   $: label = repoRoute ? (repoDetail?.fullName ?? repoRoute.fullName) : data ? ownerLabel(data) : initialRoute.label;
+  $: heroOwner = ownerHero(data);
+  $: heroExtraCount = initialRoute.extraOwners.length + initialRoute.repos.length;
   $: subtitle = repoRoute
     ? (repoDetail?.project.description ?? "Repository release and activity detail.")
     : data?.subtitle ?? "Release debt across recently requested public dashboards.";
@@ -204,6 +207,19 @@
     return initialRoute.repos.length > 1
       ? `custom deck +${initialRoute.repos.length}`
       : initialRoute.label;
+  }
+
+  function ownerHero(payload: DashboardPayload | null): Owner | null {
+    if (repoRoute || initialRoute.isDefault || !initialRoute.owner) return null;
+    return payload?.owners[0] ?? null;
+  }
+
+  function ownerAvatarUrl(owner: Owner): string {
+    return owner.avatarUrl ?? `https://github.com/${encodeURIComponent(owner.login)}.png?size=160`;
+  }
+
+  function ownerGitHubUrl(owner: Owner): string {
+    return owner.url ?? `https://github.com/${encodeURIComponent(owner.login)}`;
   }
 
   function daysAgo(value: string | null): number | null {
@@ -1106,7 +1122,28 @@
           </a>
         {/if}
       </nav>
-      <h1>{label}</h1>
+      <h1>
+        {#if heroOwner}
+          <span class="hero-owner-title">
+            <a class="hero-owner-link" href={ownerGitHubUrl(heroOwner)} target="_blank" rel="noreferrer">
+              <img
+                class="hero-owner-avatar"
+                src={ownerAvatarUrl(heroOwner)}
+                alt=""
+                width="88"
+                height="88"
+                loading="eager"
+              />
+              <span>@{heroOwner.login}</span>
+            </a>
+            {#if heroExtraCount > 0}
+              <span>+{heroExtraCount}</span>
+            {/if}
+          </span>
+        {:else}
+          {label}
+        {/if}
+      </h1>
       <p class="subtitle">
         {#if subtitleOwner}
           Release freshness for

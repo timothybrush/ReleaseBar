@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added GitHub owner avatars to owner dashboard hero headings.
 - Added pointer cursors to account menu entries.
 - Reduced oversized dashboard and repository detail headline typography.
 - Fixed GitHub App install detection for signed-in users and stopped prompting installs for unrelated third-party repos.

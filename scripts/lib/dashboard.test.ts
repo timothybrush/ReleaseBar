@@ -477,6 +477,27 @@ test("worker serves escaped dotted repository detail paths as app shell", async 
 
 test("worker serves cached GitHub discovery dashboards from repository search", async () => {
   const originalFetch = globalThis.fetch;
+  const searchItems = Array.from({ length: 13 }, (_, index) => {
+    const name = index === 0 ? "releasebar" : `releasebar-${index + 1}`;
+    return {
+      name,
+      full_name: `acme/${name}`,
+      private: false,
+      fork: false,
+      archived: false,
+      html_url: `https://github.com/acme/${name}`,
+      description: "Release dashboard",
+      default_branch: "main",
+      language: "TypeScript",
+      topics: ["releases", "dashboard"],
+      stargazers_count: 1200 - index,
+      forks_count: 42,
+      open_issues_count: 7,
+      pushed_at: "2026-05-16T12:00:00Z",
+      updated_at: "2026-05-16T12:00:00Z",
+      owner: { login: "acme" },
+    };
+  });
   let searchCalls = 0;
   let repoCalls = 0;
   globalThis.fetch = async (input, init) => {
@@ -489,28 +510,9 @@ test("worker serves cached GitHub discovery dashboards from repository search", 
       assert.equal((init?.headers as Record<string, string>)?.authorization, "Bearer shared-token");
       return Response.json(
         {
-          total_count: 2,
+          total_count: searchItems.length,
           incomplete_results: false,
-          items: [
-            {
-              name: "releasebar",
-              full_name: "acme/releasebar",
-              private: false,
-              fork: false,
-              archived: false,
-              html_url: "https://github.com/acme/releasebar",
-              description: "Release dashboard",
-              default_branch: "main",
-              language: "TypeScript",
-              topics: ["releases", "dashboard"],
-              stargazers_count: 1200,
-              forks_count: 42,
-              open_issues_count: 7,
-              pushed_at: "2026-05-16T12:00:00Z",
-              updated_at: "2026-05-16T12:00:00Z",
-              owner: { login: "acme" },
-            },
-          ],
+          items: searchItems,
         },
         {
           headers: {
@@ -523,13 +525,15 @@ test("worker serves cached GitHub discovery dashboards from repository search", 
       );
     }
     repoCalls += 1;
-    if (url.pathname === "/repos/acme/releasebar") {
+    const repoMatch = url.pathname.match(/^\/repos\/acme\/([^/]+)$/);
+    if (repoMatch) {
+      const repoName = repoMatch[1] ?? "releasebar";
       return Response.json({
         owner: { login: "acme" },
-        name: "releasebar",
-        full_name: "acme/releasebar",
+        name: repoName,
+        full_name: `acme/${repoName}`,
         description: "Release dashboard",
-        html_url: "https://github.com/acme/releasebar",
+        html_url: `https://github.com/acme/${repoName}`,
         default_branch: "main",
         language: "TypeScript",
         topics: ["releases", "dashboard"],
@@ -543,7 +547,7 @@ test("worker serves cached GitHub discovery dashboards from repository search", 
         private: false,
       });
     }
-    if (url.pathname === "/repos/acme/releasebar/releases") {
+    if (url.pathname.match(/^\/repos\/acme\/[^/]+\/releases$/)) {
       return Response.json([
         {
           tag_name: "v1.2.3",
@@ -554,22 +558,22 @@ test("worker serves cached GitHub discovery dashboards from repository search", 
         },
       ]);
     }
-    if (url.pathname === "/repos/acme/releasebar/commits/main") {
+    if (url.pathname.match(/^\/repos\/acme\/[^/]+\/commits\/main$/)) {
       return Response.json({
         sha: "abcdef123456",
         commit: { committer: { date: "2026-05-16T12:00:00Z" } },
       });
     }
-    if (url.pathname === "/repos/acme/releasebar/compare/v1.2.3...main") {
+    if (url.pathname.match(/^\/repos\/acme\/[^/]+\/compare\/v1\.2\.3\.\.\.main$/)) {
       return Response.json({
         total_commits: 5,
         html_url: "https://github.com/acme/releasebar/compare/v1.2.3...main",
       });
     }
-    if (url.pathname === "/repos/acme/releasebar/pulls") {
+    if (url.pathname.match(/^\/repos\/acme\/[^/]+\/pulls$/)) {
       return Response.json([{}]);
     }
-    if (url.pathname === "/repos/acme/releasebar/commits/abcdef123456/check-runs") {
+    if (url.pathname.match(/^\/repos\/acme\/[^/]+\/commits\/abcdef123456\/check-runs$/)) {
       return Response.json({ check_runs: [] });
     }
     throw new Error(`unexpected fetch ${url.pathname}`);
@@ -600,6 +604,7 @@ test("worker serves cached GitHub discovery dashboards from repository search", 
     assert.equal(body.projects[0]?.openIssues, 7);
     assert.equal(body.cache?.state, "partial");
     assert.equal(body.cache?.progress?.done, false);
+    assert.equal(body.cache?.progress?.limit, searchItems.length);
     assert.equal(body.cache?.quota?.remaining, 4999);
     assert.match(body.cache?.message ?? "", /repository search/);
 
@@ -614,6 +619,11 @@ test("worker serves cached GitHub discovery dashboards from repository search", 
     const hydrated = (await second.json()) as DashboardPayload;
     assert.equal(hydrated.cache?.state, "fresh");
     assert.equal(hydrated.cache?.progress?.done, true);
+    assert.equal(hydrated.cache?.progress?.scanned, searchItems.length);
+    assert.equal(
+      hydrated.projects.filter((project) => project.version === "repo search").length,
+      0,
+    );
     assert.equal(hydrated.projects[0]?.version, "v1.2.3");
     assert.equal(hydrated.projects[0]?.commitsSinceRelease, 5);
     assert.equal(hydrated.projects[0]?.openPullRequests, 1);
@@ -637,7 +647,7 @@ test("worker does not rehydrate completed GitHub discovery cache", async () => {
   ]);
   const env = {
     DASHBOARD_CACHE: kvStore({
-      "discover:v3:week:all": JSON.stringify({
+      "discover:v4:week:all": JSON.stringify({
         ...cached,
         title: "GitHub Hot",
         owners: [],
@@ -1169,7 +1179,7 @@ test("worker falls back to stale discovery cache when GitHub search is rate limi
   const cached = testDashboard("cached", [testProject({ owner: "cached", name: "repo" })]);
   const env = {
     DASHBOARD_CACHE: kvStore({
-      "discover:v3:week:all": JSON.stringify({
+      "discover:v4:week:all": JSON.stringify({
         ...cached,
         title: "GitHub Hot",
         owners: [],

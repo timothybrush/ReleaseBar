@@ -113,7 +113,7 @@ const hotSourceLimit = 24;
 const hotIndexLimit = 100;
 const hotCacheTtlMs = 5 * 60 * 1000;
 const discoverLimit = 40;
-const discoverHydrateLimit = 12;
+const discoverHydrateLimit = discoverLimit;
 const discoverCacheTtlMs = 60 * 60 * 1000;
 const repoDetailCacheTtlMs = 6 * 60 * 60 * 1000;
 const repoDetailWarmingRefreshMs = 5 * 60 * 1000;
@@ -121,6 +121,7 @@ const maxCustomSources = 8;
 const dashboardSchemaVersion = 5;
 const previousDashboardSchemaVersion = 4;
 const auxiliaryCacheSchemaVersion = 3;
+const discoverCacheSchemaVersion = 4;
 const dashboardCachePrefix = `dashboard:v${dashboardSchemaVersion}:`;
 const previousDashboardCachePrefix = `dashboard:v${previousDashboardSchemaVersion}:`;
 const dashboardCachePrefixes = [dashboardCachePrefix, previousDashboardCachePrefix];
@@ -1783,7 +1784,7 @@ function discoverLanguage(url: URL): string {
 }
 
 function discoverCacheKey(period: DiscoverPeriod, language: string): string {
-  return `discover:v${auxiliaryCacheSchemaVersion}:${period}:${language.trim().toLowerCase() || "all"}`;
+  return `discover:v${discoverCacheSchemaVersion}:${period}:${language.trim().toLowerCase() || "all"}`;
 }
 
 function discoverSince(period: DiscoverPeriod): string {
@@ -2536,7 +2537,7 @@ async function discoverPayload(
         limit: Math.min(discoverHydrateLimit, projects.length),
         done: false,
       },
-      message: "repository search loaded; scanning release data for top repositories",
+      message: "repository search loaded; scanning release data for all visible repositories",
     },
     totals: dashboardTotals(projects),
     projects,
@@ -2608,7 +2609,7 @@ async function hydrateDiscoverPayload(
         limit: scanned,
         done: true,
       },
-      message: `release data scanned for top ${scanned} repositories`,
+      message: `release data scanned for ${scanned} repositories`,
     },
     totals: dashboardTotals(projects),
     projects,
@@ -2664,7 +2665,7 @@ async function discoverResponse(env: Env, url: URL, context: ExecutionContext): 
     if (discoverNeedsHydration(cached)) {
       context.waitUntil(hydrateDiscoverCache(key, cached, env).catch(() => undefined));
       return jsonResponse(
-        withCacheState(cached, "partial", "scanning release data for top repositories"),
+        withCacheState(cached, "partial", "scanning release data for all visible repositories"),
         200,
         { "cache-control": "no-store" },
       );

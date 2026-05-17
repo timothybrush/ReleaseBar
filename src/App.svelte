@@ -1400,16 +1400,20 @@
                 <h2>last year</h2>
               </div>
             </div>
-            <div class="churn-meter">
-              <div>
-                <span>additions</span>
-                <strong>{numberFormat.format(codeTotal("additions"))}</strong>
+            {#if repoDetail.codeFrequency.length > 0}
+              <div class="churn-meter">
+                <div>
+                  <span>additions</span>
+                  <strong>{numberFormat.format(codeTotal("additions"))}</strong>
+                </div>
+                <div>
+                  <span>deletions</span>
+                  <strong>{numberFormat.format(codeTotal("deletions"))}</strong>
+                </div>
               </div>
-              <div>
-                <span>deletions</span>
-                <strong>{numberFormat.format(codeTotal("deletions"))}</strong>
-              </div>
-            </div>
+            {:else}
+              <p class="detail-empty">Code-frequency stats are still warming or unavailable.</p>
+            {/if}
           </section>
         </div>
       {/if}

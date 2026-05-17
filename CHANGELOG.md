@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Reduced oversized dashboard and repository detail headline typography.
 - Fixed GitHub App install detection for signed-in users and stopped prompting installs for unrelated third-party repos.
 - Made the account menu size to its content and softened oversized dashboard headlines.
 - Added obvious GitHub, release, issue, and PR links to repository detail pages.

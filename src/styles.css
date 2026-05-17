@@ -164,8 +164,8 @@ a:hover {
 
 h1 {
   margin: 0;
-  font-size: clamp(32px, 5vw, 72px);
-  line-height: 0.95;
+  font-size: clamp(30px, 4.5vw, 64px);
+  line-height: 1;
   letter-spacing: 0;
 }
 

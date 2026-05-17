@@ -17,6 +17,8 @@ import {
   ownerDashboardPath,
   optionsFromSearch,
   ownerFromPath,
+  repoDetailPath,
+  repoFromPath,
   workerApiOrigin,
   workersDevApiOrigin,
 } from "../../src/routing.js";
@@ -26,7 +28,7 @@ import {
   viewStateSearch,
   type DashboardViewState,
 } from "../../src/dashboard-view.js";
-import type { DashboardPayload, Project } from "../../src/types.js";
+import type { DashboardPayload, Project, RepoDetailPayload } from "../../src/types.js";
 import worker, { DashboardBuildLock } from "../../worker/index.js";
 
 const textEncoder = new TextEncoder();
@@ -155,6 +157,24 @@ test("owner route parsing keeps root hot board and owners API-backed", () => {
   assert.equal(ownerFromPath("/OpenClaw"), "OpenClaw");
   assert.equal(ownerFromPath("/bad_owner"), null);
   assert.equal(ownerDashboardPath("@Steipete"), "/steipete");
+  assert.deepEqual(repoFromPath("/OpenClaw/Peekaboo"), {
+    owner: "openclaw",
+    repo: "peekaboo",
+    fullName: "openclaw/peekaboo",
+    apiPath: `${workerApiOrigin}/api/repos/openclaw/peekaboo`,
+    fallbackApiPath: `${workersDevApiOrigin}/api/repos/openclaw/peekaboo`,
+  });
+  assert.equal(repoFromPath("/openclaw"), null);
+  assert.equal(repoDetailPath("OpenClaw/Peekaboo"), "/openclaw/peekaboo");
+  assert.equal(repoDetailPath("OpenClaw/react.dev"), "/-/openclaw/react.dev");
+  assert.deepEqual(repoFromPath("/-/og/foo"), {
+    owner: "og",
+    repo: "foo",
+    fullName: "og/foo",
+    apiPath: `${workerApiOrigin}/api/repos/og/foo`,
+    fallbackApiPath: `${workersDevApiOrigin}/api/repos/og/foo`,
+  });
+  assert.equal(repoDetailPath("og/foo"), "/-/og/foo");
 
   assert.deepEqual(dashboardRoute("/", "").isDefault, true);
   assert.equal(dashboardRoute("/", "").apiPath, `${workerApiOrigin}/api/_discover`);
@@ -432,6 +452,29 @@ test("worker keeps hot owner route distinct from root hot API", async () => {
   }
 });
 
+test("worker serves escaped dotted repository detail paths as app shell", async () => {
+  const response = await worker.fetch(
+    new Request("https://release.bar/-/openclaw/react.dev"),
+    {
+      ASSETS: {
+        fetch: async (request: Request) => {
+          const url = new URL(request.url);
+          assert.equal(url.pathname, "/index.html");
+          return new Response(
+            '<title>ReleaseBar</title><meta property="og:title" content="ReleaseBar" /><meta property="og:url" content="https://release.bar/" /><meta property="og:image" content="https://release.bar/og/ReleaseBar.svg" /><meta name="twitter:title" content="ReleaseBar" /><meta name="twitter:image" content="https://release.bar/og/ReleaseBar.svg" />',
+            { headers: { "content-type": "text/html" } },
+          );
+        },
+      },
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /openclaw\/react\.dev · ReleaseBar/);
+});
+
 test("worker serves cached GitHub discovery dashboards from repository search", async () => {
   const originalFetch = globalThis.fetch;
   let searchCalls = 0;
@@ -626,6 +669,437 @@ test("worker does not rehydrate completed GitHub discovery cache", async () => {
     const body = (await response.json()) as DashboardPayload;
     assert.equal(body.projects[0]?.version, "v2.0.0");
     assert.equal(body.cache?.state, "fresh");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker builds cached repository detail with releases and stats", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async (input) => {
+    calls += 1;
+    const url = new URL(String(input));
+    const path = url.pathname;
+    if (path === "/repos/acme/releasebar") {
+      return Response.json({
+        owner: { login: "acme" },
+        name: "releasebar",
+        full_name: "acme/releasebar",
+        private: false,
+        fork: false,
+        archived: false,
+        html_url: "https://github.com/acme/releasebar",
+        description: "Release dashboard",
+        default_branch: "main",
+        language: "TypeScript",
+        topics: ["release-health"],
+        stargazers_count: 1234,
+        forks_count: 45,
+        open_issues_count: 9,
+        pushed_at: "2026-05-16T12:00:00Z",
+        updated_at: "2026-05-16T12:00:00Z",
+      });
+    }
+    if (path === "/repos/acme/releasebar/releases") {
+      return Response.json([
+        {
+          tag_name: "v1.2.3",
+          name: "Release 1.2.3",
+          html_url: "https://github.com/acme/releasebar/releases/tag/v1.2.3",
+          draft: false,
+          prerelease: false,
+          published_at: "2026-05-15T00:00:00Z",
+        },
+        {
+          tag_name: "v1.2.2",
+          name: "Release 1.2.2",
+          html_url: "https://github.com/acme/releasebar/releases/tag/v1.2.2",
+          draft: false,
+          prerelease: false,
+          published_at: "2026-05-01T00:00:00Z",
+        },
+      ]);
+    }
+    if (path === "/repos/acme/releasebar/contributors") {
+      return Response.json([
+        {
+          login: "octo",
+          avatar_url: "https://avatars.githubusercontent.com/u/1",
+          html_url: "https://github.com/octo",
+          contributions: 42,
+        },
+      ]);
+    }
+    if (path === "/repos/acme/releasebar/languages") {
+      return Response.json({ TypeScript: 900, CSS: 100 });
+    }
+    if (path === "/repos/acme/releasebar/commits/main") {
+      return Response.json({
+        sha: "abcdef123456",
+        commit: { committer: { date: "2026-05-16T12:00:00Z" } },
+      });
+    }
+    if (path === "/repos/acme/releasebar/pulls") {
+      return Response.json([{}], {
+        headers: {
+          link: '<https://api.github.com/repositories/1/pulls?state=open&per_page=1&page=2>; rel="last"',
+        },
+      });
+    }
+    if (path === "/repos/acme/releasebar/compare/v1.2.3...main") {
+      return Response.json({
+        total_commits: 6,
+        html_url: "https://github.com/acme/releasebar/compare/v1.2.3...main",
+      });
+    }
+    if (path === "/repos/acme/releasebar/commits/abcdef123456/check-runs") {
+      return Response.json({
+        check_runs: [
+          {
+            html_url: "https://github.com/acme/releasebar/actions/runs/1",
+            status: "completed",
+            conclusion: "success",
+            name: "CI",
+            completed_at: "2026-05-16T12:30:00Z",
+          },
+          {
+            html_url: "https://github.com/acme/releasebar/actions/runs/2",
+            status: "completed",
+            conclusion: "failure",
+            name: "Lint",
+            completed_at: "2026-05-16T12:20:00Z",
+          },
+        ],
+      });
+    }
+    if (path === "/repos/acme/releasebar/stats/commit_activity") {
+      return Response.json([{ week: 1778889600, total: 7, days: [0, 1, 2, 0, 3, 1, 0] }]);
+    }
+    if (path === "/repos/acme/releasebar/stats/code_frequency") {
+      return Response.json([[1778889600, 120, -20]]);
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const env = {
+    DASHBOARD_CACHE: kvStore(),
+    GITHUB_TOKEN: "shared-token",
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/releasebar"),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as RepoDetailPayload;
+    assert.equal(body.fullName, "acme/releasebar");
+    assert.equal(body.project.version, "v1.2.3");
+    assert.equal(body.project.commitsSinceRelease, 6);
+    assert.equal(body.project.openIssues, 7);
+    assert.equal(body.project.openPullRequests, 2);
+    assert.equal(body.project.ciState, "failure");
+    assert.equal(body.project.ciWorkflow, "Lint");
+    assert.equal(body.releases.length, 2);
+    assert.equal(body.contributors[0]?.login, "octo");
+    assert.equal(body.commitActivity[0]?.total, 7);
+    assert.equal(body.codeFrequency[0]?.additions, 120);
+    assert.equal(body.codeFrequency[0]?.deletions, 20);
+    assert.deepEqual(
+      body.languages.map((language) => language.name),
+      ["TypeScript", "CSS"],
+    );
+
+    const cached = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/releasebar"),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(cached.status, 200);
+    assert.equal(calls, 10);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker throttles cached warming repository detail refreshes", async () => {
+  const generatedAt = new Date().toISOString();
+  const payload: RepoDetailPayload = {
+    fullName: "acme/warmbar",
+    generatedAt,
+    cache: {
+      state: "warming",
+      stale: true,
+      generatedAt,
+      message: "GitHub is preparing repository statistics.",
+    },
+    project: testProject({ owner: "acme", name: "warmbar" }),
+    releases: [],
+    contributors: [],
+    commitActivity: [],
+    codeFrequency: [],
+    languages: [],
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    throw new Error(`unexpected fetch ${String(input)}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/warmbar"),
+      {
+        DASHBOARD_CACHE: kvStore({
+          "repo-detail:v1:acme/warmbar": JSON.stringify(payload),
+        }),
+        GITHUB_TOKEN: "shared-token",
+      },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 202);
+    const body = (await response.json()) as RepoDetailPayload;
+    assert.equal(body.cache.state, "warming");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker does not cache repository detail when pull request count fails", async () => {
+  const originalFetch = globalThis.fetch;
+  let failPulls = true;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    const path = url.pathname;
+    if (path === "/repos/acme/retrybar") {
+      return Response.json({
+        owner: { login: "acme" },
+        name: "retrybar",
+        full_name: "acme/retrybar",
+        private: false,
+        fork: false,
+        archived: false,
+        html_url: "https://github.com/acme/retrybar",
+        description: "Retry dashboard",
+        default_branch: "main",
+        language: "TypeScript",
+        topics: [],
+        stargazers_count: 20,
+        forks_count: 1,
+        open_issues_count: 4,
+        pushed_at: "2026-05-16T12:00:00Z",
+        updated_at: "2026-05-16T12:00:00Z",
+      });
+    }
+    if (path === "/repos/acme/retrybar/releases") {
+      return Response.json([]);
+    }
+    if (path === "/repos/acme/retrybar/contributors") {
+      return Response.json([]);
+    }
+    if (path === "/repos/acme/retrybar/languages") {
+      return Response.json({});
+    }
+    if (path === "/repos/acme/retrybar/commits/main") {
+      return Response.json({
+        sha: "1234567890",
+        commit: { committer: { date: "2026-05-16T12:00:00Z" } },
+      });
+    }
+    if (path === "/repos/acme/retrybar/pulls") {
+      if (failPulls) {
+        return Response.json(
+          { message: "rate limit exceeded", documentation_url: "https://docs.github.com/rest" },
+          { status: 403, headers: { "retry-after": "60" } },
+        );
+      }
+      return Response.json([{}], {
+        headers: {
+          link: '<https://api.github.com/repositories/2/pulls?state=open&per_page=1&page=3>; rel="last"',
+        },
+      });
+    }
+    if (path === "/repos/acme/retrybar/commits/1234567890/check-runs") {
+      return Response.json({ check_runs: [] });
+    }
+    if (path === "/repos/acme/retrybar/stats/commit_activity") {
+      return Response.json([]);
+    }
+    if (path === "/repos/acme/retrybar/stats/code_frequency") {
+      return Response.json([]);
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const env = {
+    DASHBOARD_CACHE: kvStore(),
+    GITHUB_TOKEN: "shared-token",
+  };
+  try {
+    const failed = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/retrybar"),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(failed.status, 429);
+
+    failPulls = false;
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/retrybar"),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as RepoDetailPayload;
+    assert.equal(body.project.openPullRequests, 3);
+    assert.equal(body.project.openIssues, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker returns 404 for missing repository detail pages", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/repos/acme/missing") {
+      return Response.json({ message: "Not Found" }, { status: 404 });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/missing"),
+      { DASHBOARD_CACHE: kvStore(), GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 404);
+    assert.match(await response.text(), /GitHub API 404/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker ignores optional repository detail permission gaps", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    const path = url.pathname;
+    if (path === "/repos/acme/limitedbar") {
+      return Response.json({
+        owner: { login: "acme" },
+        name: "limitedbar",
+        full_name: "acme/limitedbar",
+        private: false,
+        fork: false,
+        archived: false,
+        html_url: "https://github.com/acme/limitedbar",
+        description: "Limited dashboard",
+        default_branch: "main",
+        language: "TypeScript",
+        topics: [],
+        stargazers_count: 20,
+        forks_count: 1,
+        open_issues_count: 0,
+        pushed_at: "2026-05-16T12:00:00Z",
+        updated_at: "2026-05-16T12:00:00Z",
+      });
+    }
+    if (path === "/repos/acme/limitedbar/releases") {
+      return Response.json([]);
+    }
+    if (path === "/repos/acme/limitedbar/contributors") {
+      return Response.json([]);
+    }
+    if (path === "/repos/acme/limitedbar/languages") {
+      return Response.json({});
+    }
+    if (path === "/repos/acme/limitedbar/commits/main") {
+      return Response.json({
+        sha: "1234567890",
+        commit: { committer: { date: "2026-05-16T12:00:00Z" } },
+      });
+    }
+    if (path === "/repos/acme/limitedbar/pulls") {
+      return Response.json([]);
+    }
+    if (path === "/repos/acme/limitedbar/commits/1234567890/check-runs") {
+      return Response.json({ message: "Resource not accessible by integration" }, { status: 403 });
+    }
+    if (path === "/repos/acme/limitedbar/stats/commit_activity") {
+      return Response.json([]);
+    }
+    if (path === "/repos/acme/limitedbar/stats/code_frequency") {
+      return Response.json([]);
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/limitedbar"),
+      { DASHBOARD_CACHE: kvStore(), GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as RepoDetailPayload;
+    assert.equal(body.project.ciState, "unknown");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker does not cache repository detail when optional calls are rate limited", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    const path = url.pathname;
+    if (path === "/repos/acme/slowbar") {
+      return Response.json({
+        owner: { login: "acme" },
+        name: "slowbar",
+        full_name: "acme/slowbar",
+        private: false,
+        fork: false,
+        archived: false,
+        html_url: "https://github.com/acme/slowbar",
+        description: "Slow dashboard",
+        default_branch: "main",
+        language: "TypeScript",
+        topics: [],
+        stargazers_count: 20,
+        forks_count: 1,
+        open_issues_count: 0,
+        pushed_at: "2026-05-16T12:00:00Z",
+        updated_at: "2026-05-16T12:00:00Z",
+      });
+    }
+    if (path === "/repos/acme/slowbar/releases") {
+      return Response.json([]);
+    }
+    if (path === "/repos/acme/slowbar/contributors") {
+      return Response.json(
+        { message: "API rate limit exceeded" },
+        { status: 403, headers: { "retry-after": "60" } },
+      );
+    }
+    if (path === "/repos/acme/slowbar/languages") {
+      return Response.json({});
+    }
+    if (path === "/repos/acme/slowbar/commits/main") {
+      return Response.json({
+        sha: "1234567890",
+        commit: { committer: { date: "2026-05-16T12:00:00Z" } },
+      });
+    }
+    if (path === "/repos/acme/slowbar/pulls") {
+      return Response.json([]);
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/slowbar"),
+      { DASHBOARD_CACHE: kvStore(), GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 429);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -876,6 +1350,27 @@ test("worker streams cached dashboard snapshots over owner events", async () => 
   const text = await response.text();
   assert.match(text, /event: dashboard/);
   assert.match(text, /owner\/repo/);
+});
+
+test("worker keeps owner events working for the repos owner slug", async () => {
+  const key = dashboardCacheKey({ owner: "repos", schemaVersion: 5 });
+  const dashboard = testDashboard("repos", [testProject({ owner: "repos", name: "repo" })]);
+  dashboard.generatedAt = new Date().toISOString();
+  if (dashboard.cache) {
+    dashboard.cache.generatedAt = dashboard.generatedAt;
+  }
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/repos/events"),
+    { DASHBOARD_CACHE: kvStore({ [key]: JSON.stringify(dashboard) }) },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "text/event-stream; charset=utf-8");
+  const text = await response.text();
+  assert.match(text, /event: dashboard/);
+  assert.match(text, /repos\/repo/);
 });
 
 test("worker returns rebuilding while another isolate owns the dashboard build lock", async () => {
@@ -1423,6 +1918,34 @@ test("worker only exposes public selected installation repositories", async () =
     const body = await response.json();
     assert.deepEqual(body.installations[0].repositories, ["steipete/public-repo"]);
     assert.equal(body.installNeeded, false);
+
+    const repoRoute = await worker.fetch(
+      new Request(
+        `https://release.bar/api/me?returnTo=${encodeURIComponent("/steipete/public-repo")}`,
+        {
+          headers: { cookie: `rd_session=${authCookie}` },
+        },
+      ),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(repoRoute.status, 200);
+    const repoRouteBody = await repoRoute.json();
+    assert.equal(repoRouteBody.installNeeded, false);
+
+    const escapedRepoRoute = await worker.fetch(
+      new Request(
+        `https://release.bar/api/me?returnTo=${encodeURIComponent("/-/steipete/public-repo")}`,
+        {
+          headers: { cookie: `rd_session=${authCookie}` },
+        },
+      ),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(escapedRepoRoute.status, 200);
+    const escapedRepoRouteBody = await escapedRepoRoute.json();
+    assert.equal(escapedRepoRouteBody.installNeeded, false);
   } finally {
     globalThis.fetch = originalFetch;
   }

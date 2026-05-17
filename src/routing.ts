@@ -12,6 +12,14 @@ export type DashboardRoute = {
 
 export type DiscoverPeriod = "day" | "week" | "month" | "year" | "releasebar";
 
+export type RepoRoute = {
+  owner: string;
+  repo: string;
+  fullName: string;
+  apiPath: string;
+  fallbackApiPath: string | null;
+};
+
 export type RouteOptions = {
   includeForks: boolean;
   includeArchived: boolean;
@@ -23,6 +31,7 @@ export const workersDevApiOrigin = "https://releasedeck-api.steipete.workers.dev
 const ownerListKey = "owners";
 const repoListKey = "repos";
 const discoverLanguageKey = "hotLang";
+const reservedRepoRouteOwners = new Set(["api", "og"]);
 const discoverPeriodValues = new Set<DiscoverPeriod>([
   "day",
   "week",
@@ -68,8 +77,38 @@ export function validRepoSlug(repo: string): boolean {
   return /^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?\/[a-z\d._-]{1,100}$/i.test(repo);
 }
 
+export function repoFromPath(pathname: string, apiOrigin = workerApiOrigin): RepoRoute | null {
+  const parts = pathname
+    .split("/")
+    .filter(Boolean)
+    .map((part) => decodeURIComponent(part));
+  const escaped = parts[0] === "-";
+  if ((!escaped && parts.length !== 2) || (escaped && parts.length !== 3)) return null;
+  const ownerPart = escaped ? parts[1] : parts[0];
+  const repoPart = escaped ? parts[2] : parts[1];
+  const owner = ownerPart?.trim().replace(/^@/, "").toLowerCase() ?? "";
+  const repo = repoPart?.trim().toLowerCase() ?? "";
+  const fullName = `${owner}/${repo}`;
+  if (!validRepoSlug(fullName)) return null;
+  const apiPath = `/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  return {
+    owner,
+    repo,
+    fullName,
+    apiPath: `${apiOrigin}${apiPath}`,
+    fallbackApiPath: apiOrigin === "" ? `${workersDevApiOrigin}${apiPath}` : null,
+  };
+}
+
 export function ownerDashboardPath(owner: string): string {
   return `/${encodeURIComponent(owner.trim().replace(/^@/, "").toLowerCase())}`;
+}
+
+export function repoDetailPath(fullName: string): string {
+  const [owner, repo] = fullName.trim().replace(/^@/, "").toLowerCase().split("/");
+  if (!owner || !repo) return "/";
+  const prefix = reservedRepoRouteOwners.has(owner) || repo.includes(".") ? "/-" : "";
+  return `${prefix}/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
 }
 
 export function discoverPeriodFromSearch(search: string): DiscoverPeriod {

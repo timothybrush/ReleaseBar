@@ -7,13 +7,23 @@ import {
   validOwnerSlug,
   validRepoSlug,
 } from "../scripts/lib/dashboard.js";
+import * as v from "valibot";
 import type { GenericSchema, InferOutput } from "valibot";
 import {
+  gitHubCheckRunsSchema,
+  gitHubCodeFrequencySchema,
+  gitHubCommitActivitySchema,
+  gitHubCommitSchema,
+  gitHubCompareSchema,
+  gitHubContributorSchema,
   gitHubInstallationListSchema,
   gitHubInstallationRepositoryListSchema,
   gitHubInstallationTokenSchema,
+  gitHubLanguageSchema,
   gitHubOAuthTokenSchema,
   gitHubOAuthUserSchema,
+  gitHubReleaseSchema,
+  gitHubRepositorySchema,
   gitHubSearchRepositoryListSchema,
   hotIndexSchema,
   parseGitHubResponse,
@@ -32,6 +42,7 @@ import type {
   DashboardPayload,
   Owner,
   Project,
+  RepoDetailPayload,
 } from "../src/types.js";
 
 type KVNamespace = {
@@ -102,6 +113,8 @@ const hotCacheTtlMs = 5 * 60 * 1000;
 const discoverLimit = 40;
 const discoverHydrateLimit = 12;
 const discoverCacheTtlMs = 60 * 60 * 1000;
+const repoDetailCacheTtlMs = 6 * 60 * 60 * 1000;
+const repoDetailWarmingRefreshMs = 5 * 60 * 1000;
 const maxCustomSources = 8;
 const dashboardSchemaVersion = 5;
 const previousDashboardSchemaVersion = 4;
@@ -123,6 +136,11 @@ const corsHeaders = {
   "access-control-allow-headers": "content-type",
 };
 const workerFetch: typeof fetch = (input, init) => fetch(input, init);
+
+function isRepoDetailApiPath(pathname: string): boolean {
+  const parts = pathname.split("/").filter(Boolean);
+  return parts.length === 4 && parts[0] === "api" && parts[1] === "repos";
+}
 
 type DashboardRequest = {
   owners: Owner[];
@@ -196,6 +214,9 @@ type TokenSources = {
 };
 
 function shouldServeAppShell(url: URL): boolean {
+  if (url.pathname.split("/").filter(Boolean)[0] === "-" && repoFullNameFromPath(url.pathname)) {
+    return true;
+  }
   if (url.pathname.endsWith("/")) return true;
   const leaf = url.pathname.split("/").pop() ?? "";
   return !leaf.includes(".");
@@ -377,6 +398,19 @@ function repoListFromUrl(url: URL): string[] {
   ];
 }
 
+function repoFullNameFromPath(pathname: string): string | null {
+  const parts = pathname
+    .split("/")
+    .filter(Boolean)
+    .map((part) => decodeURIComponent(part));
+  const escaped = parts[0] === "-";
+  if ((!escaped && parts.length !== 2) || (escaped && parts.length !== 3)) return null;
+  const owner = slugOwner(escaped ? (parts[1] ?? "") : (parts[0] ?? ""));
+  const repo = (escaped ? (parts[2] ?? "") : (parts[1] ?? "")).trim().toLowerCase();
+  const fullName = `${owner}/${repo}`;
+  return validRepoSlug(fullName) ? fullName : null;
+}
+
 function uniqueSorted(values: string[]): string[] {
   return [...new Set(values)].sort((a, b) => a.localeCompare(b));
 }
@@ -469,6 +503,8 @@ async function assetResponse(request: Request, env: Env): Promise<Response> {
 }
 
 function socialLabel(url: URL): string {
+  const repo = repoFullNameFromPath(url.pathname);
+  if (repo) return repo;
   const owner = slugOwner(url.pathname.split("/").filter(Boolean)[0] ?? "");
   if (validOwnerSlug(owner)) {
     const extra = ownerListFromUrl(url, owner).length + repoListFromUrl(url).length;
@@ -905,7 +941,15 @@ function sourceAccounts(sources: TokenSources): string[] {
 
 function returnToSources(returnTo: string, origin: string): { owners: string[]; repos: string[] } {
   const url = new URL(returnTo, origin);
-  const rawOwner = slugOwner(url.pathname.split("/").filter(Boolean)[0] ?? "");
+  const pathRepo = repoFullNameFromPath(url.pathname);
+  if (pathRepo) {
+    return {
+      owners: ownerListFromUrl(url),
+      repos: [...new Set([pathRepo, ...repoListFromUrl(url)])],
+    };
+  }
+  const parts = url.pathname.split("/").filter(Boolean);
+  const rawOwner = slugOwner(parts[0] ?? "");
   const primaryOwner = validOwnerSlug(rawOwner) ? rawOwner : null;
   return {
     owners: [
@@ -1174,6 +1218,9 @@ function dashboardErrorMessage(error: unknown): string {
 }
 
 function errorStatus(error: unknown): number {
+  const message = errorMessage(error);
+  const githubStatus = message.match(/^GitHub API (\d+)/)?.[1];
+  if (githubStatus === "404") return 404;
   return isGitHubRateLimit(error) ? 429 : 502;
 }
 
@@ -1565,6 +1612,545 @@ function parseHeaderInt(value: string | null): number | null {
   if (!value) return null;
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isRateLimitResponse(response: Response, message: string): boolean {
+  return (
+    response.status === 429 ||
+    /rate limit|secondary rate|abuse detection/i.test(message) ||
+    (response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0")
+  );
+}
+
+function quotaFromGitHubResponse(
+  response: Response,
+  source: ApiQuota["source"],
+  account: string | null,
+): ApiQuota {
+  const quota = quotaFromResponse(response, {
+    GITHUB_TOKEN: source === "anonymous" ? undefined : "token",
+  } as Env);
+  return { ...quota, source, account };
+}
+
+async function detailGitHubJson<TSchema extends GenericSchema>(
+  path: string,
+  schema: TSchema,
+  context: string,
+  token: string | null,
+  quotaSource: ApiQuota["source"],
+  quotaAccount: string | null,
+  onQuota: (quota: ApiQuota) => void,
+): Promise<InferOutput<TSchema>> {
+  const response = await workerFetch(`https://api.github.com${path}`, {
+    headers: {
+      accept: "application/vnd.github+json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      "user-agent": "ReleaseBar",
+      "x-github-api-version": "2022-11-28",
+    },
+  });
+  onQuota(quotaFromGitHubResponse(response, quotaSource, quotaAccount));
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message =
+      body && typeof body === "object" && "message" in body
+        ? String((body as { message?: unknown }).message)
+        : `GitHub API ${response.status}`;
+    if (isRateLimitResponse(response, message)) {
+      throw new GitHubRateLimitError(message, parseHeaderInt(response.headers.get("retry-after")));
+    }
+    throw new Error(`GitHub API ${response.status} for ${path}: ${message}`);
+  }
+  return parseGitHubResponse(schema, body, context);
+}
+
+async function detailGitHubStats<TSchema extends GenericSchema>(
+  path: string,
+  schema: TSchema,
+  token: string | null,
+  quotaSource: ApiQuota["source"],
+  quotaAccount: string | null,
+  onQuota: (quota: ApiQuota) => void,
+): Promise<{ state: "ready" | "warming" | "unavailable"; data: InferOutput<TSchema> | null }> {
+  const response = await workerFetch(`https://api.github.com${path}`, {
+    headers: {
+      accept: "application/vnd.github+json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      "user-agent": "ReleaseBar",
+      "x-github-api-version": "2022-11-28",
+    },
+  });
+  onQuota(quotaFromGitHubResponse(response, quotaSource, quotaAccount));
+  if (response.status === 202) return { state: "warming", data: null };
+  if (response.status === 204 || response.status === 422) {
+    return { state: "unavailable", data: null };
+  }
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message =
+      body && typeof body === "object" && "message" in body
+        ? String((body as { message?: unknown }).message)
+        : `GitHub API ${response.status}`;
+    if (isRateLimitResponse(response, message)) {
+      throw new GitHubRateLimitError(message, parseHeaderInt(response.headers.get("retry-after")));
+    }
+    return { state: "unavailable", data: null };
+  }
+  return { state: "ready", data: parseGitHubResponse(schema, body, path) };
+}
+
+async function detailGitHubCount(
+  path: string,
+  token: string | null,
+  quotaSource: ApiQuota["source"],
+  quotaAccount: string | null,
+  onQuota: (quota: ApiQuota) => void,
+): Promise<number> {
+  const response = await workerFetch(`https://api.github.com${path}`, {
+    headers: {
+      accept: "application/vnd.github+json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      "user-agent": "ReleaseBar",
+      "x-github-api-version": "2022-11-28",
+    },
+  });
+  onQuota(quotaFromGitHubResponse(response, quotaSource, quotaAccount));
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message =
+      body && typeof body === "object" && "message" in body
+        ? String((body as { message?: unknown }).message)
+        : `GitHub API ${response.status}`;
+    if (isRateLimitResponse(response, message)) {
+      throw new GitHubRateLimitError(message, parseHeaderInt(response.headers.get("retry-after")));
+    }
+    throw new Error(`GitHub API ${response.status} for ${path}: ${message}`);
+  }
+  const lastPage = lastPageFromLink(response.headers.get("link"));
+  if (lastPage !== null) return lastPage;
+  return Array.isArray(body) ? body.length : 0;
+}
+
+function lastPageFromLink(link: string | null): number | null {
+  if (!link) return null;
+  const last = link
+    .split(",")
+    .map((part) => part.trim())
+    .find((part) => /rel="last"/.test(part));
+  const match = last?.match(/[?&]page=(\d+)/);
+  if (!match?.[1]) return null;
+  const page = Number.parseInt(match[1], 10);
+  return Number.isFinite(page) ? page : null;
+}
+
+function releaseProject(repo: InferOutput<typeof gitHubRepositorySchema>): Project {
+  return {
+    owner: repo.owner.login,
+    name: repo.name,
+    fullName: repo.full_name,
+    description: repo.description,
+    url: repo.html_url,
+    defaultBranch: repo.default_branch,
+    language: repo.language,
+    topics: repo.topics ?? [],
+    stars: repo.stargazers_count,
+    forks: repo.forks_count,
+    openIssues: repo.open_issues_count,
+    openPullRequests: 0,
+    issuesUrl: `${repo.html_url}/issues`,
+    pullRequestsUrl: `${repo.html_url}/pulls`,
+    archived: repo.archived ?? false,
+    pushedAt: repo.pushed_at,
+    updatedAt: repo.updated_at,
+    latestCommitSha: null,
+    latestCommitDate: null,
+    version: "unreleased",
+    releaseName: null,
+    releaseUrl: repo.html_url,
+    releaseDate: null,
+    commitsSinceRelease: null,
+    compareUrl: null,
+    ciState: "unknown",
+    ciStatus: null,
+    ciConclusion: null,
+    ciWorkflow: null,
+    ciUrl: null,
+    ciRunDate: null,
+    freshness: "hot",
+  };
+}
+
+function repoDetailCacheKey(owner: string, repo: string): string {
+  return `repo-detail:v1:${slugOwner(owner)}/${repo.toLowerCase()}`;
+}
+
+async function readRepoDetail(env: Env, key: string): Promise<RepoDetailPayload | null> {
+  const raw = await env.DASHBOARD_CACHE?.get(key);
+  return raw ? tryJsonParse<RepoDetailPayload>(raw, `repo detail ${key}`) : null;
+}
+
+async function writeRepoDetail(env: Env, key: string, payload: RepoDetailPayload): Promise<void> {
+  await env.DASHBOARD_CACHE?.put(key, JSON.stringify(payload), {
+    expirationTtl: dashboardStorageTtlSeconds,
+  });
+}
+
+function repoDetailAgeMs(payload: RepoDetailPayload | null): number {
+  if (!payload) return Number.POSITIVE_INFINITY;
+  const generatedAt = Date.parse(payload.generatedAt);
+  return Number.isFinite(generatedAt) ? Date.now() - generatedAt : Number.POSITIVE_INFINITY;
+}
+
+function withRepoDetailState(
+  payload: RepoDetailPayload,
+  state: RepoDetailPayload["cache"]["state"],
+  message = payload.cache.message,
+): RepoDetailPayload {
+  return {
+    ...payload,
+    cache: {
+      ...payload.cache,
+      state,
+      stale: state !== "fresh",
+      ...(message ? { message } : {}),
+    },
+  };
+}
+
+async function optionalRepoDetail<T>(promise: Promise<T>, fallback: T): Promise<T> {
+  try {
+    return await promise;
+  } catch (error) {
+    if (isGitHubRateLimit(error)) throw error;
+    return fallback;
+  }
+}
+
+async function buildRepoDetail(
+  owner: string,
+  repoName: string,
+  request: Request,
+  env: Env,
+): Promise<RepoDetailPayload> {
+  const fullName = `${slugOwner(owner)}/${repoName.toLowerCase()}`;
+  const requestToken = await requestInstallationToken(request, env, {
+    owners: [],
+    repos: [fullName],
+  }).catch(() => null);
+  const token = requestToken?.token ?? env.GITHUB_TOKEN ?? null;
+  const quotaSource = requestToken?.quotaSource ?? (env.GITHUB_TOKEN ? "shared" : "anonymous");
+  const quotaAccount = requestToken?.quotaAccount ?? null;
+  let quota: ApiQuota | undefined;
+  const onQuota = (next: ApiQuota) => {
+    quota = next;
+  };
+  const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}`;
+  const repo = await detailGitHubJson(
+    path,
+    gitHubRepositorySchema,
+    "repository detail",
+    token,
+    quotaSource,
+    quotaAccount,
+    onQuota,
+  );
+  if (repo.private) {
+    throw new Error("private repositories are not visible in public dashboards");
+  }
+
+  const [releases, contributors, languages, latestCommit, openPullRequests] = await Promise.all([
+    detailGitHubJson(
+      `${path}/releases?per_page=8`,
+      v.array(gitHubReleaseSchema),
+      "repository releases",
+      token,
+      quotaSource,
+      quotaAccount,
+      onQuota,
+    ),
+    optionalRepoDetail(
+      detailGitHubJson(
+        `${path}/contributors?per_page=12`,
+        v.array(gitHubContributorSchema),
+        "repository contributors",
+        token,
+        quotaSource,
+        quotaAccount,
+        onQuota,
+      ),
+      [],
+    ),
+    optionalRepoDetail(
+      detailGitHubJson(
+        `${path}/languages`,
+        gitHubLanguageSchema,
+        "repository languages",
+        token,
+        quotaSource,
+        quotaAccount,
+        onQuota,
+      ),
+      {},
+    ),
+    optionalRepoDetail(
+      detailGitHubJson(
+        `${path}/commits/${encodeURIComponent(repo.default_branch)}`,
+        gitHubCommitSchema,
+        "latest commit",
+        token,
+        quotaSource,
+        quotaAccount,
+        onQuota,
+      ),
+      null,
+    ),
+    detailGitHubCount(
+      `${path}/pulls?state=open&per_page=1`,
+      token,
+      quotaSource,
+      quotaAccount,
+      onQuota,
+    ),
+  ]);
+
+  const latestRelease = releases.find((release) => !release.draft) ?? null;
+  const compare = latestRelease
+    ? await optionalRepoDetail(
+        detailGitHubJson(
+          `${path}/compare/${encodeURIComponent(latestRelease.tag_name)}...${encodeURIComponent(repo.default_branch)}`,
+          gitHubCompareSchema,
+          "release compare",
+          token,
+          quotaSource,
+          quotaAccount,
+          onQuota,
+        ),
+        null,
+      )
+    : null;
+  const checks = latestCommit?.sha
+    ? await optionalRepoDetail(
+        detailGitHubJson(
+          `${path}/commits/${encodeURIComponent(latestCommit.sha)}/check-runs?per_page=100`,
+          gitHubCheckRunsSchema,
+          "repository check runs",
+          token,
+          quotaSource,
+          quotaAccount,
+          onQuota,
+        ),
+        null,
+      )
+    : null;
+
+  const [commitActivity, codeFrequency] = await Promise.all([
+    detailGitHubStats(
+      `${path}/stats/commit_activity`,
+      gitHubCommitActivitySchema,
+      token,
+      quotaSource,
+      quotaAccount,
+      onQuota,
+    ),
+    detailGitHubStats(
+      `${path}/stats/code_frequency`,
+      gitHubCodeFrequencySchema,
+      token,
+      quotaSource,
+      quotaAccount,
+      onQuota,
+    ),
+  ]);
+  const statsWarming = [commitActivity, codeFrequency].some((stat) => stat.state === "warming");
+  const project = releaseProject(repo);
+  project.openPullRequests = openPullRequests;
+  project.openIssues = Math.max(repo.open_issues_count - openPullRequests, 0);
+  project.latestCommitSha = latestCommit?.sha.slice(0, 7) ?? null;
+  project.latestCommitDate = latestCommit?.commit.committer?.date ?? null;
+  project.version = latestRelease?.tag_name ?? "unreleased";
+  project.releaseName = latestRelease?.name ?? null;
+  project.releaseUrl = latestRelease?.html_url ?? repo.html_url;
+  project.releaseDate = latestRelease?.published_at ?? null;
+  project.commitsSinceRelease = compare?.total_commits ?? null;
+  project.compareUrl = compare?.html_url ?? null;
+  project.freshness = freshnessForDetail(project.commitsSinceRelease);
+  const ci = detailCiDetails(checks?.check_runs ?? []);
+  project.ciStatus = ci.ciStatus;
+  project.ciConclusion = ci.ciConclusion;
+  project.ciWorkflow = ci.ciWorkflow;
+  project.ciUrl = ci.ciUrl;
+  project.ciRunDate = ci.ciRunDate;
+  project.ciState = ci.ciState;
+
+  const generatedAt = new Date().toISOString();
+  return {
+    fullName: repo.full_name,
+    generatedAt,
+    cache: {
+      state: statsWarming ? "warming" : "fresh",
+      stale: statsWarming,
+      generatedAt,
+      ...(statsWarming ? { message: "GitHub is preparing repository statistics." } : {}),
+      ...(quota ? { quota } : {}),
+    },
+    project,
+    releases: releases
+      .filter((release) => !release.draft)
+      .map((release) => ({
+        name: release.name,
+        tagName: release.tag_name,
+        url: release.html_url,
+        publishedAt: release.published_at,
+        prerelease: release.prerelease ?? false,
+      })),
+    contributors: contributors.map((contributor) => ({
+      login: contributor.login ?? "anonymous",
+      avatarUrl: contributor.avatar_url ?? null,
+      url: contributor.html_url ?? null,
+      commits: contributor.contributions,
+    })),
+    commitActivity: (commitActivity.data ?? []).map((week) => ({
+      week: new Date(week.week * 1000).toISOString(),
+      total: week.total,
+      days: week.days,
+    })),
+    codeFrequency: (codeFrequency.data ?? []).map(([week, additions, deletions]) => ({
+      week: new Date(week * 1000).toISOString(),
+      additions,
+      deletions: Math.abs(deletions),
+    })),
+    languages: Object.entries(languages)
+      .map(([name, bytes]) => ({ name, bytes }))
+      .sort((a, b) => b.bytes - a.bytes),
+  };
+}
+
+function freshnessForDetail(commits: number | null): Project["freshness"] {
+  if (commits === 0) return "fresh";
+  if (commits !== null && commits <= 5) return "warm";
+  if (commits !== null && commits <= 25) return "busy";
+  return "hot";
+}
+
+type DetailCheckRun = NonNullable<InferOutput<typeof gitHubCheckRunsSchema>["check_runs"]>[number];
+
+function detailCiDetails(
+  runs: DetailCheckRun[],
+): Pick<Project, "ciState" | "ciStatus" | "ciConclusion" | "ciWorkflow" | "ciUrl" | "ciRunDate"> {
+  if (runs.length === 0) {
+    return {
+      ciState: "unknown",
+      ciStatus: null,
+      ciConclusion: null,
+      ciWorkflow: null,
+      ciUrl: null,
+      ciRunDate: null,
+    };
+  }
+
+  const failure = runs.find((run) =>
+    ["failure", "timed_out", "action_required"].includes(run.conclusion ?? ""),
+  );
+  const active = runs.find((run) => run.status && run.status !== "completed");
+  const cancelled = runs.find((run) => run.conclusion === "cancelled");
+  const successCount = runs.filter((run) => run.conclusion === "success").length;
+  const neutralCount = runs.filter((run) => run.conclusion === "neutral").length;
+  const skippedCount = runs.filter((run) => run.conclusion === "skipped").length;
+  const selected = failure ?? active ?? cancelled ?? runs[0];
+
+  let ciState: Project["ciState"] = "unknown";
+  if (failure) {
+    ciState = "failure";
+  } else if (active) {
+    ciState = active.status === "in_progress" ? "running" : "pending";
+  } else if (cancelled) {
+    ciState = "cancelled";
+  } else if (successCount > 0) {
+    ciState = "success";
+  } else if (neutralCount > 0) {
+    ciState = "neutral";
+  } else if (skippedCount > 0) {
+    ciState = "skipped";
+  }
+
+  return {
+    ciState,
+    ciStatus: selected.status ?? null,
+    ciConclusion: selected.conclusion ?? null,
+    ciWorkflow:
+      ciState === "success" ? `${successCount}/${runs.length} checks` : (selected.name ?? null),
+    ciUrl: selected.html_url ?? null,
+    ciRunDate: selected.completed_at ?? selected.started_at ?? null,
+  };
+}
+
+async function refreshRepoDetail(
+  key: string,
+  owner: string,
+  repo: string,
+  request: Request,
+  env: Env,
+): Promise<void> {
+  const lock = await acquireBuildLock(env, `${key}:refresh`);
+  if (!lock) return;
+  try {
+    const payload = await buildRepoDetail(owner, repo, request, env);
+    await writeRepoDetail(env, key, payload);
+  } finally {
+    await lock.release();
+  }
+}
+
+async function repoDetailResponse(
+  request: Request,
+  env: Env,
+  context: ExecutionContext,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const [, , , rawOwner, rawRepo] = url.pathname.split("/");
+  const owner = slugOwner(decodeURIComponent(rawOwner ?? ""));
+  const repo = decodeURIComponent(rawRepo ?? "").toLowerCase();
+  const fullName = `${owner}/${repo}`;
+  if (!validRepoSlug(fullName)) {
+    return jsonResponse({ error: "invalid repository" }, 400, { "cache-control": "no-store" });
+  }
+
+  const key = repoDetailCacheKey(owner, repo);
+  const cached = await readRepoDetail(env, key);
+  const ageMs = repoDetailAgeMs(cached);
+  if (cached?.cache.state === "warming" && ageMs < repoDetailWarmingRefreshMs) {
+    return jsonResponse(cached, 202, { "cache-control": "no-store" });
+  }
+  if (cached && ageMs < repoDetailCacheTtlMs && cached.cache.state !== "warming") {
+    return jsonResponse(cached);
+  }
+  if (cached && ageMs <= maxDisplayStaleMs) {
+    context.waitUntil(refreshRepoDetail(key, owner, repo, request, env).catch(() => undefined));
+    return jsonResponse(withRepoDetailState(cached, "stale", "refreshing repository statistics"));
+  }
+
+  try {
+    const payload = await buildRepoDetail(owner, repo, request, env);
+    await writeRepoDetail(env, key, payload);
+    return jsonResponse(payload, payload.cache.state === "warming" ? 202 : 200, {
+      "cache-control": payload.cache.state === "warming" ? "no-store" : "public, max-age=60",
+    });
+  } catch (error) {
+    return jsonResponse(
+      {
+        error: dashboardErrorMessage(error),
+        cache: {
+          state: "error",
+          stale: true,
+          generatedAt: new Date().toISOString(),
+          message: dashboardErrorMessage(error),
+        },
+      },
+      errorStatus(error),
+      retryAfterHeaders(error),
+    );
+  }
 }
 
 function discoverFreshness(repo: GitHubSearchRepository): Project["freshness"] {
@@ -2604,6 +3190,9 @@ async function routeRequest(
   }
   if (url.pathname === "/api/_discover") {
     return discoverResponse(env, url, context);
+  }
+  if (isRepoDetailApiPath(url.pathname)) {
+    return repoDetailResponse(request, env, context);
   }
   if (url.pathname.startsWith("/api/") && url.pathname.endsWith("/events")) {
     return ownerEventsResponse(request, env);

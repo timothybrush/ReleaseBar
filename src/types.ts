@@ -146,3 +146,53 @@ export type DashboardPayload = {
   };
   projects: Project[];
 };
+
+export type RepoDetailContributor = {
+  login: string;
+  avatarUrl: string | null;
+  url: string | null;
+  commits: number;
+};
+
+export type RepoDetailRelease = {
+  name: string | null;
+  tagName: string;
+  url: string;
+  publishedAt: string | null;
+  prerelease: boolean;
+};
+
+export type RepoDetailWeek = {
+  week: string;
+  total: number;
+  days: number[];
+};
+
+export type RepoDetailCodeWeek = {
+  week: string;
+  additions: number;
+  deletions: number;
+};
+
+export type RepoDetailLanguage = {
+  name: string;
+  bytes: number;
+};
+
+export type RepoDetailPayload = {
+  fullName: string;
+  generatedAt: string;
+  cache: {
+    state: "fresh" | "stale" | "warming" | "error";
+    stale: boolean;
+    generatedAt: string;
+    message?: string;
+    quota?: ApiQuota;
+  };
+  project: Project;
+  releases: RepoDetailRelease[];
+  contributors: RepoDetailContributor[];
+  commitActivity: RepoDetailWeek[];
+  codeFrequency: RepoDetailCodeWeek[];
+  languages: RepoDetailLanguage[];
+};

@@ -28,11 +28,20 @@
   import {
     dashboardRoute,
     ownerDashboardPath,
+    repoDetailPath,
+    repoFromPath,
     validRepoSlug,
     type DiscoverPeriod,
   } from "./routing.js";
-  import type { ApiQuota, AuthPayload, DashboardPayload, Project } from "./types.js";
+  import type {
+    ApiQuota,
+    AuthPayload,
+    DashboardPayload,
+    Project,
+    RepoDetailPayload,
+  } from "./types.js";
 
+  const repoRoute = repoFromPath(location.pathname);
   const initialRoute = dashboardRoute(location.pathname, location.search);
   const storedDevMode = localStorage.getItem("releasedeck:dev-mode") === "true";
   const initialView = parseViewState(
@@ -45,6 +54,7 @@
   const hiddenReposKey = `releasedeck:${routeScope}:hidden-repos`;
 
   let data: DashboardPayload | null = null;
+  let repoDetail: RepoDetailPayload | null = null;
   let auth: AuthPayload | null = null;
   let query = initialView.query;
   let language = initialView.language;
@@ -68,6 +78,7 @@
   let generatedDetail = "";
   let mounted = false;
   let dashboardRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let repoDetailRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let dashboardEventSource: EventSource | null = null;
 
   const numberFormat = new Intl.NumberFormat("en", { notation: "compact" });
@@ -90,11 +101,14 @@
   ];
   const discoverLanguages = ["TypeScript", "Python", "Rust", "Go", "Swift"];
 
-  $: label = data ? ownerLabel(data) : initialRoute.label;
-  $: subtitle = data?.subtitle ?? "Release debt across recently requested public dashboards.";
+  $: label = repoRoute ? (repoDetail?.fullName ?? repoRoute.fullName) : data ? ownerLabel(data) : initialRoute.label;
+  $: subtitle = repoRoute
+    ? (repoDetail?.project.description ?? "Repository release and activity detail.")
+    : data?.subtitle ?? "Release debt across recently requested public dashboards.";
   $: profileSourceCount =
     (data?.profile?.includeOwners.length ?? 0) + (data?.profile?.includeRepos.length ?? 0);
   $: subtitleOwner =
+    !repoRoute &&
     !initialRoute.isDefault &&
     initialRoute.owner &&
     initialRoute.extraOwners.length === 0 &&
@@ -142,6 +156,7 @@
   }`;
   $: connectionStatus = authStatus();
   $: canEditPublicDefault =
+    !repoRoute &&
     Boolean(auth?.user && initialRoute.owner) &&
     auth?.user?.login.toLowerCase() === initialRoute.owner?.toLowerCase();
   $: commandActions = defineActions(
@@ -165,6 +180,14 @@
   $: activeDiscoverPeriod = initialRoute.discoverPeriod ?? "week";
   $: activeDiscoverLanguage = initialRoute.discoverLanguage;
   $: syncViewState(query, language, filter, sortKey, sortDirection, devMode);
+  $: detailMaxCommits = maxNumber(repoDetail?.commitActivity.map((week) => week.total) ?? []);
+  $: detailMaxContributorCommits = maxNumber(
+    repoDetail?.contributors.map((contributor) => contributor.commits) ?? [],
+  );
+  $: detailLanguageTotal = (repoDetail?.languages ?? []).reduce(
+    (sum, language) => sum + language.bytes,
+    0,
+  );
 
   function ownerLabel(payload: DashboardPayload): string {
     if (initialRoute.isDefault) {
@@ -217,6 +240,32 @@
       return `${relativeFormat.format(Math.round(diffMs / 3600000), "hour")} at ${timeFormat.format(new Date(time))}`;
     }
     return `${absoluteDate(value)} at ${timeFormat.format(new Date(time))}`;
+  }
+
+  function maxNumber(values: number[]): number {
+    return values.reduce((max, value) => Math.max(max, value), 0);
+  }
+
+  function percent(value: number, max: number): number {
+    if (value <= 0) return 0;
+    return max <= 0 ? 0 : Math.max(4, Math.round((value / max) * 100));
+  }
+
+  function percentOfTotal(value: number, total: number): number {
+    return total <= 0 ? 0 : Math.round((value / total) * 100);
+  }
+
+  function shortDate(value: string | null): string {
+    if (!value) return "never";
+    return dateFormat.format(new Date(value));
+  }
+
+  function commitTotal(): number {
+    return (repoDetail?.commitActivity ?? []).reduce((sum, week) => sum + week.total, 0);
+  }
+
+  function codeTotal(kind: "additions" | "deletions"): number {
+    return (repoDetail?.codeFrequency ?? []).reduce((sum, week) => sum + week[kind], 0);
   }
 
   function matchesBase(
@@ -459,6 +508,7 @@
     devEnabled: boolean,
   ): void {
     if (!mounted) return;
+    if (repoRoute) return;
     const nextSearch = viewStateSearch(
       location.search,
       {
@@ -514,6 +564,17 @@
       .join(" · ");
   }
 
+  function updateRepoDetailStatus(): void {
+    if (!repoDetail) return;
+    const cacheState = repoDetail.cache.state;
+    const quota = quotaLabel(repoDetail.cache.quota);
+    generatedLabel =
+      cacheState === "warming"
+        ? `warming stats · cached ${relativeDate(repoDetail.generatedAt)}`
+        : `updated ${relativeDate(repoDetail.generatedAt)}`;
+    generatedDetail = [cacheState, quota, repoDetail.cache.message ?? ""].filter(Boolean).join(" · ");
+  }
+
   async function fetchPayload(apiPath: string, bypassCache = false): Promise<Response> {
     if (!bypassCache) {
       return fetch(apiPath);
@@ -561,6 +622,23 @@
         return;
       }
       void loadDashboard(attempt + 1).catch(() => undefined);
+    }, delay);
+  }
+
+  function scheduleRepoDetailRefresh(attempt: number): void {
+    if (!repoRoute) return;
+    if (repoDetailRefreshTimer !== null) {
+      globalThis.clearTimeout(repoDetailRefreshTimer);
+    }
+    if (attempt >= 36) return;
+    const delay = attempt < 8 ? 5000 : 15000;
+    repoDetailRefreshTimer = globalThis.setTimeout(() => {
+      repoDetailRefreshTimer = null;
+      if (document.hidden) {
+        scheduleRepoDetailRefresh(attempt);
+        return;
+      }
+      void loadRepoDetail(attempt + 1).catch(() => undefined);
     }, delay);
   }
 
@@ -653,6 +731,36 @@
     }
   }
 
+  async function loadRepoDetail(attempt = 0): Promise<void> {
+    if (!repoRoute) return;
+    const bypassCache = attempt > 0;
+    const read = async (apiPath: string) => {
+      const response = await fetchPayload(apiPath, bypassCache);
+      const body = (await response.json().catch(() => null)) as
+        | RepoDetailPayload
+        | { error?: string; cache?: { message?: string } }
+        | null;
+      return { response, body };
+    };
+    let { response, body } = await read(repoRoute.apiPath);
+    if (!response.ok && repoRoute.fallbackApiPath) {
+      ({ response, body } = await read(repoRoute.fallbackApiPath));
+    }
+    if (body && "project" in body) {
+      repoDetail = body;
+      updateRepoDetailStatus();
+      if (body.cache.state === "warming" || body.cache.state === "stale") {
+        scheduleRepoDetailRefresh(attempt);
+      }
+      return;
+    }
+    const message =
+      body && "error" in body
+        ? body.error
+        : body?.cache?.message || `repository detail failed: ${response.status}`;
+    throw new Error(message || `repository detail failed: ${response.status}`);
+  }
+
   function handleSourceSubmit(event: SubmitEvent): void {
     event.preventDefault();
     addSource(sourceInput);
@@ -728,6 +836,14 @@
         description: project.description ?? undefined,
         group: "Repos",
         keywords: [project.owner, project.name, project.language ?? "", project.version, ...topics],
+        onRun: () => location.assign(repoDetailPath(project.fullName)),
+      },
+      {
+        actionId: `github:${project.fullName}`,
+        title: `Open ${project.fullName} on GitHub`,
+        subTitle: "github.com",
+        group: "Repos",
+        keywords: ["github", "external", project.fullName],
         onRun: () => openUrl(project.url),
       },
       {
@@ -954,7 +1070,7 @@
     const unsubscribe = paletteStore.subscribe((value: PaletteStoreParams) => {
       paletteText = value.textInput;
     });
-    void Promise.all([loadAuth(), loadDashboard()]).catch((error) => {
+    void Promise.all([loadAuth(), repoRoute ? loadRepoDetail() : loadDashboard()]).catch((error) => {
       generatedLabel = "failed";
       generatedDetail = error instanceof Error ? error.message : String(error);
       errorMessage = generatedDetail;
@@ -965,6 +1081,9 @@
   onDestroy(() => {
     if (dashboardRefreshTimer !== null) {
       globalThis.clearTimeout(dashboardRefreshTimer);
+    }
+    if (repoDetailRefreshTimer !== null) {
+      globalThis.clearTimeout(repoDetailRefreshTimer);
     }
     closeDashboardStream();
     document.body.classList.remove("dev-mode");
@@ -1008,9 +1127,11 @@
             <span class="account-caret" aria-hidden="true"></span>
           </DropdownMenu.Trigger>
           <DropdownMenu.Content class="account-dropdown" align="end" sideOffset={8} loop>
-            <DropdownMenu.Item class="menu-action" onSelect={() => (settingsOpen = !settingsOpen)}>
-              Settings
-            </DropdownMenu.Item>
+            {#if !repoRoute}
+              <DropdownMenu.Item class="menu-action" onSelect={() => (settingsOpen = !settingsOpen)}>
+                Settings
+              </DropdownMenu.Item>
+            {/if}
             {#if auth.installNeeded}
               <DropdownMenu.Item class="menu-action" onSelect={installApp}>
                 Install App
@@ -1036,7 +1157,7 @@
     </div>
   </header>
 
-  {#if initialRoute.isDefault}
+  {#if !repoRoute && initialRoute.isDefault}
     <nav class="discover-nav" aria-label="Discover GitHub repositories">
       <div class="discover-group" aria-label="Time range">
         {#each discoverPeriods as period}
@@ -1072,7 +1193,7 @@
     </nav>
   {/if}
 
-  {#if settingsOpen}
+  {#if settingsOpen && !repoRoute}
     <div class="settings-panel" aria-label="Dashboard settings" data-open>
       <button
         class="settings-close"
@@ -1145,6 +1266,155 @@
     </div>
   {/if}
 
+  {#if repoRoute}
+    <section class="repo-detail" aria-label="Repository detail">
+      {#if errorMessage}
+        <p class="error-message">{errorMessage}</p>
+      {:else if !repoDetail}
+        <div class="loading-state" aria-live="polite">
+          <span class="loading-kicker">fetching repository</span>
+          <strong>loading stats</strong>
+          <small>GitHub release and activity data is being cached.</small>
+          <div class="loading-bars" aria-hidden="true">
+            <span></span>
+            <span></span>
+            <span></span>
+          </div>
+        </div>
+      {:else}
+        {#if repoDetail.cache.state === "warming" || repoDetail.cache.state === "stale"}
+          <div class="partial-state" aria-live="polite">
+            <span>{repoDetail.cache.state === "warming" ? "stats warming" : "cached stats visible"}</span>
+            <strong>{repoDetail.cache.message ?? "Repository statistics are refreshing."}</strong>
+          </div>
+        {/if}
+        <div class="detail-grid">
+          <section class="detail-panel detail-overview">
+            <div>
+              <span class="panel-kicker">release</span>
+              <strong>{repoDetail.project.version}</strong>
+              <small>{shortDate(repoDetail.project.releaseDate)} · {relativeDate(repoDetail.project.releaseDate)}</small>
+            </div>
+            <div>
+              <span class="panel-kicker">commits since</span>
+              <strong>{repoDetail.project.commitsSinceRelease ?? "n/a"}</strong>
+              <small>{repoDetail.project.freshness}</small>
+            </div>
+            <div>
+              <span class="panel-kicker">stars</span>
+              <strong>{numberFormat.format(repoDetail.project.stars)}</strong>
+              <small>{numberFormat.format(repoDetail.project.forks)} forks</small>
+            </div>
+            <div>
+              <span class="panel-kicker">open work</span>
+              <strong>{numberFormat.format(repoDetail.project.openIssues + repoDetail.project.openPullRequests)}</strong>
+              <small>{repoDetail.project.openIssues} issues · {repoDetail.project.openPullRequests} PRs</small>
+            </div>
+          </section>
+
+          <section class="detail-panel detail-wide">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-kicker">commit graph</span>
+                <h2>last 52 weeks</h2>
+              </div>
+              <strong>{numberFormat.format(commitTotal())} commits</strong>
+            </div>
+            {#if repoDetail.commitActivity.length > 0}
+              <div class="spark-bars" aria-label="Weekly commits">
+                {#each repoDetail.commitActivity as week}
+                  <span
+                    title={`${shortDate(week.week)} · ${week.total} commits`}
+                    style={`height: ${percent(week.total, detailMaxCommits)}%`}
+                  ></span>
+                {/each}
+              </div>
+            {:else}
+              <p class="detail-empty">Commit activity is still warming or unavailable.</p>
+            {/if}
+          </section>
+
+          <section class="detail-panel">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-kicker">contributors</span>
+                <h2>top committers</h2>
+              </div>
+            </div>
+            <div class="contributor-list">
+              {#each repoDetail.contributors as contributor}
+                <a class="contributor-row" href={contributor.url ?? repoDetail.project.url} target="_blank" rel="noreferrer">
+                  {#if contributor.avatarUrl}
+                    <img src={contributor.avatarUrl} alt="" width="26" height="26" loading="lazy" />
+                  {:else}
+                    <span class="avatar-fallback" aria-hidden="true"></span>
+                  {/if}
+                  <span>{contributor.login}</span>
+                  <strong>{numberFormat.format(contributor.commits)}</strong>
+                  <i style={`width: ${percent(contributor.commits, detailMaxContributorCommits)}%`}></i>
+                </a>
+              {/each}
+            </div>
+          </section>
+
+          <section class="detail-panel">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-kicker">releases</span>
+                <h2>latest versions</h2>
+              </div>
+            </div>
+            <div class="release-list">
+              {#each repoDetail.releases.slice(0, 6) as release}
+                <a href={release.url} target="_blank" rel="noreferrer">
+                  <strong>{release.tagName}</strong>
+                  <span>{shortDate(release.publishedAt)} · {relativeDate(release.publishedAt)}</span>
+                  {#if release.prerelease}<small>pre</small>{/if}
+                </a>
+              {/each}
+            </div>
+          </section>
+
+          <section class="detail-panel">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-kicker">languages</span>
+                <h2>repo mix</h2>
+              </div>
+            </div>
+            <div class="language-bars">
+              {#each repoDetail.languages.slice(0, 6) as repoLanguage}
+                <div>
+                  <span>{repoLanguage.name}</span>
+                  <strong>{percentOfTotal(repoLanguage.bytes, detailLanguageTotal)}%</strong>
+                  <i style={`width: ${percentOfTotal(repoLanguage.bytes, detailLanguageTotal)}%`}></i>
+                </div>
+              {/each}
+            </div>
+          </section>
+
+          <section class="detail-panel">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-kicker">code churn</span>
+                <h2>last year</h2>
+              </div>
+            </div>
+            <div class="churn-meter">
+              <div>
+                <span>additions</span>
+                <strong>{numberFormat.format(codeTotal("additions"))}</strong>
+              </div>
+              <div>
+                <span>deletions</span>
+                <strong>{numberFormat.format(codeTotal("deletions"))}</strong>
+              </div>
+            </div>
+          </section>
+        </div>
+      {/if}
+    </section>
+  {:else}
   <section class="console" aria-label="Project search and metrics">
     <div class="prompt">
       <span class="mark">$</span>
@@ -1263,7 +1533,7 @@
                 {project.owner}
               </a>
               <span class="repo-separator" aria-hidden="true">/</span>
-              <a class="repo-link" target="_blank" rel="noreferrer" href={project.url} title="Open repo on GitHub">
+              <a class="repo-link" href={repoDetailPath(project.fullName)} title="Open repo detail">
                 {project.name}
               </a>
             </div>
@@ -1359,6 +1629,7 @@
       {/if}
     </div>
   </section>
+  {/if}
 </main>
 
 <CommandPalette

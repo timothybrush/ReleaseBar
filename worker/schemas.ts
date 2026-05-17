@@ -78,6 +78,86 @@ export const gitHubSearchRepositoryListSchema = v.looseObject({
   message: v.optional(v.string()),
 });
 
+export const gitHubRepositorySchema = v.looseObject({
+  owner: v.looseObject({
+    login: v.string(),
+  }),
+  name: v.string(),
+  full_name: v.string(),
+  private: v.optional(v.boolean()),
+  fork: v.optional(v.boolean()),
+  archived: v.optional(v.boolean()),
+  html_url: v.string(),
+  description: v.nullable(v.string()),
+  default_branch: v.string(),
+  language: v.nullable(v.string()),
+  topics: v.optional(v.array(v.string())),
+  stargazers_count: v.number(),
+  forks_count: v.number(),
+  open_issues_count: v.number(),
+  pushed_at: v.nullable(v.string()),
+  updated_at: v.nullable(v.string()),
+});
+
+export const gitHubReleaseSchema = v.looseObject({
+  tag_name: v.string(),
+  name: v.nullable(v.string()),
+  html_url: v.string(),
+  draft: v.optional(v.boolean()),
+  prerelease: v.optional(v.boolean()),
+  published_at: v.nullable(v.string()),
+});
+
+export const gitHubContributorSchema = v.looseObject({
+  login: v.optional(v.string()),
+  avatar_url: v.optional(v.nullable(v.string())),
+  html_url: v.optional(v.nullable(v.string())),
+  contributions: v.number(),
+});
+
+export const gitHubCommitSchema = v.looseObject({
+  sha: v.string(),
+  commit: v.looseObject({
+    committer: v.optional(
+      v.looseObject({
+        date: v.nullable(v.string()),
+      }),
+    ),
+  }),
+});
+
+export const gitHubCompareSchema = v.looseObject({
+  total_commits: v.optional(v.number()),
+  html_url: v.optional(v.string()),
+});
+
+export const gitHubCheckRunsSchema = v.looseObject({
+  check_runs: v.optional(
+    v.array(
+      v.looseObject({
+        html_url: v.optional(v.nullable(v.string())),
+        status: v.optional(v.nullable(v.string())),
+        conclusion: v.optional(v.nullable(v.string())),
+        name: v.optional(v.nullable(v.string())),
+        started_at: v.optional(v.nullable(v.string())),
+        completed_at: v.optional(v.nullable(v.string())),
+      }),
+    ),
+  ),
+});
+
+export const gitHubCommitActivitySchema = v.array(
+  v.looseObject({
+    week: v.number(),
+    total: v.number(),
+    days: v.array(v.number()),
+  }),
+);
+
+export const gitHubCodeFrequencySchema = v.array(v.tuple([v.number(), v.number(), v.number()]));
+
+export const gitHubLanguageSchema = v.record(v.string(), v.number());
+
 const authUserSchema = v.object({
   id: v.number(),
   login: v.string(),
@@ -100,6 +180,8 @@ export type GitHubOAuthUser = v.InferOutput<typeof gitHubOAuthUserSchema>;
 export type GitHubInstallation = v.InferOutput<typeof gitHubInstallationSchema>;
 export type GitHubInstallationRepository = v.InferOutput<typeof gitHubInstallationRepositorySchema>;
 export type GitHubInstallationToken = v.InferOutput<typeof gitHubInstallationTokenSchema>;
+export type GitHubRepository = v.InferOutput<typeof gitHubRepositorySchema>;
+export type GitHubRelease = v.InferOutput<typeof gitHubReleaseSchema>;
 export type GitHubSearchRepository = v.InferOutput<typeof gitHubSearchRepositorySchema>;
 
 export function parseGitHubResponse<TSchema extends v.GenericSchema>(

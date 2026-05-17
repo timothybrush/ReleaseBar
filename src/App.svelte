@@ -137,6 +137,8 @@
   $: ownerToggles = data
     ? [...new Set(data.projects.map((project) => project.owner.toLowerCase()))].sort()
     : [];
+  $: visibleOwnerCount = new Set(visibleProjects.map((project) => project.owner.toLowerCase())).size;
+  $: showProjectOwnerAvatars = initialRoute.isDefault || visibleOwnerCount > 1;
   $: languageOptions = data
     ? [
         ...new Set(
@@ -220,6 +222,13 @@
 
   function ownerGitHubUrl(owner: Owner): string {
     return owner.url ?? `https://github.com/${encodeURIComponent(owner.login)}`;
+  }
+
+  function projectOwnerAvatarUrl(project: Project): string {
+    const owner = data?.owners.find(
+      (owner) => owner.login.toLowerCase() === project.owner.toLowerCase(),
+    );
+    return owner?.avatarUrl ?? `https://github.com/${encodeURIComponent(project.owner)}.png?size=80`;
   }
 
   function daysAgo(value: string | null): number | null {
@@ -1592,13 +1601,32 @@
         <article class="project" data-freshness={project.freshness}>
           <div class="repo-cell">
             <div class="repo-title">
-              <a class="owner-link" href={ownerDashboardPath(project.owner)} title={`Open @${project.owner} dashboard`}>
-                {project.owner}
-              </a>
-              <span class="repo-separator" aria-hidden="true">/</span>
-              <a class="repo-link" href={repoDetailPath(project.fullName)} title="Open repo detail">
-                {project.name}
-              </a>
+              {#if showProjectOwnerAvatars}
+                <a
+                  class="row-owner-avatar-link"
+                  href={ownerDashboardPath(project.owner)}
+                  title={`Open @${project.owner} dashboard`}
+                  aria-label={`Open @${project.owner} dashboard`}
+                >
+                  <img
+                    class="row-owner-avatar"
+                    src={projectOwnerAvatarUrl(project)}
+                    alt=""
+                    width="28"
+                    height="28"
+                    loading="lazy"
+                  />
+                </a>
+              {/if}
+              <span class="repo-name-line">
+                <a class="owner-link" href={ownerDashboardPath(project.owner)} title={`Open @${project.owner} dashboard`}>
+                  {project.owner}
+                </a>
+                <span class="repo-separator" aria-hidden="true">/</span>
+                <a class="repo-link" href={repoDetailPath(project.fullName)} title="Open repo detail">
+                  {project.name}
+                </a>
+              </span>
             </div>
             <p class="description">{project.description || "no description"}</p>
             <div class="tags">

@@ -947,11 +947,44 @@ body.dev-mode .table-head .since-heading .label-compact {
 .repo-title {
   display: flex;
   max-width: 100%;
-  align-items: baseline;
+  align-items: center;
   overflow: hidden;
-  gap: 4px;
+  gap: 8px;
   font-weight: 700;
   white-space: nowrap;
+}
+
+.repo-name-line {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 4px;
+  overflow: hidden;
+}
+
+.row-owner-avatar-link {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid color-mix(in srgb, var(--green) 28%, var(--line-strong));
+  border-radius: 7px;
+  background: rgba(156, 255, 87, 0.045);
+}
+
+.row-owner-avatar-link:hover,
+.row-owner-avatar-link:focus-visible {
+  border-color: var(--green);
+  box-shadow: 0 0 18px rgba(156, 255, 87, 0.14);
+}
+
+.row-owner-avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 5px;
+  object-fit: cover;
 }
 
 .owner-link,

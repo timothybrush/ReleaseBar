@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added compact owner avatars to mixed-owner repository lists.
 - Added GitHub owner avatars to owner dashboard hero headings.
 - Added pointer cursors to account menu entries.
 - Reduced oversized dashboard and repository detail headline typography.

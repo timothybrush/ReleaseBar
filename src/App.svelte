@@ -1723,6 +1723,15 @@
   {/if}
 </main>
 
+<footer class="site-footer">
+  <span>A project of</span>
+  <a href="https://steipete.me" target="_blank" rel="noreferrer">Peter</a>
+  <a href="https://github.com/steipete" target="_blank" rel="noreferrer">@steipete</a>
+  <span>Steinberger</span>
+  <span class="footer-separator" aria-hidden="true">.</span>
+  <a href="https://github.com/steipete/ReleaseDeck/blob/main/LICENSE" target="_blank" rel="noreferrer">MIT Licensed</a>
+</footer>
+
 <CommandPalette
   commands={commandActions}
   placeholder="jump to repo, dashboard, action"

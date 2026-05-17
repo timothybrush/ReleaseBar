@@ -61,6 +61,38 @@ a:hover {
   padding: 40px 0;
 }
 
+.site-footer {
+  display: flex;
+  width: min(1380px, calc(100vw - 32px));
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: -18px auto 34px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.site-footer a {
+  color: var(--text);
+  text-decoration: underline;
+  text-decoration-color: var(--line-strong);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 4px;
+}
+
+.site-footer a:hover,
+.site-footer a:focus-visible {
+  color: var(--green);
+  text-decoration-color: var(--green);
+  outline: 0;
+}
+
+.footer-separator {
+  color: var(--line-strong);
+}
+
 /* Header */
 
 .topline {
@@ -1764,6 +1796,11 @@ body.dev-mode .table-head .since-heading .label-compact {
   .dev-toggle {
     width: 100%;
     margin-left: 0;
+  }
+
+  .site-footer {
+    flex-wrap: wrap;
+    margin-top: -4px;
   }
 
   .quick-jump {

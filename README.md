@@ -1,4 +1,4 @@
-# ReleaseBar
+# 📦 ReleaseBar
 
 Release freshness dashboard for public GitHub users and orgs.
 

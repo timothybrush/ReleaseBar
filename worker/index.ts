@@ -114,6 +114,7 @@ const hotIndexLimit = 100;
 const hotCacheTtlMs = 5 * 60 * 1000;
 const discoverLimit = 40;
 const discoverHydrateLimit = discoverLimit;
+const discoverHydrateBatchSize = 12;
 const discoverCacheTtlMs = 60 * 60 * 1000;
 const repoDetailCacheTtlMs = 6 * 60 * 60 * 1000;
 const repoDetailWarmingRefreshMs = 5 * 60 * 1000;
@@ -2549,7 +2550,10 @@ async function hydrateDiscoverPayload(
   env: Env,
 ): Promise<DashboardPayload> {
   const now = new Date().toISOString();
-  const repos = payload.projects.slice(0, discoverHydrateLimit).map((project) => project.fullName);
+  const limit = Math.min(discoverHydrateLimit, payload.projects.length);
+  const scannedBefore = Math.min(payload.cache?.progress?.scanned ?? 0, limit);
+  const scanned = Math.min(scannedBefore + discoverHydrateBatchSize, limit);
+  const repos = payload.projects.slice(scannedBefore, scanned).map((project) => project.fullName);
   if (repos.length === 0) {
     return {
       ...payload,
@@ -2563,7 +2567,7 @@ async function hydrateDiscoverPayload(
         state: "fresh",
         stale: false,
         generatedAt: now,
-        progress: { scanned: 0, limit: 0, done: true },
+        progress: { scanned: limit, limit, done: true },
         message: "repository search loaded",
       },
     };
@@ -2588,7 +2592,7 @@ async function hydrateDiscoverPayload(
   const projects = payload.projects.map(
     (project) => hydratedProjects.get(project.fullName.toLowerCase()) ?? project,
   );
-  const scanned = repos.length;
+  const done = scanned >= limit;
   return {
     ...payload,
     generatedAt: now,
@@ -2598,18 +2602,20 @@ async function hydrateDiscoverPayload(
         repoLimit: discoverLimit,
         generatedAt: now,
       }),
-      state: "fresh",
-      stale: false,
+      state: done ? "fresh" : "partial",
+      stale: !done,
       generatedAt: now,
       ...((hydrated.cache?.quota ?? payload.cache?.quota)
         ? { quota: hydrated.cache?.quota ?? payload.cache?.quota }
         : {}),
       progress: {
         scanned,
-        limit: scanned,
-        done: true,
+        limit,
+        done,
       },
-      message: `release data scanned for ${scanned} repositories`,
+      message: done
+        ? `release data scanned for ${scanned} repositories`
+        : `release data scanned for ${scanned}/${limit} repositories`,
     },
     totals: dashboardTotals(projects),
     projects,

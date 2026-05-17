@@ -616,7 +616,24 @@ test("worker serves cached GitHub discovery dashboards from repository search", 
       context,
     );
     assert.equal(second.status, 200);
-    const hydrated = (await second.json()) as DashboardPayload;
+    const firstBatch = (await second.json()) as DashboardPayload;
+    assert.equal(firstBatch.cache?.state, "partial");
+    assert.equal(firstBatch.cache?.progress?.done, false);
+    assert.equal(firstBatch.cache?.progress?.scanned, 12);
+    assert.equal(
+      firstBatch.projects.filter((project) => project.version === "repo search").length,
+      1,
+    );
+
+    await Promise.all(waitUntil.splice(0));
+
+    const third = await worker.fetch(
+      new Request("https://release.bar/api/_discover?period=week&lang=TypeScript"),
+      env,
+      context,
+    );
+    assert.equal(third.status, 200);
+    const hydrated = (await third.json()) as DashboardPayload;
     assert.equal(hydrated.cache?.state, "fresh");
     assert.equal(hydrated.cache?.progress?.done, true);
     assert.equal(hydrated.cache?.progress?.scanned, searchItems.length);

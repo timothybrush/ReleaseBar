@@ -92,6 +92,39 @@ a:hover {
   text-decoration-color: currentColor;
 }
 
+.repo-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.repo-actions a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 6px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: rgba(16, 19, 15, 0.72);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.repo-actions a:first-child {
+  border-color: color-mix(in srgb, var(--green) 62%, var(--line-strong));
+  color: var(--green);
+}
+
+.repo-actions a:hover,
+.repo-actions a:focus-visible {
+  border-color: var(--green);
+  background: rgba(156, 255, 87, 0.08);
+  color: var(--green);
+}
+
 .eyebrow-nav {
   display: flex;
   align-items: center;

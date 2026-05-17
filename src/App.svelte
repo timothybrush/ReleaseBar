@@ -1117,6 +1117,14 @@
           {subtitle}
         {/if}
       </p>
+      {#if repoRoute && repoDetail}
+        <nav class="repo-actions" aria-label="Repository links">
+          <a href={repoDetail.project.url} target="_blank" rel="noreferrer">GitHub</a>
+          <a href={`${repoDetail.project.url}/releases`} target="_blank" rel="noreferrer">Releases</a>
+          <a href={repoDetail.project.issuesUrl} target="_blank" rel="noreferrer">Issues</a>
+          <a href={repoDetail.project.pullRequestsUrl} target="_blank" rel="noreferrer">PRs</a>
+        </nav>
+      {/if}
     </div>
     <div class="top-actions">
       <button

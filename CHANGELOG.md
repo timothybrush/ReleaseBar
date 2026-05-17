@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Simplified the dev-mode toggle so the selected border carries the state without a duplicate checkbox glyph.
 - Show visible repository rows before release data finishes scanning, then progressively hydrate them.
 - Added avatar, release version, and commits-since-release detail to social cards.
 - Added compact owner avatars to mixed-owner repository lists.

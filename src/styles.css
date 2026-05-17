@@ -450,26 +450,39 @@ input::placeholder {
   display: inline-flex;
   min-height: var(--control-height);
   align-items: center;
-  gap: 8px;
+  justify-content: center;
   margin-left: auto;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 0 10px;
+  padding: 0 13px;
   background: var(--panel);
   color: var(--muted);
   cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    box-shadow 120ms ease,
+    color 120ms ease;
 }
 
 .dev-toggle input {
-  width: 14px;
-  height: 14px;
-  accent-color: var(--green);
-  cursor: pointer;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 .dev-toggle:has(input:checked) {
   border-color: var(--cyan);
   color: var(--text);
+  box-shadow: 0 0 18px rgba(130, 227, 255, 0.16);
+}
+
+.dev-toggle:has(input:focus-visible) {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
 }
 
 button {

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Made the account menu size to its content and softened oversized dashboard headlines.
 - Added obvious GitHub, release, issue, and PR links to repository detail pages.
 - Scanned release data for every repository shown on the GitHub Hot root dashboard instead of only the first batch.
 - Kept the GitHub App menu state stable immediately after installation while GitHub installation data catches up.

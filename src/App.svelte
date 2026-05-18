@@ -1620,7 +1620,7 @@
             <div class="panel-heading">
               <div>
                 <span class="panel-kicker">commit graph</span>
-                <h2>last 52 weeks</h2>
+                <h2>last year</h2>
               </div>
               <strong>{numberFormat.format(commitTotal())} commits</strong>
             </div>

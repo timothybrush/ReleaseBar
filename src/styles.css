@@ -233,6 +233,44 @@ h1 {
   object-fit: cover;
 }
 
+.repo-title {
+  display: flex;
+  align-items: center;
+  gap: clamp(14px, 2vw, 24px);
+  min-width: 0;
+}
+
+.repo-title-avatar-link {
+  display: inline-flex;
+  flex: 0 0 auto;
+  border-radius: var(--radius);
+}
+
+.repo-title-avatar-link:hover .repo-title-avatar,
+.repo-title-avatar-link:focus-visible .repo-title-avatar {
+  border-color: var(--green);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.45),
+    0 0 34px rgba(156, 255, 87, 0.2);
+}
+
+.repo-title-avatar {
+  width: clamp(58px, 6.4vw, 88px);
+  height: clamp(58px, 6.4vw, 88px);
+  border: 1px solid color-mix(in srgb, var(--green) 44%, var(--line-strong));
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.45),
+    0 0 34px rgba(156, 255, 87, 0.12);
+  object-fit: cover;
+}
+
+.repo-title-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .status {
   position: relative;
   display: flex;
@@ -1337,6 +1375,7 @@ body.dev-mode .table-head .since-heading .label-compact {
 }
 
 .detail-wide,
+.detail-tail,
 .detail-overview {
   grid-column: 1 / -1;
 }
@@ -1370,7 +1409,7 @@ body.dev-mode .table-head .since-heading .label-compact {
   margin-top: 10px;
   overflow: hidden;
   color: var(--text);
-  font-size: clamp(24px, 3vw, 42px);
+  font-size: min(clamp(24px, 3vw, 42px), var(--detail-value-size, 42px));
   line-height: 1;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1538,7 +1577,7 @@ body.dev-mode .table-head .since-heading .label-compact {
 }
 
 .contributor-list,
-.release-list,
+.release-groups,
 .language-bars {
   display: grid;
   gap: 10px;
@@ -1585,6 +1624,26 @@ body.dev-mode .table-head .since-heading .label-compact {
   border-radius: 999px;
   background: var(--green);
   opacity: 0.72;
+}
+
+.release-group {
+  display: grid;
+  gap: 8px;
+}
+
+.release-group + .release-group {
+  margin-top: 8px;
+}
+
+.release-group-label {
+  color: var(--green);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.release-list {
+  display: grid;
+  gap: 10px;
 }
 
 .release-list a {

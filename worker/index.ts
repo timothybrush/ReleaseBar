@@ -2459,7 +2459,7 @@ async function buildRepoDetail(
 
   const [releases, contributors, languages, latestCommit, openPullRequests] = await Promise.all([
     detailGitHubJson(
-      `${path}/releases?per_page=8`,
+      `${path}/releases?per_page=20`,
       v.array(gitHubReleaseSchema),
       "repository releases",
       token,

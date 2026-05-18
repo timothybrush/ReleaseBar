@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added owner avatars to repository detail hero headings.
+- Made repository detail stat values shrink for long release names before truncating.
+- Split repository detail releases into recent stable and prerelease groups.
+- Fixed the repository detail grid so the final stats panel spans the full width instead of leaving an empty cell.
 - Limited inline need-attention row text to repositories with an existing release and more than 200 commits since that release.
 - Restored the package emoji in the README heading.
 - Added clearer public dashboard profile state, public-only settings copy, need-attention reasons, scan progress, richer repo detail cadence/work trends, command actions, mobile row cards, longer stale cache retention, and broader deploy smoke checks.

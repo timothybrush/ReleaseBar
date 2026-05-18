@@ -975,6 +975,7 @@ test("worker builds cached repository detail with releases and stats", async () 
       });
     }
     if (path === "/repos/acme/releasebar/releases") {
+      assert.equal(url.searchParams.get("per_page"), "20");
       return Response.json([
         {
           tag_name: "v1.2.3",

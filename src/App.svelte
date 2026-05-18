@@ -191,6 +191,12 @@
   $: detailMaxContributorCommits = maxNumber(
     repoDetail?.contributors.map((contributor) => contributor.commits) ?? [],
   );
+  $: stableReleases = (repoDetail?.releases ?? [])
+    .filter((release) => !release.prerelease)
+    .slice(0, 4);
+  $: preReleases = (repoDetail?.releases ?? [])
+    .filter((release) => release.prerelease)
+    .slice(0, 4);
   $: detailLanguageTotal = (repoDetail?.languages ?? []).reduce(
     (sum, language) => sum + language.bytes,
     0,
@@ -329,6 +335,12 @@
   function formatDays(value: number | null): string {
     if (value === null) return "n/a";
     return `${numberFormat.format(value)}d`;
+  }
+
+  function detailValueStyle(value: string | number | null): string {
+    const length = String(value ?? "").length;
+    const size = length > 22 ? 24 : length > 16 ? 30 : length > 12 ? 34 : 42;
+    return `--detail-value-size: ${size}px`;
   }
 
   function attentionText(project: Project): string {
@@ -1241,6 +1253,24 @@
               <span>+{heroExtraCount}</span>
             {/if}
           </span>
+        {:else if repoRoute && repoDetail}
+          <span class="repo-title">
+            <a
+              class="repo-title-avatar-link"
+              href={ownerDashboardPath(repoDetail.project.owner)}
+              aria-label={`Open @${repoDetail.project.owner} dashboard`}
+            >
+              <img
+                class="repo-title-avatar"
+                src={projectOwnerAvatarUrl(repoDetail.project)}
+                alt=""
+                width="88"
+                height="88"
+                loading="eager"
+              />
+            </a>
+            <span class="repo-title-text">{label}</span>
+          </span>
         {:else}
           {label}
         {/if}
@@ -1465,27 +1495,40 @@
           <section class="detail-panel detail-overview">
             <div>
               <span class="panel-kicker">release</span>
-              <strong>{repoDetail.project.version}</strong>
+              <strong
+                style={detailValueStyle(repoDetail.project.version)}
+                title={repoDetail.project.version}
+              >
+                {repoDetail.project.version}
+              </strong>
               <small>{shortDate(repoDetail.project.releaseDate)} · {relativeDate(repoDetail.project.releaseDate)}</small>
             </div>
             <div>
               <span class="panel-kicker">commits since</span>
-              <strong>{repoDetail.project.commitsSinceRelease ?? "n/a"}</strong>
+              <strong style={detailValueStyle(repoDetail.project.commitsSinceRelease ?? "n/a")}>
+                {repoDetail.project.commitsSinceRelease ?? "n/a"}
+              </strong>
               <small>{repoDetail.project.freshness}</small>
             </div>
             <div>
               <span class="panel-kicker">stars</span>
-              <strong>{numberFormat.format(repoDetail.project.stars)}</strong>
+              <strong style={detailValueStyle(numberFormat.format(repoDetail.project.stars))}>
+                {numberFormat.format(repoDetail.project.stars)}
+              </strong>
               <small>{numberFormat.format(repoDetail.project.forks)} forks</small>
             </div>
             <div>
               <span class="panel-kicker">open work</span>
-              <strong>{numberFormat.format(repoDetail.project.openIssues + repoDetail.project.openPullRequests)}</strong>
+              <strong style={detailValueStyle(numberFormat.format(repoDetail.project.openIssues + repoDetail.project.openPullRequests))}>
+                {numberFormat.format(repoDetail.project.openIssues + repoDetail.project.openPullRequests)}
+              </strong>
               <small>{repoDetail.project.openIssues} issues · {repoDetail.project.openPullRequests} PRs</small>
             </div>
             <div>
               <span class="panel-kicker">cadence</span>
-              <strong>{formatDays(releaseCadence.medianDays)}</strong>
+              <strong style={detailValueStyle(formatDays(releaseCadence.medianDays))}>
+                {formatDays(releaseCadence.medianDays)}
+              </strong>
               <small>median release gap · {releaseCadence.releaseCount} recent releases</small>
             </div>
           </section>
@@ -1545,14 +1588,36 @@
               </div>
               <strong>{formatDays(releaseCadence.latestGapDays)}</strong>
             </div>
-            <div class="release-list">
-              {#each repoDetail.releases.slice(0, 6) as release}
-                <a href={release.url} target="_blank" rel="noreferrer">
-                  <strong>{release.tagName}</strong>
-                  <span>{shortDate(release.publishedAt)} · {relativeDate(release.publishedAt)}</span>
-                  {#if release.prerelease}<small>pre</small>{/if}
-                </a>
-              {/each}
+            <div class="release-groups">
+              {#if stableReleases.length > 0}
+                <div class="release-group">
+                  <span class="release-group-label">stable</span>
+                  <div class="release-list">
+                    {#each stableReleases as release}
+                      <a href={release.url} target="_blank" rel="noreferrer">
+                        <strong>{release.tagName}</strong>
+                        <span>{shortDate(release.publishedAt)} · {relativeDate(release.publishedAt)}</span>
+                      </a>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
+              {#if preReleases.length > 0}
+                <div class="release-group">
+                  <span class="release-group-label">pre</span>
+                  <div class="release-list">
+                    {#each preReleases as release}
+                      <a href={release.url} target="_blank" rel="noreferrer">
+                        <strong>{release.tagName}</strong>
+                        <span>{shortDate(release.publishedAt)} · {relativeDate(release.publishedAt)}</span>
+                      </a>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
+              {#if stableReleases.length === 0 && preReleases.length === 0}
+                <p class="detail-empty">Release history is unavailable.</p>
+              {/if}
             </div>
           </section>
 
@@ -1609,7 +1674,7 @@
             </div>
           </section>
 
-          <section class="detail-panel">
+          <section class="detail-panel detail-tail">
             <div class="panel-heading">
               <div>
                 <span class="panel-kicker">code churn</span>

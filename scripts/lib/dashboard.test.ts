@@ -621,6 +621,188 @@ test("worker serves escaped dotted repository detail paths as app shell", async 
   assert.match(html, /openclaw\/react\.dev · release\.bar/);
 });
 
+test("worker embeds cached public dashboard data in the app shell", async () => {
+  const payload = testDashboard("hot", [testProject({ owner: "acme", name: "releasebar" })]);
+  const response = await worker.fetch(
+    new Request("https://release.bar/"),
+    {
+      ASSETS: {
+        fetch: async (request: Request) => {
+          assert.equal(new URL(request.url).pathname, "/index.html");
+          return new Response(
+            '<title>ReleaseBar</title><meta property="og:title" content="ReleaseBar" /><meta property="og:url" content="https://release.bar/" /><meta property="og:image" content="https://release.bar/og/ReleaseBar.svg" /><meta name="twitter:title" content="ReleaseBar" /><meta name="twitter:image" content="https://release.bar/og/ReleaseBar.svg" /><script type="module" src="/assets/index.js"></script>',
+            { headers: { "content-type": "text/html" } },
+          );
+        },
+      },
+      DASHBOARD_CACHE: kvStore({
+        "discover:v4:week:all": JSON.stringify(payload),
+      }),
+    },
+    { waitUntil: () => undefined },
+  );
+
+  const html = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(html, /id="releasebar-initial-data"/);
+  assert.match(html, /"route":"dashboard"/);
+  assert.match(html, /acme\\u002freleasebar|acme\/releasebar/);
+  assert.ok(html.indexOf('id="releasebar-initial-data"') < html.indexOf('<script type="module"'));
+});
+
+test("worker embeds cached language-filtered discover data in the app shell", async () => {
+  const allPayload = testDashboard("all", [testProject({ owner: "acme", name: "allbar" })]);
+  const languagePayload = testDashboard("typescript", [
+    testProject({ owner: "acme", name: "typedbar", language: "TypeScript" }),
+  ]);
+  const response = await worker.fetch(
+    new Request("https://release.bar/?period=day&hotLang=TypeScript"),
+    {
+      ASSETS: {
+        fetch: async (request: Request) => {
+          assert.equal(new URL(request.url).pathname, "/index.html");
+          return new Response(
+            '<title>ReleaseBar</title><script type="module" src="/assets/index.js"></script>',
+            { headers: { "content-type": "text/html" } },
+          );
+        },
+      },
+      DASHBOARD_CACHE: kvStore({
+        "discover:v4:day:all": JSON.stringify(allPayload),
+        "discover:v4:day:typescript": JSON.stringify(languagePayload),
+      }),
+    },
+    { waitUntil: () => undefined },
+  );
+
+  const html = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(html, /id="releasebar-initial-data"/);
+  assert.match(html, /typedbar/);
+  assert.doesNotMatch(html, /allbar/);
+});
+
+test("worker preserves partial discover state in embedded app shell data", async () => {
+  const payload = testDashboard("all", [
+    testProject({
+      owner: "acme",
+      name: "placeholder",
+      version: "repo search",
+      releaseDate: null,
+      commitsSinceRelease: null,
+      compareUrl: null,
+    }),
+  ]);
+  payload.cache = {
+    state: "partial",
+    stale: true,
+    capped: false,
+    repoLimit: 200,
+    generatedAt: payload.generatedAt,
+    progress: { scanned: 0, limit: 1, done: false },
+  };
+  const response = await worker.fetch(
+    new Request("https://release.bar/"),
+    {
+      ASSETS: {
+        fetch: async (request: Request) => {
+          assert.equal(new URL(request.url).pathname, "/index.html");
+          return new Response(
+            '<title>ReleaseBar</title><script type="module" src="/assets/index.js"></script>',
+            { headers: { "content-type": "text/html" } },
+          );
+        },
+      },
+      DASHBOARD_CACHE: kvStore({
+        "discover:v4:week:all": JSON.stringify(payload),
+      }),
+    },
+    { waitUntil: () => undefined },
+  );
+
+  const html = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(html, /id="releasebar-initial-data"/);
+  assert.match(html, /"state":"partial"/);
+  assert.match(html, /"done":false/);
+});
+
+test("worker does not treat view language filters as discover cache selectors", async () => {
+  const allPayload = testDashboard("all", [testProject({ owner: "acme", name: "allbar" })]);
+  const languagePayload = testDashboard("typescript", [
+    testProject({ owner: "acme", name: "typedbar", language: "TypeScript" }),
+  ]);
+  const response = await worker.fetch(
+    new Request("https://release.bar/?period=day&lang=TypeScript"),
+    {
+      ASSETS: {
+        fetch: async (request: Request) => {
+          assert.equal(new URL(request.url).pathname, "/index.html");
+          return new Response(
+            '<title>ReleaseBar</title><script type="module" src="/assets/index.js"></script>',
+            { headers: { "content-type": "text/html" } },
+          );
+        },
+      },
+      DASHBOARD_CACHE: kvStore({
+        "discover:v4:day:all": JSON.stringify(allPayload),
+        "discover:v4:day:typescript": JSON.stringify(languagePayload),
+      }),
+    },
+    { waitUntil: () => undefined },
+  );
+
+  const html = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(html, /id="releasebar-initial-data"/);
+  assert.match(html, /allbar/);
+  assert.doesNotMatch(html, /typedbar/);
+});
+
+test("worker embeds cached public repository detail data in the app shell", async () => {
+  const generatedAt = new Date().toISOString();
+  const payload: RepoDetailPayload = {
+    fullName: "acme/releasebar",
+    generatedAt,
+    cache: {
+      state: "fresh",
+      stale: false,
+      generatedAt,
+    },
+    project: testProject({ owner: "acme", name: "releasebar" }),
+    releases: [],
+    contributors: [],
+    commitActivity: [],
+    codeFrequency: [],
+    languages: [],
+    workTrend: null,
+  };
+  const response = await worker.fetch(
+    new Request("https://release.bar/acme/releasebar"),
+    {
+      ASSETS: {
+        fetch: async (request: Request) => {
+          assert.equal(new URL(request.url).pathname, "/index.html");
+          return new Response(
+            '<title>ReleaseBar</title><meta property="og:title" content="ReleaseBar" /><meta property="og:url" content="https://release.bar/" /><meta property="og:image" content="https://release.bar/og/ReleaseBar.svg" /><meta name="twitter:title" content="ReleaseBar" /><meta name="twitter:image" content="https://release.bar/og/ReleaseBar.svg" /><script type="module" src="/assets/index.js"></script>',
+            { headers: { "content-type": "text/html" } },
+          );
+        },
+      },
+      DASHBOARD_CACHE: kvStore({
+        "repo-detail:v4:acme/releasebar": JSON.stringify(payload),
+      }),
+    },
+    { waitUntil: () => undefined },
+  );
+
+  const html = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(html, /id="releasebar-initial-data"/);
+  assert.match(html, /"route":"repo"/);
+  assert.match(html, /acme\\u002freleasebar|acme\/releasebar/);
+});
+
 test("worker social cards include owner avatars and repository release metrics", async () => {
   const generatedAt = new Date().toISOString();
   const repoPayload: RepoDetailPayload = {

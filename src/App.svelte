@@ -53,6 +53,22 @@
 
   const repoRoute = repoFromPath(location.pathname);
   const initialRoute = dashboardRoute(location.pathname, location.search);
+  type InitialPageData =
+    | { route: "dashboard"; payload: DashboardPayload }
+    | { route: "repo"; payload: RepoDetailPayload };
+
+  function initialPageData(): InitialPageData | null {
+    const element = document.getElementById("releasebar-initial-data");
+    if (!element?.textContent) return null;
+    try {
+      const parsed = JSON.parse(element.textContent) as InitialPageData;
+      return parsed.route === "dashboard" || parsed.route === "repo" ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  const embedded = initialPageData();
   const storedDevMode = localStorage.getItem("releasedeck:dev-mode") === "true";
   const storedTheme = localStorage.getItem("releasedeck:theme");
   let theme: "dark" | "light" = storedTheme === "light" ? "light" : "dark";
@@ -65,8 +81,10 @@
   const hiddenOwnersKey = `releasedeck:${routeScope}:hidden-owners`;
   const hiddenReposKey = `releasedeck:${routeScope}:hidden-repos`;
 
-  let data: DashboardPayload | null = null;
-  let repoDetail: RepoDetailPayload | null = null;
+  let data: DashboardPayload | null =
+    !repoRoute && embedded?.route === "dashboard" ? embedded.payload : null;
+  let repoDetail: RepoDetailPayload | null =
+    repoRoute && embedded?.route === "repo" ? embedded.payload : null;
   let auth: AuthPayload | null = null;
   let query = initialView.query;
   let language = initialView.language;
@@ -86,8 +104,8 @@
   let profileMessage = "";
   let errorMessage = "";
   let paletteText = "";
-  let generatedLabel = "loading";
-  let generatedDetail = "";
+  let generatedLabel = embedded ? "cached" : "loading";
+  let generatedDetail = embedded ? "rendered from cached data" : "";
   let mounted = false;
   let dashboardRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let repoDetailRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1483,9 +1501,41 @@
     const unsubscribe = paletteStore.subscribe((value: PaletteStoreParams) => {
       paletteText = value.textInput;
     });
+    const routeTask = (() => {
+      if (repoRoute && repoDetail) {
+        if (!repoDetail.project.releaseDate && repoSummaryRange === "release") {
+          repoSummaryRange = "month";
+        }
+        updateRepoDetailStatus();
+        if (
+          repoDetail.cache.state === "warming" ||
+          repoDetail.cache.state === "stale" ||
+          repoDetail.releaseSummary?.state === "warming"
+        ) {
+          return loadRepoDetail();
+        }
+        if (repoSummaryRange !== "release" && !repoActivity) {
+          void loadRepoActivity();
+        }
+        return Promise.resolve();
+      }
+      if (!repoRoute && data) {
+        updateStatus();
+        if (new URLSearchParams(location.search).has("rdRefresh")) {
+          return loadDashboard();
+        }
+        if (shouldAutoRefresh(data)) {
+          return loadDashboard();
+        } else {
+          closeDashboardStream();
+        }
+        return Promise.resolve();
+      }
+      return repoRoute ? loadRepoDetail() : loadDashboard();
+    })();
     void Promise.all([
       loadAuth(),
-      repoRoute ? loadRepoDetail() : loadDashboard(),
+      routeTask,
       showOwnerActivity ? loadOwnerActivity() : Promise.resolve(),
     ]).catch((error) => {
       generatedLabel = "failed";

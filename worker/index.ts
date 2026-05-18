@@ -369,6 +369,10 @@ type TokenSources = {
   repos: string[];
 };
 
+type InitialPageData =
+  | { route: "dashboard"; payload: DashboardPayload }
+  | { route: "repo"; payload: RepoDetailPayload };
+
 function shouldServeAppShell(url: URL): boolean {
   if (url.pathname.split("/").filter(Boolean)[0] === "-" && repoFullNameFromPath(url.pathname)) {
     return true;
@@ -384,6 +388,23 @@ function escapeHtml(value: string): string {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function escapeJsonForHtml(value: unknown): string {
+  return JSON.stringify(value)
+    .replaceAll("<", "\\u003c")
+    .replaceAll(">", "\\u003e")
+    .replaceAll("&", "\\u0026")
+    .replaceAll("\u2028", "\\u2028")
+    .replaceAll("\u2029", "\\u2029");
+}
+
+function injectInitialPageData(html: string, data: InitialPageData | null): string {
+  if (!data) return html;
+  const script = `<script id="releasebar-initial-data" type="application/json">${escapeJsonForHtml(data)}</script>`;
+  return html.includes('<script type="module"')
+    ? html.replace('<script type="module"', `${script}<script type="module"`)
+    : html.replace("</head>", `${script}</head>`);
 }
 
 function base64Url(bytes: Uint8Array): string {
@@ -582,6 +603,12 @@ function repoFullNameFromPath(pathname: string): string | null {
   return validRepoSlug(fullName) ? fullName : null;
 }
 
+function ownerFromPagePath(pathname: string): string | null {
+  if (repoFullNameFromPath(pathname)) return null;
+  const owner = slugOwner(pathname.split("/").filter(Boolean)[0] ?? "");
+  return validOwnerSlug(owner) ? owner : null;
+}
+
 function uniqueSorted(values: string[]): string[] {
   return [...new Set(values)].sort((a, b) => a.localeCompare(b));
 }
@@ -618,6 +645,22 @@ async function resolveOwners(
   return owners;
 }
 
+async function initialPageData(url: URL, env: Env): Promise<InitialPageData | null> {
+  const repo = repoFullNameFromPath(url.pathname);
+  if (repo) return cachedRepoInitialData(env, repo);
+
+  const primaryOwner = ownerFromPagePath(url.pathname);
+  const custom =
+    ownerListFromUrl(url, primaryOwner ?? undefined).length > 0 || repoListFromUrl(url).length > 0;
+  if (primaryOwner || custom) {
+    return cachedDashboardInitialData(env, url, primaryOwner);
+  }
+  if ((url.searchParams.get("period") ?? "").toLowerCase() === "releasebar") {
+    return cachedHotInitialData(env);
+  }
+  return cachedDiscoverInitialData(env, url);
+}
+
 async function assetResponse(request: Request, env: Env): Promise<Response> {
   if (!env.ASSETS) {
     return jsonResponse({ error: "not found" }, 404);
@@ -633,28 +676,32 @@ async function assetResponse(request: Request, env: Env): Promise<Response> {
     const originalUrl = new URL(request.url);
     const label = socialLabel(originalUrl);
     const image = `${originalUrl.origin}/og/${encodeURIComponent(label)}.svg`;
-    const html = (await response.text())
-      .replace(/<title>.*?<\/title>/, `<title>${escapeHtml(label)} · release.bar</title>`)
-      .replace(
-        /<meta property="og:title" content="[^"]*" \/>/,
-        `<meta property="og:title" content="${escapeHtml(label)} · release.bar" />`,
-      )
-      .replace(
-        /<meta property="og:url" content="[^"]*" \/>/,
-        `<meta property="og:url" content="${escapeHtml(originalUrl.href)}" />`,
-      )
-      .replace(
-        /<meta property="og:image" content="[^"]*" \/>/,
-        `<meta property="og:image" content="${escapeHtml(image)}" />`,
-      )
-      .replace(
-        /<meta name="twitter:title" content="[^"]*" \/>/,
-        `<meta name="twitter:title" content="${escapeHtml(label)} · release.bar" />`,
-      )
-      .replace(
-        /<meta name="twitter:image" content="[^"]*" \/>/,
-        `<meta name="twitter:image" content="${escapeHtml(image)}" />`,
-      );
+    const initialData = await initialPageData(originalUrl, env).catch(() => null);
+    const html = injectInitialPageData(
+      (await response.text())
+        .replace(/<title>.*?<\/title>/, `<title>${escapeHtml(label)} · release.bar</title>`)
+        .replace(
+          /<meta property="og:title" content="[^"]*" \/>/,
+          `<meta property="og:title" content="${escapeHtml(label)} · release.bar" />`,
+        )
+        .replace(
+          /<meta property="og:url" content="[^"]*" \/>/,
+          `<meta property="og:url" content="${escapeHtml(originalUrl.href)}" />`,
+        )
+        .replace(
+          /<meta property="og:image" content="[^"]*" \/>/,
+          `<meta property="og:image" content="${escapeHtml(image)}" />`,
+        )
+        .replace(
+          /<meta name="twitter:title" content="[^"]*" \/>/,
+          `<meta name="twitter:title" content="${escapeHtml(label)} · release.bar" />`,
+        )
+        .replace(
+          /<meta name="twitter:image" content="[^"]*" \/>/,
+          `<meta name="twitter:image" content="${escapeHtml(image)}" />`,
+        ),
+      initialData,
+    );
     const headers = new Headers(response.headers);
     headers.delete("content-encoding");
     headers.delete("content-length");
@@ -2339,6 +2386,15 @@ async function hotResponse(env: Env): Promise<Response> {
   return jsonResponse(payload);
 }
 
+async function cachedHotInitialData(env: Env): Promise<InitialPageData | null> {
+  const cached = await readCached(env, hotCacheKey);
+  if (!cached || !canDisplayCached(cached) || cached.cache?.state === "error") return null;
+  return {
+    route: "dashboard",
+    payload: withCacheState(cached, cacheAgeMs(cached) < hotCacheTtlMs ? "fresh" : "stale"),
+  };
+}
+
 type DiscoverPeriod = "day" | "week" | "month" | "year";
 
 const discoverPeriods = new Set<DiscoverPeriod>(["day", "week", "month", "year"]);
@@ -2351,6 +2407,11 @@ function discoverPeriod(url: URL): DiscoverPeriod {
 
 function discoverLanguage(url: URL): string {
   const raw = (url.searchParams.get("lang") ?? "").trim();
+  return /^[a-z0-9+#.\-\s]{1,32}$/i.test(raw) ? raw : "";
+}
+
+function discoverPageLanguage(url: URL): string {
+  const raw = (url.searchParams.get("hotLang") ?? "").trim();
   return /^[a-z0-9+#.\-\s]{1,32}$/i.test(raw) ? raw : "";
 }
 
@@ -4505,6 +4566,18 @@ async function repoDetailResponse(
   }
 }
 
+async function cachedRepoInitialData(env: Env, fullName: string): Promise<InitialPageData | null> {
+  const [owner, repo] = fullName.split("/");
+  if (!owner || !repo) return null;
+  const cached = await readRepoDetail(env, repoDetailCacheKey(owner, repo));
+  if (!cached || repoDetailAgeMs(cached) > maxDisplayStaleMs) return null;
+  const payload =
+    repoDetailAgeMs(cached) < repoDetailCacheTtlMs
+      ? cached
+      : withRepoDetailState(cached, "stale", "refreshing repository statistics");
+  return { route: "repo", payload };
+}
+
 function discoverFreshness(repo: GitHubSearchRepository): Project["freshness"] {
   const stars = repo.stargazers_count ?? 0;
   const pushedAt = repo.pushed_at ? Date.parse(repo.pushed_at) : 0;
@@ -4834,13 +4907,27 @@ async function discoverResponse(env: Env, url: URL, context: ExecutionContext): 
   }
 }
 
-async function dashboardEventParts(url: URL, env: Env): Promise<{ key: string } | null> {
-  const rawOwner =
-    url.pathname
-      .replace(/^\/api\//, "")
-      .replace(/\/events$/, "")
-      .split("/")[0] ?? "";
-  const primaryOwner = rawOwner === "dashboard" ? null : slugOwner(rawOwner);
+async function cachedDiscoverInitialData(env: Env, url: URL): Promise<InitialPageData | null> {
+  const period = discoverPeriod(url);
+  const language = discoverPageLanguage(url);
+  const cached = await readCached(env, discoverCacheKey(period, language));
+  if (!cached || !canDisplayCached(cached) || cached.cache?.state === "error") return null;
+  const state = discoverNeedsHydration(cached)
+    ? "partial"
+    : cacheAgeMs(cached) < discoverCacheTtlMs
+      ? "fresh"
+      : "stale";
+  return {
+    route: "dashboard",
+    payload: withCacheState(cached, state),
+  };
+}
+
+async function dashboardCacheKeyForPage(
+  url: URL,
+  env: Env,
+  primaryOwner: string | null,
+): Promise<string | null> {
   if (primaryOwner !== null && !validOwnerSlug(primaryOwner)) {
     return null;
   }
@@ -4864,16 +4951,42 @@ async function dashboardEventParts(url: URL, env: Env): Promise<{ key: string } 
   if (!primaryOwner && extraOwnerSlugs.length === 0 && includeRepos.length === 0) {
     return null;
   }
-  return {
-    key: dashboardCacheKey({
-      owner: primaryOwner ?? "custom",
-      owners: extraOwnerSlugs,
-      repos: includeRepos,
-      salt: profile?.updatedAt,
-      ...options,
-      schemaVersion: dashboardSchemaVersion,
-    }),
-  };
+  return dashboardCacheKey({
+    owner: primaryOwner ?? "custom",
+    owners: extraOwnerSlugs,
+    repos: includeRepos,
+    salt: profile?.updatedAt,
+    ...options,
+    schemaVersion: dashboardSchemaVersion,
+  });
+}
+
+async function cachedDashboardInitialData(
+  env: Env,
+  url: URL,
+  primaryOwner: string | null,
+): Promise<InitialPageData | null> {
+  const key = await dashboardCacheKeyForPage(url, env, primaryOwner);
+  const cached = key ? await readCached(env, key) : null;
+  if (!cached || !canDisplayCached(cached) || cached.cache?.state === "error") return null;
+  const state =
+    cached.cache?.progress?.done === false
+      ? "partial"
+      : cacheAgeMs(cached) < fullTtlMs
+        ? "fresh"
+        : "stale";
+  return { route: "dashboard", payload: withCacheState(cached, state) };
+}
+
+async function dashboardEventParts(url: URL, env: Env): Promise<{ key: string } | null> {
+  const rawOwner =
+    url.pathname
+      .replace(/^\/api\//, "")
+      .replace(/\/events$/, "")
+      .split("/")[0] ?? "";
+  const primaryOwner = rawOwner === "dashboard" ? null : slugOwner(rawOwner);
+  const key = await dashboardCacheKeyForPage(url, env, primaryOwner);
+  return key ? { key } : null;
 }
 
 function sleep(ms: number): Promise<void> {

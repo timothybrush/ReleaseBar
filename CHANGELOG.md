@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Switched AI summaries to OpenAI's `chat-latest` API alias for GPT-5.5 Instant.
 - Added recent-work AI summaries to repository detail pages, including unreleased repositories and a since-release toggle for released repositories.
 - Made working-on AI summaries focus on concrete work instead of restating that the data came from GitHub activity.
 - Linked working-on repository chips to ReleaseBar repository detail pages and tightened the activity heading spacing.

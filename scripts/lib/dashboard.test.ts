@@ -1318,8 +1318,8 @@ test("worker summarizes commits since release in the background", async () => {
       const headers = init?.headers as Record<string, string> | undefined;
       assert.equal(headers?.authorization, "Bearer openai-token");
       const body = JSON.parse(String(init?.body ?? "{}"));
-      assert.equal(body.model, "gpt-5.5");
-      assert.equal(body.reasoning?.effort, "low");
+      assert.equal(body.model, "chat-latest");
+      assert.equal(body.reasoning, undefined);
       assert.match(JSON.stringify(body.input), /Add release summary panel/);
       return Response.json({
         output_text: "",
@@ -1351,13 +1351,14 @@ test("worker summarizes commits since release in the background", async () => {
       (await cache.get("repo-detail:v4:acme/releasebar")) ?? "{}",
     ) as RepoDetailPayload;
     assert.equal(cached.releaseSummary?.state, "ready");
+    assert.equal(cached.releaseSummary?.model, "chat-latest");
     assert.match(cached.releaseSummary?.text ?? "", /AI summary panel/);
     assert.equal(cached.releaseSummary?.commitsUsed, 2);
     assert.equal(cached.generatedAt, generatedAt);
     assert.equal(cached.cache.state, "warming");
     assert.equal(cached.cache.generatedAt, generatedAt);
     assert.notEqual(
-      await cache.get("release-summary:v1:acme/releasebar:v1.0.0:abcdef1:gpt-5.5"),
+      await cache.get("release-summary:v1:acme/releasebar:v1.0.0:abcdef1:chat-latest"),
       null,
     );
   } finally {
@@ -1429,6 +1430,8 @@ test("worker summarizes recent repository activity in the background", async () 
       const headers = init?.headers as Record<string, string> | undefined;
       assert.equal(headers?.authorization, "Bearer openai-token");
       const body = JSON.parse(String(init?.body ?? "{}"));
+      assert.equal(body.model, "chat-latest");
+      assert.equal(body.reasoning, undefined);
       assert.match(JSON.stringify(body.input), /Repository: acme\/unreleased/);
       assert.match(JSON.stringify(body.input), /Add repository activity summary/);
       return Response.json({
@@ -1454,7 +1457,8 @@ test("worker summarizes recent repository activity in the background", async () 
     const cached = JSON.parse(
       (await cache.get("repo-activity:v1:acme/unreleased:month")) ?? "{}",
     ) as RepoDetailActivityPayload;
-    assert.equal(cached.summary?.state, "ready");
+    assert.equal(cached.summary?.state, "ready", cached.summary?.message ?? "");
+    assert.equal(cached.summary?.model, "chat-latest");
     assert.match(cached.summary?.text ?? "", /recent-work panel/);
     assert.equal(cached.summary?.promptVersion, 2);
   } finally {
@@ -1466,6 +1470,7 @@ test("worker summarizes public owner activity in the background", async () => {
   const cache = kvStore();
   const queued: Promise<unknown>[] = [];
   const originalFetch = globalThis.fetch;
+  const generatedAt = new Date().toISOString();
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
     if (url.hostname === "api.github.com" && url.pathname === "/users/acme") {
@@ -1486,7 +1491,7 @@ test("worker summarizes public owner activity in the background", async () => {
           id: "1",
           type: "PushEvent",
           public: true,
-          created_at: new Date().toISOString(),
+          created_at: generatedAt,
           repo: { name: "acme/releasebar" },
           payload: {
             size: 4,
@@ -1500,7 +1505,7 @@ test("worker summarizes public owner activity in the background", async () => {
           id: "2",
           type: "PullRequestEvent",
           public: true,
-          created_at: new Date().toISOString(),
+          created_at: generatedAt,
           repo: { name: "acme/releasebar" },
           payload: {
             action: "opened",
@@ -1514,7 +1519,7 @@ test("worker summarizes public owner activity in the background", async () => {
           id: "3",
           type: "PushEvent",
           public: false,
-          created_at: new Date().toISOString(),
+          created_at: generatedAt,
           repo: { name: "acme/private" },
           payload: { commits: [{ message: "private work" }] },
         },
@@ -1524,7 +1529,7 @@ test("worker summarizes public owner activity in the background", async () => {
           id: String(index),
           type: "IssueCommentEvent",
           public: true,
-          created_at: new Date().toISOString(),
+          created_at: generatedAt,
           repo: { name: "acme/releasebar" },
           payload: {
             issue: {
@@ -1540,8 +1545,8 @@ test("worker summarizes public owner activity in the background", async () => {
       const headers = init?.headers as Record<string, string> | undefined;
       assert.equal(headers?.authorization, "Bearer openai-token");
       const body = JSON.parse(String(init?.body ?? "{}"));
-      assert.equal(body.model, "gpt-5.5");
-      assert.equal(body.reasoning?.effort, "low");
+      assert.equal(body.model, "chat-latest");
+      assert.equal(body.reasoning, undefined);
       assert.match(body.instructions, /do not restate those facts/i);
       assert.doesNotMatch(body.instructions, /Say this is public activity/i);
       assert.match(JSON.stringify(body.input), /Top repositories: acme\/releasebar/);
@@ -1578,7 +1583,7 @@ test("worker summarizes public owner activity in the background", async () => {
     const cached = JSON.parse(
       (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
     ) as OwnerActivityPayload;
-    assert.equal(cached.summary?.state, "ready");
+    assert.equal(cached.summary?.state, "ready", cached.summary?.message ?? "");
     assert.match(cached.summary?.text ?? "", /activity summaries/);
     assert.doesNotMatch(cached.summary?.text ?? "", /GitHub activity|public activity/i);
     assert.notEqual(cached.summary?.inputHash, null);
@@ -1781,6 +1786,7 @@ test("worker refreshes cached owner activity summaries from older prompt version
     ) as OwnerActivityPayload;
     assert.equal(cached.summary?.state, "ready");
     assert.equal(cached.summary?.promptVersion, 2);
+    assert.equal(cached.summary?.model, "chat-latest");
     assert.notEqual(cached.summary?.inputHash, "old-prompt-hash");
     assert.equal(cached.summary?.text, "@acme's work refined working-on summaries.");
   } finally {
@@ -1928,6 +1934,7 @@ test("worker persists public owner activity summary failures", async () => {
       (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
     ) as OwnerActivityPayload;
     assert.equal(cached.summary?.state, "unavailable");
+    assert.equal(cached.summary?.model, "chat-latest");
     assert.match(cached.summary?.message ?? "", /summary unavailable/);
     assert.notEqual(cached.summary?.inputHash, "activity-hash");
     assert.equal(cached.summary?.promptVersion, 2);
@@ -2078,7 +2085,7 @@ test("worker skips stale release summaries when repository detail changed", asyn
     assert.equal(cached.releaseSummary?.releaseTag, "v1.0.1");
     assert.equal(cached.releaseSummary?.text, null);
     assert.notEqual(
-      await cache.get("release-summary:v1:acme/releasebar:v1.0.0:abcdef1:gpt-5.5"),
+      await cache.get("release-summary:v1:acme/releasebar:v1.0.0:abcdef1:chat-latest"),
       null,
     );
   } finally {

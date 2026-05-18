@@ -72,13 +72,13 @@ Set the GitHub App setup URL to `https://release.bar/api/auth/install` and enabl
 
 ### AI Release Summaries
 
-Configure `OPENAI_API_KEY` as a Worker secret to summarize commit titles since the latest release on repository detail pages. Optional: `OPENAI_SUMMARY_MODEL` defaults to `gpt-5.5`.
+Configure `OPENAI_API_KEY` as a Worker secret to summarize recent public activity and commit titles since the latest release. Optional: `OPENAI_SUMMARY_MODEL` defaults to `chat-latest`, OpenAI's GPT-5.5 Instant API alias.
 
 ```sh
 wrangler secret put OPENAI_API_KEY
 ```
 
-Summaries are generated server-side through the OpenAI Responses API with low reasoning effort and cached by repository, release tag, default-branch head SHA, model, and prompt version.
+Summaries are generated server-side through the OpenAI Responses API without an explicit reasoning option. Release summaries are cached by repository, release tag, default-branch head SHA, model, and prompt version; activity summaries also refresh when the configured model changes.
 
 ## Deploy
 

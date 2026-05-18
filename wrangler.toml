@@ -5,7 +5,7 @@ account_id = "de09342a728de2c25c85cc6b34d68739"
 workers_dev = true
 
 [vars]
-OPENAI_SUMMARY_MODEL = "gpt-5.5"
+OPENAI_SUMMARY_MODEL = "chat-latest"
 
 [build]
 command = "npm run build:script && npm run build:app && npm run build:assets"

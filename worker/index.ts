@@ -2758,7 +2758,7 @@ function activityTotals(events: OwnerActivityEvent[]): OwnerActivityPayload["tot
 }
 
 function activitySummaryModel(env: Env): string {
-  return env.OPENAI_SUMMARY_MODEL || "gpt-5.5";
+  return env.OPENAI_SUMMARY_MODEL || "chat-latest";
 }
 
 type ActivitySummaryPayload = Pick<OwnerActivityPayload, "events" | "repositories">;
@@ -2893,7 +2893,6 @@ async function summarizeOwnerActivity(
     },
     body: JSON.stringify({
       model,
-      reasoning: { effort: "low" },
       max_output_tokens: 420,
       instructions: activitySummaryInstructions(),
       input: [
@@ -3059,7 +3058,6 @@ async function summarizeRepoActivity(
     },
     body: JSON.stringify({
       model,
-      reasoning: { effort: "low" },
       max_output_tokens: 420,
       instructions: activitySummaryInstructions(),
       input: [
@@ -3187,10 +3185,11 @@ function withOwnerActivityState(
   };
 }
 
-function ownerActivitySummaryNeedsRefresh(payload: OwnerActivityPayload | null): boolean {
+function ownerActivitySummaryNeedsRefresh(payload: OwnerActivityPayload | null, env: Env): boolean {
   return (
     payload?.summary?.state === "warming" ||
-    (!!payload?.summary && payload.summary.promptVersion !== activitySummaryPromptVersion)
+    (!!payload?.summary && payload.summary.promptVersion !== activitySummaryPromptVersion) ||
+    (!!payload?.summary && payload.summary.model !== activitySummaryModel(env))
   );
 }
 
@@ -3199,7 +3198,7 @@ async function refreshOwnerActivitySummary(
   payload: OwnerActivityPayload,
   env: Env,
 ): Promise<void> {
-  if (!ownerActivitySummaryNeedsRefresh(payload)) return;
+  if (!ownerActivitySummaryNeedsRefresh(payload, env)) return;
   const payloadInputHash = (await sha256Base64Url(activitySummaryInput(payload))).slice(0, 32);
   const lock = await acquireBuildLock(env, `${key}:summary`);
   if (!lock) return;
@@ -3236,7 +3235,7 @@ async function refreshOwnerActivitySummary(
         state: "unavailable",
         text: null,
         generatedAt: null,
-        model: latest.summary?.model ?? activitySummaryModel(env),
+        model: activitySummaryModel(env),
         inputHash: payloadInputHash,
         eventsUsed: activitySummaryEvents(latest).length,
         promptVersion: activitySummaryPromptVersion,
@@ -3260,7 +3259,7 @@ async function refreshOwnerActivity(
   try {
     const payload = await buildOwnerActivity(ownerSlug, range, request, env);
     await writeOwnerActivity(env, key, payload);
-    if (ownerActivitySummaryNeedsRefresh(payload)) {
+    if (ownerActivitySummaryNeedsRefresh(payload, env)) {
       await refreshOwnerActivitySummary(key, payload, env);
     }
   } finally {
@@ -3283,7 +3282,7 @@ async function ownerActivityResponse(
   const cached = await readOwnerActivity(env, key);
   const age = ownerActivityAgeMs(cached);
   if (cached && age < activityCacheTtlMs(range)) {
-    if (ownerActivitySummaryNeedsRefresh(cached)) {
+    if (ownerActivitySummaryNeedsRefresh(cached, env)) {
       context.waitUntil(refreshOwnerActivitySummary(key, cached, env).catch(() => undefined));
     }
     return jsonResponse(cached, cached.summary?.state === "warming" ? 202 : 200, {
@@ -3304,7 +3303,7 @@ async function ownerActivityResponse(
   try {
     const payload = await buildOwnerActivity(ownerSlug, range, request, env);
     await writeOwnerActivity(env, key, payload);
-    if (ownerActivitySummaryNeedsRefresh(payload)) {
+    if (ownerActivitySummaryNeedsRefresh(payload, env)) {
       context.waitUntil(refreshOwnerActivitySummary(key, payload, env).catch(() => undefined));
     }
     return jsonResponse(payload, payload.summary?.state === "warming" ? 202 : 200, {
@@ -3348,10 +3347,14 @@ function withRepoActivityState(
   };
 }
 
-function repoActivitySummaryNeedsRefresh(payload: RepoDetailActivityPayload | null): boolean {
+function repoActivitySummaryNeedsRefresh(
+  payload: RepoDetailActivityPayload | null,
+  env: Env,
+): boolean {
   return (
     payload?.summary?.state === "warming" ||
-    (!!payload?.summary && payload.summary.promptVersion !== activitySummaryPromptVersion)
+    (!!payload?.summary && payload.summary.promptVersion !== activitySummaryPromptVersion) ||
+    (!!payload?.summary && payload.summary.model !== activitySummaryModel(env))
   );
 }
 
@@ -3360,7 +3363,7 @@ async function refreshRepoActivitySummary(
   payload: RepoDetailActivityPayload,
   env: Env,
 ): Promise<void> {
-  if (!repoActivitySummaryNeedsRefresh(payload)) return;
+  if (!repoActivitySummaryNeedsRefresh(payload, env)) return;
   const payloadInputHash = (await sha256Base64Url(activitySummaryInput(payload))).slice(0, 32);
   const lock = await acquireBuildLock(env, `${key}:summary`);
   if (!lock) return;
@@ -3397,7 +3400,7 @@ async function refreshRepoActivitySummary(
         state: "unavailable",
         text: null,
         generatedAt: null,
-        model: latest.summary?.model ?? activitySummaryModel(env),
+        model: activitySummaryModel(env),
         inputHash: payloadInputHash,
         eventsUsed: activitySummaryEvents(latest).length,
         promptVersion: activitySummaryPromptVersion,
@@ -3422,7 +3425,7 @@ async function refreshRepoActivity(
   try {
     const payload = await buildRepoActivity(owner, repo, range, request, env);
     await writeRepoActivity(env, key, payload);
-    if (repoActivitySummaryNeedsRefresh(payload)) {
+    if (repoActivitySummaryNeedsRefresh(payload, env)) {
       await refreshRepoActivitySummary(key, payload, env);
     }
   } finally {
@@ -3448,7 +3451,7 @@ async function repoActivityResponse(
   const cached = await readRepoActivity(env, key);
   const age = repoActivityAgeMs(cached);
   if (cached && age < activityCacheTtlMs(range)) {
-    if (repoActivitySummaryNeedsRefresh(cached)) {
+    if (repoActivitySummaryNeedsRefresh(cached, env)) {
       context.waitUntil(refreshRepoActivitySummary(key, cached, env).catch(() => undefined));
     }
     return jsonResponse(cached, cached.summary?.state === "warming" ? 202 : 200, {
@@ -3469,7 +3472,7 @@ async function repoActivityResponse(
   try {
     const payload = await buildRepoActivity(owner, repo, range, request, env);
     await writeRepoActivity(env, key, payload);
-    if (repoActivitySummaryNeedsRefresh(payload)) {
+    if (repoActivitySummaryNeedsRefresh(payload, env)) {
       context.waitUntil(refreshRepoActivitySummary(key, payload, env).catch(() => undefined));
     }
     return jsonResponse(payload, payload.summary?.state === "warming" ? 202 : 200, {
@@ -3545,7 +3548,7 @@ function repoDetailCacheKey(owner: string, repo: string): string {
 }
 
 function releaseSummaryModel(env: Env): string {
-  return env.OPENAI_SUMMARY_MODEL || "gpt-5.5";
+  return env.OPENAI_SUMMARY_MODEL || "chat-latest";
 }
 
 function releaseSummaryCacheKey(project: Project, model: string): string | null {
@@ -3785,7 +3788,6 @@ async function summarizeReleaseDelta(
     },
     body: JSON.stringify({
       model,
-      reasoning: { effort: "low" },
       max_output_tokens: 450,
       instructions:
         "You summarize public GitHub commit titles for release dashboards. Write 2-4 concise sentences, past tense, no bullets, no hype, no markdown. Mention broad themes and user-visible changes when commit titles support them. Do not invent details beyond the commit titles.",
@@ -4120,8 +4122,19 @@ async function refreshRepoDetail(
   }
 }
 
-function releaseSummaryNeedsRefresh(payload: RepoDetailPayload | null): boolean {
-  return payload?.releaseSummary?.state === "warming";
+function releaseSummaryNeedsRefresh(payload: RepoDetailPayload | null, env: Env): boolean {
+  const hasComparableCommits =
+    !!payload?.project.releaseDate &&
+    payload.project.version !== "unreleased" &&
+    !!payload.project.latestCommitSha &&
+    payload.project.commitsSinceRelease !== null &&
+    payload.project.commitsSinceRelease > 0;
+  return (
+    payload?.releaseSummary?.state === "warming" ||
+    (hasComparableCommits &&
+      !!payload?.releaseSummary &&
+      payload.releaseSummary.model !== releaseSummaryModel(env))
+  );
 }
 
 async function refreshReleaseSummary(
@@ -4132,7 +4145,7 @@ async function refreshReleaseSummary(
   request: Request,
   env: Env,
 ): Promise<void> {
-  if (!env.OPENAI_API_KEY || !releaseSummaryNeedsRefresh(payload)) return;
+  if (!env.OPENAI_API_KEY || !releaseSummaryNeedsRefresh(payload, env)) return;
   const lock = await acquireBuildLock(env, `${key}:release-summary`);
   if (!lock) return;
   try {
@@ -4171,7 +4184,7 @@ async function refreshReleaseSummary(
         state: "unavailable",
         text: null,
         generatedAt: null,
-        model: latest.releaseSummary?.model ?? releaseSummaryModel(env),
+        model: releaseSummaryModel(env),
         releaseTag: latest.project.releaseDate ? latest.project.version : null,
         headSha: latest.project.latestCommitSha,
         commitCount: latest.project.commitsSinceRelease,
@@ -4202,20 +4215,20 @@ async function repoDetailResponse(
   const cached = await readRepoDetail(env, key);
   const ageMs = repoDetailAgeMs(cached);
   if (cached?.cache.state === "warming" && ageMs < repoDetailWarmingRefreshMs) {
-    if (releaseSummaryNeedsRefresh(cached)) {
+    if (releaseSummaryNeedsRefresh(cached, env)) {
       context.waitUntil(refreshReleaseSummary(key, owner, repo, cached, request, env));
     }
     return jsonResponse(cached, 202, { "cache-control": "no-store" });
   }
   if (cached && ageMs < repoDetailCacheTtlMs && cached.cache.state !== "warming") {
-    if (releaseSummaryNeedsRefresh(cached)) {
+    if (releaseSummaryNeedsRefresh(cached, env)) {
       context.waitUntil(refreshReleaseSummary(key, owner, repo, cached, request, env));
     }
     return jsonResponse(cached);
   }
   if (cached && ageMs <= maxDisplayStaleMs) {
     context.waitUntil(refreshRepoDetail(key, owner, repo, request, env).catch(() => undefined));
-    if (releaseSummaryNeedsRefresh(cached)) {
+    if (releaseSummaryNeedsRefresh(cached, env)) {
       context.waitUntil(refreshReleaseSummary(key, owner, repo, cached, request, env));
     }
     return jsonResponse(withRepoDetailState(cached, "stale", "refreshing repository statistics"));
@@ -4224,7 +4237,7 @@ async function repoDetailResponse(
   try {
     const payload = await buildRepoDetail(owner, repo, request, env);
     await writeRepoDetail(env, key, payload);
-    if (releaseSummaryNeedsRefresh(payload)) {
+    if (releaseSummaryNeedsRefresh(payload, env)) {
       context.waitUntil(refreshReleaseSummary(key, owner, repo, payload, request, env));
     }
     return jsonResponse(payload, payload.cache.state === "warming" ? 202 : 200, {

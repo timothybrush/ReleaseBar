@@ -1576,6 +1576,24 @@ body.dev-mode .table-head .since-heading .label-compact {
   font-size: 13px;
 }
 
+.release-summary {
+  display: grid;
+  gap: 16px;
+}
+
+.release-summary p {
+  max-width: 980px;
+  margin: 0;
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+.release-summary small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .contributor-list,
 .release-groups,
 .language-bars {

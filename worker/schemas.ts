@@ -134,6 +134,16 @@ export const gitHubCommitSchema = v.looseObject({
 export const gitHubCompareSchema = v.looseObject({
   total_commits: v.optional(v.number()),
   html_url: v.optional(v.string()),
+  commits: v.optional(
+    v.array(
+      v.looseObject({
+        sha: v.optional(v.string()),
+        commit: v.looseObject({
+          message: v.string(),
+        }),
+      }),
+    ),
+  ),
 });
 
 export const gitHubCheckRunsSchema = v.looseObject({

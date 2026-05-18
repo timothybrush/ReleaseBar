@@ -595,7 +595,7 @@ test("worker social cards include owner avatars and repository release metrics",
   };
   const env = {
     DASHBOARD_CACHE: kvStore({
-      "repo-detail:v3:acme/releasebar": JSON.stringify(repoPayload),
+      "repo-detail:v4:acme/releasebar": JSON.stringify(repoPayload),
     }),
   };
 
@@ -706,7 +706,7 @@ test("worker social cards include owner avatars and repository release metrics",
       new Request("https://release.bar/og/stale%2Frepo.svg"),
       {
         DASHBOARD_CACHE: kvStore({
-          "repo-detail:v3:stale/repo": JSON.stringify(stalePayload),
+          "repo-detail:v4:stale/repo": JSON.stringify(stalePayload),
         }),
       },
       { waitUntil: (promise) => queued.push(promise) },
@@ -1143,7 +1143,7 @@ test("worker throttles cached warming repository detail refreshes", async () => 
       new Request("https://release.bar/api/repos/acme/warmbar"),
       {
         DASHBOARD_CACHE: kvStore({
-          "repo-detail:v3:acme/warmbar": JSON.stringify(payload),
+          "repo-detail:v4:acme/warmbar": JSON.stringify(payload),
         }),
         GITHUB_TOKEN: "shared-token",
       },
@@ -1152,6 +1152,219 @@ test("worker throttles cached warming repository detail refreshes", async () => 
     assert.equal(response.status, 202);
     const body = (await response.json()) as RepoDetailPayload;
     assert.equal(body.cache.state, "warming");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker summarizes commits since release in the background", async () => {
+  const generatedAt = new Date().toISOString();
+  const payload: RepoDetailPayload = {
+    fullName: "acme/releasebar",
+    generatedAt,
+    cache: {
+      state: "warming",
+      stale: true,
+      generatedAt,
+      message: "refreshing repository statistics",
+    },
+    releaseSummary: {
+      state: "warming",
+      text: null,
+      generatedAt: null,
+      model: "gpt-5.5",
+      releaseTag: "v1.0.0",
+      headSha: "abcdef1",
+      commitCount: 2,
+      commitsUsed: 0,
+      message: "Summarizing commits since the latest release.",
+    },
+    project: testProject({
+      owner: "acme",
+      name: "releasebar",
+      commitsSinceRelease: 2,
+    }),
+    releases: [],
+    contributors: [],
+    commitActivity: [],
+    codeFrequency: [],
+    languages: [],
+    workTrend: null,
+  };
+  const cache = kvStore({
+    "repo-detail:v4:acme/releasebar": JSON.stringify(payload),
+  });
+  const queued: Promise<unknown>[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (
+      url.hostname === "api.github.com" &&
+      url.pathname === "/repos/acme/releasebar/compare/v1.0.0...abcdef1"
+    ) {
+      assert.equal(url.searchParams.get("per_page"), "100");
+      assert.equal(url.searchParams.get("page"), "1");
+      return Response.json({
+        total_commits: 2,
+        commits: [
+          { commit: { message: "Add release summary panel\n\nLong body" } },
+          { commit: { message: "Fix summary cache key" } },
+        ],
+      });
+    }
+    if (url.hostname === "api.openai.com" && url.pathname === "/v1/responses") {
+      const headers = init?.headers as Record<string, string> | undefined;
+      assert.equal(headers?.authorization, "Bearer openai-token");
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      assert.equal(body.model, "gpt-5.5");
+      assert.equal(body.reasoning?.effort, "low");
+      assert.match(JSON.stringify(body.input), /Add release summary panel/);
+      return Response.json({
+        output_text: "",
+        output: [
+          {
+            content: [
+              {
+                type: "output_text",
+                text: "ReleaseBar added an AI summary panel and tightened the cache key for generated summaries.",
+              },
+            ],
+          },
+        ],
+      });
+    }
+    throw new Error(`unexpected fetch ${url.toString()}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/releasebar"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token", OPENAI_API_KEY: "openai-token" },
+      { waitUntil: (promise) => queued.push(promise) },
+    );
+    assert.equal(response.status, 202);
+    const body = (await response.json()) as RepoDetailPayload;
+    assert.equal(body.releaseSummary?.state, "warming");
+    await Promise.all(queued);
+    const cached = JSON.parse(
+      (await cache.get("repo-detail:v4:acme/releasebar")) ?? "{}",
+    ) as RepoDetailPayload;
+    assert.equal(cached.releaseSummary?.state, "ready");
+    assert.match(cached.releaseSummary?.text ?? "", /AI summary panel/);
+    assert.equal(cached.releaseSummary?.commitsUsed, 2);
+    assert.equal(cached.generatedAt, generatedAt);
+    assert.equal(cached.cache.state, "warming");
+    assert.equal(cached.cache.generatedAt, generatedAt);
+    assert.notEqual(
+      await cache.get("release-summary:v1:acme/releasebar:v1.0.0:abcdef1:gpt-5.5"),
+      null,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker skips stale release summaries when repository detail changed", async () => {
+  const generatedAt = new Date().toISOString();
+  const payload: RepoDetailPayload = {
+    fullName: "acme/releasebar",
+    generatedAt,
+    cache: {
+      state: "fresh",
+      stale: false,
+      generatedAt,
+    },
+    releaseSummary: {
+      state: "warming",
+      text: null,
+      generatedAt: null,
+      model: "gpt-5.5",
+      releaseTag: "v1.0.0",
+      headSha: "abcdef1",
+      commitCount: 1,
+      commitsUsed: 0,
+    },
+    project: testProject({
+      owner: "acme",
+      name: "releasebar",
+      commitsSinceRelease: 1,
+    }),
+    releases: [],
+    contributors: [],
+    commitActivity: [],
+    codeFrequency: [],
+    languages: [],
+    workTrend: null,
+  };
+  const latestPayload: RepoDetailPayload = {
+    ...payload,
+    project: {
+      ...payload.project,
+      version: "v1.0.1",
+      latestCommitSha: "fedcba9",
+    },
+    releaseSummary: {
+      state: "warming",
+      text: null,
+      generatedAt: null,
+      model: "gpt-5.5",
+      releaseTag: "v1.0.1",
+      headSha: "fedcba9",
+      commitCount: 1,
+      commitsUsed: 0,
+    },
+  };
+  const cache = kvStore({
+    "repo-detail:v4:acme/releasebar": JSON.stringify(payload),
+  });
+  const queued: Promise<unknown>[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (
+      url.hostname === "api.github.com" &&
+      url.pathname === "/repos/acme/releasebar/compare/v1.0.0...abcdef1"
+    ) {
+      return Response.json({
+        total_commits: 1,
+        commits: [{ commit: { message: "Add stale summary guard" } }],
+      });
+    }
+    if (url.hostname === "api.openai.com" && url.pathname === "/v1/responses") {
+      await cache.put("repo-detail:v4:acme/releasebar", JSON.stringify(latestPayload));
+      return Response.json({
+        output: [
+          {
+            content: [
+              {
+                type: "output_text",
+                text: "ReleaseBar added a stale summary guard.",
+              },
+            ],
+          },
+        ],
+      });
+    }
+    throw new Error(`unexpected fetch ${url.toString()}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/releasebar"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token", OPENAI_API_KEY: "openai-token" },
+      { waitUntil: (promise) => queued.push(promise) },
+    );
+    assert.equal(response.status, 200);
+    await Promise.all(queued);
+    const cached = JSON.parse(
+      (await cache.get("repo-detail:v4:acme/releasebar")) ?? "{}",
+    ) as RepoDetailPayload;
+    assert.equal(cached.project.version, "v1.0.1");
+    assert.equal(cached.project.latestCommitSha, "fedcba9");
+    assert.equal(cached.releaseSummary?.releaseTag, "v1.0.1");
+    assert.equal(cached.releaseSummary?.text, null);
+    assert.notEqual(
+      await cache.get("release-summary:v1:acme/releasebar:v1.0.0:abcdef1:gpt-5.5"),
+      null,
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1501,7 +1714,7 @@ test("worker keeps repository detail when work trend search is rate limited", as
     assert.equal(response.status, 200);
     const body = (await response.json()) as RepoDetailPayload;
     assert.equal(body.workTrend, null);
-    assert.notEqual(await cache.get("repo-detail:v3:acme/trendbar"), null);
+    assert.notEqual(await cache.get("repo-detail:v4:acme/trendbar"), null);
   } finally {
     globalThis.fetch = originalFetch;
   }

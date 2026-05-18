@@ -194,6 +194,18 @@ export type RepoDetailStatState = {
   message?: string;
 };
 
+export type RepoDetailReleaseSummary = {
+  state: "ready" | "warming" | "unavailable";
+  text: string | null;
+  generatedAt: string | null;
+  model: string | null;
+  releaseTag: string | null;
+  headSha: string | null;
+  commitCount: number | null;
+  commitsUsed: number;
+  message?: string;
+};
+
 export type RepoDetailPayload = {
   fullName: string;
   generatedAt: string;
@@ -208,6 +220,7 @@ export type RepoDetailPayload = {
     commitActivity: RepoDetailStatState;
     codeFrequency: RepoDetailStatState;
   };
+  releaseSummary?: RepoDetailReleaseSummary;
   project: Project;
   releases: RepoDetailRelease[];
   contributors: RepoDetailContributor[];

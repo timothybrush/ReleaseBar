@@ -45,6 +45,7 @@ import type {
   Owner,
   Project,
   RepoDetailPayload,
+  RepoDetailReleaseSummary,
   RepoDetailWorkTrend,
 } from "../src/types.js";
 
@@ -89,6 +90,8 @@ type Env = {
   GITHUB_APP_PRIVATE_KEY?: string;
   GITHUB_APP_SLUG?: string;
   GITHUB_TOKEN?: string;
+  OPENAI_API_KEY?: string;
+  OPENAI_SUMMARY_MODEL?: string;
   RELEASEDECK_CANONICAL_DOMAIN?: string;
 };
 
@@ -120,6 +123,8 @@ const discoverHydrateBatchSize = 12;
 const discoverCacheTtlMs = 60 * 60 * 1000;
 const repoDetailCacheTtlMs = 6 * 60 * 60 * 1000;
 const repoDetailWarmingRefreshMs = 5 * 60 * 1000;
+const releaseSummaryPromptVersion = 1;
+const releaseSummaryCommitLimit = 500;
 const maxCustomSources = 8;
 const dashboardSchemaVersion = 5;
 const previousDashboardSchemaVersion = 4;
@@ -2398,7 +2403,24 @@ function releaseProject(repo: InferOutput<typeof gitHubRepositorySchema>): Proje
 }
 
 function repoDetailCacheKey(owner: string, repo: string): string {
-  return `repo-detail:v3:${slugOwner(owner)}/${repo.toLowerCase()}`;
+  return `repo-detail:v4:${slugOwner(owner)}/${repo.toLowerCase()}`;
+}
+
+function releaseSummaryModel(env: Env): string {
+  return env.OPENAI_SUMMARY_MODEL || "gpt-5.5";
+}
+
+function releaseSummaryCacheKey(project: Project, model: string): string | null {
+  if (!project.releaseDate || project.version === "unreleased" || !project.latestCommitSha) {
+    return null;
+  }
+  return [
+    `release-summary:v${releaseSummaryPromptVersion}`,
+    project.fullName.toLowerCase(),
+    encodeURIComponent(project.version),
+    project.latestCommitSha,
+    encodeURIComponent(model),
+  ].join(":");
 }
 
 async function readRepoDetail(env: Env, key: string): Promise<RepoDetailPayload | null> {
@@ -2408,6 +2430,25 @@ async function readRepoDetail(env: Env, key: string): Promise<RepoDetailPayload 
 
 async function writeRepoDetail(env: Env, key: string, payload: RepoDetailPayload): Promise<void> {
   await env.DASHBOARD_CACHE?.put(key, JSON.stringify(payload), {
+    expirationTtl: dashboardStorageTtlSeconds,
+  });
+}
+
+async function readReleaseSummary(
+  env: Env,
+  key: string | null,
+): Promise<RepoDetailReleaseSummary | null> {
+  if (!key) return null;
+  const raw = await env.DASHBOARD_CACHE?.get(key);
+  return raw ? tryJsonParse<RepoDetailReleaseSummary>(raw, `release summary ${key}`) : null;
+}
+
+async function writeReleaseSummary(
+  env: Env,
+  key: string,
+  summary: RepoDetailReleaseSummary,
+): Promise<void> {
+  await env.DASHBOARD_CACHE?.put(key, JSON.stringify(summary), {
     expirationTtl: dashboardStorageTtlSeconds,
   });
 }
@@ -2441,6 +2482,215 @@ async function optionalRepoDetail<T>(promise: Promise<T>, fallback: T): Promise<
     if (isGitHubRateLimit(error)) throw error;
     return fallback;
   }
+}
+
+function unavailableReleaseSummary(
+  project: Project,
+  model: string | null,
+  message: string,
+): RepoDetailReleaseSummary {
+  return {
+    state: "unavailable",
+    text: null,
+    generatedAt: null,
+    model,
+    releaseTag: project.releaseDate ? project.version : null,
+    headSha: project.latestCommitSha,
+    commitCount: project.commitsSinceRelease,
+    commitsUsed: 0,
+    message,
+  };
+}
+
+async function releaseSummaryState(project: Project, env: Env): Promise<RepoDetailReleaseSummary> {
+  const model = releaseSummaryModel(env);
+  if (!project.releaseDate || project.version === "unreleased") {
+    return unavailableReleaseSummary(project, model, "No prior release to summarize.");
+  }
+  if (!project.latestCommitSha) {
+    return unavailableReleaseSummary(project, model, "Latest commit is unavailable.");
+  }
+  if (project.commitsSinceRelease === null) {
+    return unavailableReleaseSummary(project, model, "Commit comparison is unavailable.");
+  }
+  if (project.commitsSinceRelease === 0) {
+    return {
+      state: "ready",
+      text: "No commits have landed since the latest release.",
+      generatedAt: new Date().toISOString(),
+      model,
+      releaseTag: project.version,
+      headSha: project.latestCommitSha,
+      commitCount: 0,
+      commitsUsed: 0,
+    };
+  }
+  const key = releaseSummaryCacheKey(project, model);
+  const cached = await readReleaseSummary(env, key);
+  if (cached?.state === "ready") return cached;
+  if (!env.OPENAI_API_KEY) {
+    return unavailableReleaseSummary(project, model, "AI release summaries are not configured.");
+  }
+  return {
+    state: "warming",
+    text: null,
+    generatedAt: null,
+    model,
+    releaseTag: project.version,
+    headSha: project.latestCommitSha,
+    commitCount: project.commitsSinceRelease,
+    commitsUsed: 0,
+    message: "Summarizing commits since the latest release.",
+  };
+}
+
+function commitTitle(message: string): string {
+  return message.split("\n")[0]?.trim().replace(/\s+/g, " ") ?? "";
+}
+
+async function compareCommitTitles(
+  path: string,
+  releaseTag: string,
+  head: string,
+  token: string | null,
+  quotaSource: ApiQuota["source"],
+  quotaAccount: string | null,
+  onQuota: (quota: ApiQuota) => void,
+): Promise<{ titles: string[]; total: number | null }> {
+  const titles: string[] = [];
+  let total: number | null = null;
+  for (let page = 1; titles.length < releaseSummaryCommitLimit; page += 1) {
+    const compare = await detailGitHubJson(
+      `${path}/compare/${encodeURIComponent(releaseTag)}...${encodeURIComponent(head)}?per_page=100&page=${page}`,
+      gitHubCompareSchema,
+      "release summary compare",
+      token,
+      quotaSource,
+      quotaAccount,
+      onQuota,
+    );
+    total = compare.total_commits ?? total;
+    const pageTitles = (compare.commits ?? [])
+      .map((commit) => commitTitle(commit.commit.message))
+      .filter(Boolean);
+    titles.push(...pageTitles);
+    if (pageTitles.length === 0 || (total !== null && titles.length >= total)) break;
+  }
+  return { titles: titles.slice(0, releaseSummaryCommitLimit), total };
+}
+
+function openAIOutputText(body: unknown): string {
+  if (body && typeof body === "object" && "output_text" in body) {
+    const text = (body as { output_text?: unknown }).output_text;
+    if (typeof text === "string" && text.trim()) return text.trim();
+  }
+  const output = body && typeof body === "object" ? (body as { output?: unknown }).output : null;
+  if (!Array.isArray(output)) return "";
+  return output
+    .flatMap((item) => {
+      const content =
+        item && typeof item === "object" ? (item as { content?: unknown }).content : null;
+      return Array.isArray(content) ? content : [];
+    })
+    .map((item) => {
+      if (!item || typeof item !== "object") return "";
+      const text = (item as { text?: unknown }).text;
+      return typeof text === "string" ? text : "";
+    })
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+async function summarizeReleaseDelta(
+  project: Project,
+  path: string,
+  request: Request,
+  env: Env,
+): Promise<RepoDetailReleaseSummary> {
+  const model = releaseSummaryModel(env);
+  if (!env.OPENAI_API_KEY) {
+    return unavailableReleaseSummary(project, model, "AI release summaries are not configured.");
+  }
+  if (!project.releaseDate || project.version === "unreleased" || !project.latestCommitSha) {
+    return unavailableReleaseSummary(project, model, "No comparable release delta is available.");
+  }
+  const requestToken = await requestInstallationToken(request, env, {
+    owners: [],
+    repos: [project.fullName],
+  }).catch(() => null);
+  const token = requestToken?.token ?? env.GITHUB_TOKEN ?? null;
+  const quotaSource = requestToken?.quotaSource ?? (env.GITHUB_TOKEN ? "shared" : "anonymous");
+  const quotaAccount = requestToken?.quotaAccount ?? null;
+  const onQuota = () => undefined;
+  const { titles, total } = await compareCommitTitles(
+    path,
+    project.version,
+    project.latestCommitSha,
+    token,
+    quotaSource,
+    quotaAccount,
+    onQuota,
+  );
+  if (titles.length === 0) {
+    return unavailableReleaseSummary(
+      project,
+      model,
+      "No commit titles were available to summarize.",
+    );
+  }
+  const response = await workerFetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      reasoning: { effort: "low" },
+      max_output_tokens: 450,
+      instructions:
+        "You summarize public GitHub commit titles for release dashboards. Write 2-4 concise sentences, past tense, no bullets, no hype, no markdown. Mention broad themes and user-visible changes when commit titles support them. Do not invent details beyond the commit titles.",
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: [
+                `Repository: ${project.fullName}`,
+                `Latest release: ${project.version}`,
+                `Default branch head: ${project.latestCommitSha}`,
+                `Commit titles included: ${titles.length} of ${total ?? project.commitsSinceRelease ?? titles.length}`,
+                "",
+                titles.map((title, index) => `${index + 1}. ${title}`).join("\n"),
+              ].join("\n"),
+            },
+          ],
+        },
+      ],
+    }),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message =
+      body && typeof body === "object" && "error" in body
+        ? String((body as { error?: { message?: string } }).error?.message ?? "OpenAI API error")
+        : `OpenAI API ${response.status}`;
+    throw new Error(message);
+  }
+  const text = openAIOutputText(body);
+  if (!text) throw new Error("OpenAI response did not include summary text");
+  return {
+    state: "ready",
+    text,
+    generatedAt: new Date().toISOString(),
+    model,
+    releaseTag: project.version,
+    headSha: project.latestCommitSha,
+    commitCount: total ?? project.commitsSinceRelease,
+    commitsUsed: titles.length,
+  };
 }
 
 async function buildRepoDetail(
@@ -2599,6 +2849,7 @@ async function buildRepoDetail(
   project.ciUrl = ci.ciUrl;
   project.ciRunDate = ci.ciRunDate;
   project.ciState = ci.ciState;
+  const releaseSummary = await releaseSummaryState(project, env);
 
   const generatedAt = new Date().toISOString();
   return {
@@ -2621,6 +2872,7 @@ async function buildRepoDetail(
         ...(codeFrequency.message ? { message: codeFrequency.message } : {}),
       },
     },
+    releaseSummary,
     project,
     releases: releases
       .filter((release) => !release.draft)
@@ -2730,6 +2982,70 @@ async function refreshRepoDetail(
   }
 }
 
+function releaseSummaryNeedsRefresh(payload: RepoDetailPayload | null): boolean {
+  return payload?.releaseSummary?.state === "warming";
+}
+
+async function refreshReleaseSummary(
+  key: string,
+  owner: string,
+  repo: string,
+  payload: RepoDetailPayload,
+  request: Request,
+  env: Env,
+): Promise<void> {
+  if (!env.OPENAI_API_KEY || !releaseSummaryNeedsRefresh(payload)) return;
+  const lock = await acquireBuildLock(env, `${key}:release-summary`);
+  if (!lock) return;
+  try {
+    const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+    const summary = await summarizeReleaseDelta(payload.project, path, request, env);
+    const summaryKey = releaseSummaryCacheKey(
+      payload.project,
+      summary.model ?? releaseSummaryModel(env),
+    );
+    if (summaryKey && summary.state === "ready") {
+      await writeReleaseSummary(env, summaryKey, summary);
+    }
+    const latest = (await readRepoDetail(env, key)) ?? payload;
+    if (
+      latest.project.version !== payload.project.version ||
+      latest.project.latestCommitSha !== payload.project.latestCommitSha
+    ) {
+      return;
+    }
+    await writeRepoDetail(env, key, {
+      ...latest,
+      releaseSummary: summary,
+    });
+  } catch (error) {
+    const latest = (await readRepoDetail(env, key)) ?? payload;
+    if (
+      latest.project.version !== payload.project.version ||
+      latest.project.latestCommitSha !== payload.project.latestCommitSha
+    ) {
+      return;
+    }
+    await writeRepoDetail(env, key, {
+      ...latest,
+      releaseSummary: {
+        ...(latest.releaseSummary ?? payload.releaseSummary),
+        state: "unavailable",
+        text: null,
+        generatedAt: null,
+        model: latest.releaseSummary?.model ?? releaseSummaryModel(env),
+        releaseTag: latest.project.releaseDate ? latest.project.version : null,
+        headSha: latest.project.latestCommitSha,
+        commitCount: latest.project.commitsSinceRelease,
+        commitsUsed: 0,
+        message: errorMessage(error),
+      },
+    });
+  } finally {
+    await lock.release();
+  }
+}
+
 async function repoDetailResponse(
   request: Request,
   env: Env,
@@ -2748,19 +3064,31 @@ async function repoDetailResponse(
   const cached = await readRepoDetail(env, key);
   const ageMs = repoDetailAgeMs(cached);
   if (cached?.cache.state === "warming" && ageMs < repoDetailWarmingRefreshMs) {
+    if (releaseSummaryNeedsRefresh(cached)) {
+      context.waitUntil(refreshReleaseSummary(key, owner, repo, cached, request, env));
+    }
     return jsonResponse(cached, 202, { "cache-control": "no-store" });
   }
   if (cached && ageMs < repoDetailCacheTtlMs && cached.cache.state !== "warming") {
+    if (releaseSummaryNeedsRefresh(cached)) {
+      context.waitUntil(refreshReleaseSummary(key, owner, repo, cached, request, env));
+    }
     return jsonResponse(cached);
   }
   if (cached && ageMs <= maxDisplayStaleMs) {
     context.waitUntil(refreshRepoDetail(key, owner, repo, request, env).catch(() => undefined));
+    if (releaseSummaryNeedsRefresh(cached)) {
+      context.waitUntil(refreshReleaseSummary(key, owner, repo, cached, request, env));
+    }
     return jsonResponse(withRepoDetailState(cached, "stale", "refreshing repository statistics"));
   }
 
   try {
     const payload = await buildRepoDetail(owner, repo, request, env);
     await writeRepoDetail(env, key, payload);
+    if (releaseSummaryNeedsRefresh(payload)) {
+      context.waitUntil(refreshReleaseSummary(key, owner, repo, payload, request, env));
+    }
     return jsonResponse(payload, payload.cache.state === "warming" ? 202 : 200, {
       "cache-control": payload.cache.state === "warming" ? "no-store" : "public, max-age=60",
     });

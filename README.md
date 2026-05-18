@@ -41,6 +41,7 @@ Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token
 - private repositories are ignored even when selected in GitHub App installation; ReleaseBar only stores and renders public repository metadata
 - the need-attention metric filters repos with unreleased commits, stale releases, failing/cancelled CI, or issue/PR pressure and rows show the reason inline
 - repository detail pages include release cadence, recent releases, contributors, languages, commit/churn charts, and 30-day issue/PR trend counts when GitHub provides them
+- repository detail pages can show an AI summary of commit titles since the latest release when the Worker has an OpenAI API key
 
 ## API And Cache
 
@@ -68,6 +69,16 @@ Configure these Worker secrets before enabling login:
 `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` are required for dedicated GitHub App quota. Without them, users can still sign in, but dashboard rebuilds use the shared server token/cache. Optional: `GITHUB_APP_SLUG` defaults to `releasebar-app`, the current GitHub App slug.
 
 Set the GitHub App setup URL to `https://release.bar/api/auth/install` and enable redirect-on-update so users return to their dashboard after installing or changing repository access.
+
+### AI Release Summaries
+
+Configure `OPENAI_API_KEY` as a Worker secret to summarize commit titles since the latest release on repository detail pages. Optional: `OPENAI_SUMMARY_MODEL` defaults to `gpt-5.5`.
+
+```sh
+wrangler secret put OPENAI_API_KEY
+```
+
+Summaries are generated server-side through the OpenAI Responses API with low reasoning effort and cached by repository, release tag, default-branch head SHA, model, and prompt version.
 
 ## Deploy
 

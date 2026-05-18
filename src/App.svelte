@@ -42,6 +42,7 @@
     Owner,
     Project,
     RepoDetailPayload,
+    RepoDetailReleaseSummary,
   } from "./types.js";
 
   const repoRoute = repoFromPath(location.pathname);
@@ -316,6 +317,25 @@
       return "GitHub does not expose code-frequency stats for this repository.";
     }
     return "Code-frequency stats are still warming or unavailable.";
+  }
+
+  function showReleaseSummary(summary: RepoDetailReleaseSummary | undefined): boolean {
+    return Boolean(
+      summary &&
+        (summary.state !== "unavailable" ||
+          summary.message !== "AI release summaries are not configured."),
+    );
+  }
+
+  function releaseSummaryMeta(summary: RepoDetailReleaseSummary): string {
+    const count =
+      summary.commitCount === null ? "" : `${numberFormat.format(summary.commitCount)} commits`;
+    const used =
+      summary.commitsUsed > 0 && summary.commitCount !== summary.commitsUsed
+        ? `${numberFormat.format(summary.commitsUsed)} summarized`
+        : "";
+    const model = summary.model ?? "";
+    return [count, used, model].filter(Boolean).join(" · ");
   }
 
   function median(values: number[]): number | null {
@@ -847,7 +867,11 @@
     if (body && "project" in body) {
       repoDetail = body;
       updateRepoDetailStatus();
-      if (body.cache.state === "warming" || body.cache.state === "stale") {
+      if (
+        body.cache.state === "warming" ||
+        body.cache.state === "stale" ||
+        body.releaseSummary?.state === "warming"
+      ) {
         scheduleRepoDetailRefresh(attempt);
       }
       return;
@@ -1547,6 +1571,31 @@
               <small>median release gap · {releaseCadence.releaseCount} recent releases</small>
             </div>
           </section>
+
+          {#if showReleaseSummary(repoDetail.releaseSummary)}
+            <section class="detail-panel detail-wide release-summary">
+              <div class="panel-heading">
+                <div>
+                  <span class="panel-kicker">AI summary</span>
+                  <h2>since last release</h2>
+                </div>
+                {#if repoDetail.releaseSummary?.state === "ready"}
+                  <strong>{repoDetail.releaseSummary.releaseTag}</strong>
+                {:else}
+                  <strong>{repoDetail.releaseSummary?.state}</strong>
+                {/if}
+              </div>
+              {#if repoDetail.releaseSummary?.state === "ready" && repoDetail.releaseSummary.text}
+                <p>{repoDetail.releaseSummary.text}</p>
+                <small>{releaseSummaryMeta(repoDetail.releaseSummary)}</small>
+              {:else if repoDetail.releaseSummary?.state === "warming"}
+                <p>Summarizing commit titles since the latest release.</p>
+                <small>{releaseSummaryMeta(repoDetail.releaseSummary)}</small>
+              {:else if repoDetail.releaseSummary?.message}
+                <p class="detail-empty">{repoDetail.releaseSummary.message}</p>
+              {/if}
+            </section>
+          {/if}
 
           <section class="detail-panel detail-wide">
             <div class="panel-heading">

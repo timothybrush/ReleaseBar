@@ -1858,12 +1858,6 @@
               {#if project.archived}<span class="tag muted">archived</span>{/if}
               <span class="tag">{project.freshness}</span>
             </div>
-            {#if attentionReasons(project).length > 0}
-              <p class="attention-reasons">
-                <span>needs attention</span>
-                {attentionText(project)}
-              </p>
-            {/if}
           </div>
           <div class="stars-cell">
             <strong>{numberFormat.format(project.stars)}</strong>

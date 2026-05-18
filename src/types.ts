@@ -185,6 +185,7 @@ export type OwnerActivitySummary = {
   model: string | null;
   inputHash: string | null;
   eventsUsed: number;
+  promptVersion?: number;
   message?: string;
 };
 

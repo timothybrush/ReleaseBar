@@ -132,7 +132,7 @@ const repoDetailCacheTtlMs = 6 * 60 * 60 * 1000;
 const repoDetailWarmingRefreshMs = 30 * 1000;
 const releaseSummaryPromptVersion = 1;
 const releaseSummaryCommitLimit = 500;
-const activitySummaryPromptVersion = 1;
+const activitySummaryPromptVersion = 2;
 const activityEventPageLimit = 3;
 const activitySummaryInputLimit = 120;
 const maxCustomSources = 8;
@@ -2688,7 +2688,13 @@ function activitySummaryEvents(payload: OwnerActivityPayload): OwnerActivityEven
 }
 
 function activitySummaryInput(payload: OwnerActivityPayload): string {
-  return activitySummaryEvents(payload)
+  const summaryEvents = activitySummaryEvents(payload);
+  if (summaryEvents.length === 0) return "";
+  const topRepos = payload.repositories
+    .slice(0, 8)
+    .map((repo) => `${repo.fullName} (${repo.events} events, ${repo.commits} commits)`)
+    .join(", ");
+  const events = summaryEvents
     .map((event, index) =>
       [
         `${index + 1}. ${event.kind}`,
@@ -2699,6 +2705,7 @@ function activitySummaryInput(payload: OwnerActivityPayload): string {
       ].join(" · "),
     )
     .join("\n");
+  return [`Top repositories: ${topRepos || "none"}`, "", events].join("\n");
 }
 
 function unavailableActivitySummary(
@@ -2713,6 +2720,7 @@ function unavailableActivitySummary(
     model,
     inputHash,
     eventsUsed: 0,
+    promptVersion: activitySummaryPromptVersion,
     message,
   };
 }
@@ -2724,11 +2732,7 @@ async function activitySummaryState(
   const model = activitySummaryModel(env);
   const input = activitySummaryInput(payload);
   if (!input.trim()) {
-    return unavailableActivitySummary(
-      model,
-      null,
-      "Not enough recent public activity to summarize.",
-    );
+    return unavailableActivitySummary(model, null, "Not enough recent work to summarize.");
   }
   const inputHash = (await sha256Base64Url(input)).slice(0, 32);
   const eventsUsed = activitySummaryEvents(payload).length;
@@ -2739,7 +2743,9 @@ async function activitySummaryState(
     inputHash,
   );
   const cached = await readOwnerActivitySummary(env, cacheKey);
-  if (cached?.state === "ready") return cached;
+  if (cached?.state === "ready" && cached.promptVersion === activitySummaryPromptVersion) {
+    return cached;
+  }
   if (!env.OPENAI_API_KEY) {
     return unavailableActivitySummary(
       model,
@@ -2754,8 +2760,31 @@ async function activitySummaryState(
     model,
     inputHash,
     eventsUsed,
-    message: "Summarizing recent public GitHub activity.",
+    promptVersion: activitySummaryPromptVersion,
+    message: "Summarizing recent work.",
   };
+}
+
+function activitySummaryInstructions(): string {
+  return [
+    "You write the working-on paragraph for ReleaseBar owner dashboards.",
+    "The UI already says this is a GitHub dashboard, shows the selected time range, and lists commit/PR/issue totals, so do not restate those facts.",
+    "Do not use filler like public GitHub activity, recent activity, events, commits, PRs, has been working on, centered on, or touched repositories.",
+    "Start with concrete work: systems, fixes, releases, docs, integrations, repo names, and themes that are directly supported by the event titles.",
+    "Write 2-3 useful sentences, no bullets, no markdown, no hype.",
+    "Do not infer private work, intentions, employers, or impact beyond the event titles.",
+  ].join(" ");
+}
+
+function polishActivitySummaryText(text: string): string {
+  return text
+    .replace(/\bpublic GitHub activity\b/gi, "work")
+    .replace(/\bGitHub activity\b/gi, "work")
+    .replace(/\bpublic activity\b/gi, "work")
+    .replace(/\brecent activity\b/gi, "work")
+    .replace(/\bActivity also touched\b/g, "Also touched")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 async function summarizeOwnerActivity(
@@ -2765,11 +2794,7 @@ async function summarizeOwnerActivity(
   const model = activitySummaryModel(env);
   const input = activitySummaryInput(payload);
   if (!input.trim()) {
-    return unavailableActivitySummary(
-      model,
-      null,
-      "Not enough recent public activity to summarize.",
-    );
+    return unavailableActivitySummary(model, null, "Not enough recent work to summarize.");
   }
   const inputHash = (await sha256Base64Url(input)).slice(0, 32);
   const eventsUsed = activitySummaryEvents(payload).length;
@@ -2790,8 +2815,7 @@ async function summarizeOwnerActivity(
       model,
       reasoning: { effort: "low" },
       max_output_tokens: 420,
-      instructions:
-        "You summarize public GitHub activity for an open source dashboard. Write 2-4 concise sentences, present perfect or recent past, no bullets, no hype, no markdown. Say this is public activity if useful. Mention broad themes, repositories, and work types only when the event titles support them. Do not infer private work or invent details.",
+      instructions: activitySummaryInstructions(),
       input: [
         {
           role: "user",
@@ -2824,11 +2848,12 @@ async function summarizeOwnerActivity(
   if (!text) throw new Error("OpenAI response did not include activity summary text");
   const summary = {
     state: "ready",
-    text,
+    text: polishActivitySummaryText(text),
     generatedAt: new Date().toISOString(),
     model,
     inputHash,
     eventsUsed,
+    promptVersion: activitySummaryPromptVersion,
   } satisfies OwnerActivitySummary;
   await writeOwnerActivitySummary(
     env,
@@ -2880,7 +2905,7 @@ async function buildOwnerActivity(
       state: "fresh",
       stale: false,
       generatedAt,
-      message: "public GitHub activity only",
+      message: "public data only",
       ...(quota ? { quota } : {}),
     },
     totals: activityTotals(events),
@@ -2910,7 +2935,10 @@ function withOwnerActivityState(
 }
 
 function ownerActivitySummaryNeedsRefresh(payload: OwnerActivityPayload | null): boolean {
-  return payload?.summary?.state === "warming";
+  return (
+    payload?.summary?.state === "warming" ||
+    (!!payload?.summary && payload.summary.promptVersion !== activitySummaryPromptVersion)
+  );
 }
 
 async function refreshOwnerActivitySummary(
@@ -2919,16 +2947,18 @@ async function refreshOwnerActivitySummary(
   env: Env,
 ): Promise<void> {
   if (!ownerActivitySummaryNeedsRefresh(payload)) return;
+  const payloadInputHash = (await sha256Base64Url(activitySummaryInput(payload))).slice(0, 32);
   const lock = await acquireBuildLock(env, `${key}:summary`);
   if (!lock) return;
   try {
     const summary = await summarizeOwnerActivity(payload, env);
     const latest = (await readOwnerActivity(env, key)) ?? payload;
+    const latestInputHash = (await sha256Base64Url(activitySummaryInput(latest))).slice(0, 32);
     if (
       latest.owner.login.toLowerCase() !== payload.owner.login.toLowerCase() ||
       latest.range !== payload.range ||
-      latest.summary?.inputHash !== payload.summary?.inputHash ||
-      latest.summary?.inputHash !== summary.inputHash
+      latestInputHash !== payloadInputHash ||
+      (summary.inputHash !== null && latestInputHash !== summary.inputHash)
     ) {
       return;
     }
@@ -2938,10 +2968,11 @@ async function refreshOwnerActivitySummary(
     });
   } catch (error) {
     const latest = (await readOwnerActivity(env, key)) ?? payload;
+    const latestInputHash = (await sha256Base64Url(activitySummaryInput(latest))).slice(0, 32);
     if (
       latest.owner.login.toLowerCase() !== payload.owner.login.toLowerCase() ||
       latest.range !== payload.range ||
-      latest.summary?.inputHash !== payload.summary?.inputHash
+      latestInputHash !== payloadInputHash
     ) {
       return;
     }
@@ -2953,8 +2984,9 @@ async function refreshOwnerActivitySummary(
         text: null,
         generatedAt: null,
         model: latest.summary?.model ?? activitySummaryModel(env),
-        inputHash: latest.summary?.inputHash ?? payload.summary?.inputHash ?? null,
-        eventsUsed: latest.events.length,
+        inputHash: payloadInputHash,
+        eventsUsed: activitySummaryEvents(latest).length,
+        promptVersion: activitySummaryPromptVersion,
         message: errorMessage(error),
       },
     });
@@ -3010,7 +3042,7 @@ async function ownerActivityResponse(
       refreshOwnerActivity(key, ownerSlug, range, request, env).catch(() => undefined),
     );
     return jsonResponse(
-      withOwnerActivityState(cached, "stale", "showing cached public activity while refreshing"),
+      withOwnerActivityState(cached, "stale", "showing cached work while refreshing"),
       200,
       { "cache-control": "no-store" },
     );

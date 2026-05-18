@@ -1444,11 +1444,14 @@ test("worker summarizes public owner activity in the background", async () => {
       const body = JSON.parse(String(init?.body ?? "{}"));
       assert.equal(body.model, "gpt-5.5");
       assert.equal(body.reasoning?.effort, "low");
+      assert.match(body.instructions, /do not restate those facts/i);
+      assert.doesNotMatch(body.instructions, /Say this is public activity/i);
+      assert.match(JSON.stringify(body.input), /Top repositories: acme\/releasebar/);
       assert.match(JSON.stringify(body.input), /Add owner activity panel/);
       assert.match(JSON.stringify(body.input), /Events included: 120/);
       return Response.json({
         output_text:
-          "Acme has been working on ReleaseBar activity summaries, cache behavior, and dashboard copy.",
+          "ReleaseBar activity summaries, cache behavior, and dashboard copy moved forward together.",
       });
     }
     throw new Error(`unexpected fetch ${url.toString()}`);
@@ -1479,8 +1482,10 @@ test("worker summarizes public owner activity in the background", async () => {
     ) as OwnerActivityPayload;
     assert.equal(cached.summary?.state, "ready");
     assert.match(cached.summary?.text ?? "", /activity summaries/);
+    assert.doesNotMatch(cached.summary?.text ?? "", /GitHub activity|public activity/i);
     assert.notEqual(cached.summary?.inputHash, null);
     assert.equal(cached.summary?.eventsUsed, 120);
+    assert.equal(cached.summary?.promptVersion, 2);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1597,6 +1602,156 @@ test("worker skips stale public owner activity summaries when events changed", a
   }
 });
 
+test("worker refreshes cached owner activity summaries from older prompt versions", async () => {
+  const generatedAt = new Date().toISOString();
+  const payload: OwnerActivityPayload = {
+    owner: {
+      type: "user",
+      login: "acme",
+      avatarUrl: "https://github.com/acme.png",
+      url: "https://github.com/acme",
+    },
+    range: "week",
+    generatedAt,
+    cache: {
+      state: "fresh",
+      stale: false,
+      generatedAt,
+    },
+    totals: {
+      events: 1,
+      commits: 1,
+      pullRequests: 0,
+      issues: 0,
+      comments: 0,
+      releases: 0,
+      repositories: 1,
+    },
+    repositories: [
+      {
+        fullName: "acme/releasebar",
+        url: "https://github.com/acme/releasebar",
+        events: 1,
+        commits: 1,
+        lastActiveAt: generatedAt,
+      },
+    ],
+    events: [
+      {
+        id: "event",
+        kind: "commit",
+        title: "Improve working-on summaries",
+        repo: "acme/releasebar",
+        url: "https://github.com/acme/releasebar",
+        createdAt: generatedAt,
+        count: 1,
+      },
+    ],
+    summary: {
+      state: "ready",
+      text: "@acme's public GitHub activity has centered on ReleaseBar.",
+      generatedAt,
+      model: "gpt-5.5",
+      inputHash: "old-prompt-hash",
+      eventsUsed: 1,
+    },
+  };
+  const cache = kvStore({
+    "owner-activity:v1:acme:week": JSON.stringify(payload),
+  });
+  const queued: Promise<unknown>[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.hostname === "api.openai.com" && url.pathname === "/v1/responses") {
+      return Response.json({
+        output_text: "@acme's public GitHub activity refined working-on summaries.",
+      });
+    }
+    throw new Error(`unexpected fetch ${url.toString()}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/acme/activity?range=week"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token", OPENAI_API_KEY: "openai-token" },
+      { waitUntil: (promise) => queued.push(promise) },
+    );
+    assert.equal(response.status, 200);
+    await Promise.all(queued);
+    const cached = JSON.parse(
+      (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
+    ) as OwnerActivityPayload;
+    assert.equal(cached.summary?.state, "ready");
+    assert.equal(cached.summary?.promptVersion, 2);
+    assert.notEqual(cached.summary?.inputHash, "old-prompt-hash");
+    assert.equal(cached.summary?.text, "@acme's work refined working-on summaries.");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker does not summarize empty owner activity", async () => {
+  const generatedAt = new Date().toISOString();
+  const payload: OwnerActivityPayload = {
+    owner: {
+      type: "user",
+      login: "acme",
+      avatarUrl: "https://github.com/acme.png",
+      url: "https://github.com/acme",
+    },
+    range: "week",
+    generatedAt,
+    cache: {
+      state: "fresh",
+      stale: false,
+      generatedAt,
+    },
+    totals: {
+      events: 0,
+      commits: 0,
+      pullRequests: 0,
+      issues: 0,
+      comments: 0,
+      releases: 0,
+      repositories: 0,
+    },
+    repositories: [],
+    events: [],
+    summary: {
+      state: "warming",
+      text: null,
+      generatedAt: null,
+      model: "gpt-5.5",
+      inputHash: "empty-hash",
+      eventsUsed: 0,
+    },
+  };
+  const cache = kvStore({
+    "owner-activity:v1:acme:week": JSON.stringify(payload),
+  });
+  const queued: Promise<unknown>[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    throw new Error(`unexpected fetch ${String(input)}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/acme/activity?range=week"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token", OPENAI_API_KEY: "openai-token" },
+      { waitUntil: (promise) => queued.push(promise) },
+    );
+    assert.equal(response.status, 202);
+    await Promise.all(queued);
+    const cached = JSON.parse(
+      (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
+    ) as OwnerActivityPayload;
+    assert.equal(cached.summary?.state, "unavailable");
+    assert.equal(cached.summary?.message, "Not enough recent work to summarize.");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("worker persists public owner activity summary failures", async () => {
   const generatedAt = new Date().toISOString();
   const payload: OwnerActivityPayload = {
@@ -1676,7 +1831,8 @@ test("worker persists public owner activity summary failures", async () => {
     ) as OwnerActivityPayload;
     assert.equal(cached.summary?.state, "unavailable");
     assert.match(cached.summary?.message ?? "", /summary unavailable/);
-    assert.equal(cached.summary?.inputHash, "activity-hash");
+    assert.notEqual(cached.summary?.inputHash, "activity-hash");
+    assert.equal(cached.summary?.promptVersion, 2);
   } finally {
     globalThis.fetch = originalFetch;
   }

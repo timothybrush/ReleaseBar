@@ -1936,17 +1936,17 @@
       </div>
 
       {#if activityLoading}
-        <p class="activity-text">Loading recent public GitHub activity.</p>
+        <p class="activity-text">Loading recent work.</p>
       {:else if activity?.summary?.state === "ready" && activity.summary.text}
         <p class="activity-text">{activity.summary.text}</p>
       {:else if activity?.summary?.state === "warming"}
-        <p class="activity-text">Summarizing recent public GitHub activity.</p>
+        <p class="activity-text">Summarizing recent work.</p>
       {:else if activity?.summary?.message}
         <p class="activity-text muted">{activity.summary.message}</p>
       {:else if activityError}
         <p class="activity-text muted">{activityError}</p>
       {:else}
-        <p class="activity-text muted">Recent public activity will appear here when GitHub returns enough signal.</p>
+        <p class="activity-text muted">Recent work will appear here when GitHub returns enough signal.</p>
       {/if}
 
       {#if activity}

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Show repository names in full in repository detail hero titles, with owner context kept in the breadcrumb/avatar.
 - Renamed the header wordmark and page-title suffix from `ReleaseBar` to `release.bar` to match the domain.
 - Added a light mode theme with a sun/moon toggle in the top-right header; defaults to dark and persists per browser.
 - Reused source-owned GitHub App installation quota for anonymous public dashboard refreshes and added structured token-use audit logs.

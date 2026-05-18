@@ -305,34 +305,20 @@ h1 {
 
 .repo-title-text {
   display: inline-flex;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-width: 0;
   max-width: 100%;
   align-items: baseline;
   overflow: hidden;
 }
 
-.repo-title-owner,
 .repo-title-name {
+  flex: 0 1 auto;
   min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.repo-title-owner {
-  flex: 0 1 auto;
-  color: color-mix(in srgb, var(--text) 88%, var(--muted));
-}
-
-.repo-title-slash {
-  flex: 0 0 auto;
-  padding: 0 0.08em;
-  color: color-mix(in srgb, var(--text) 78%, var(--muted));
-}
-
-.repo-title-name {
-  flex: 0 1 auto;
 }
 
 .theme-toggle {

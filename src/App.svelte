@@ -1560,8 +1560,6 @@
               />
             </a>
             <span class="repo-title-text" title={label}>
-              <span class="repo-title-owner">{repoDetail.project.owner}</span>
-              <span class="repo-title-slash" aria-hidden="true">/</span>
               <span class="repo-title-name">{repoDetail.project.name}</span>
             </span>
           </span>

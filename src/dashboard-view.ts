@@ -14,10 +14,10 @@ export type DashboardViewState = {
 };
 
 export const filterOptions: DashboardFilter[] = ["all", "attention", "hot", "busy", "fresh"];
-export const attentionFreshness: Freshness[] = ["hot", "busy"];
 export const sortOptions: SortKey[] = ["repo", "stars", "release", "since", "activity"];
 export const devSortOptions: SortKey[] = ["issues", "prs", "ci"];
 const staleReleaseDays = 90;
+const releaseDebtCommits = 200;
 const pullRequestPressure = 10;
 const issuePressure = 100;
 
@@ -49,34 +49,25 @@ export function needsAttention(project: Project): boolean {
   return attentionReasons(project).length > 0;
 }
 
-function isUnhydratedSearchProject(project: Project): boolean {
-  return (
-    project.version === "repo search" &&
-    project.releaseDate === null &&
-    project.commitsSinceRelease === null &&
-    project.compareUrl === null
-  );
+export function releaseDebtText(project: Project): string | null {
+  return project.releaseDate &&
+    project.commitsSinceRelease !== null &&
+    project.commitsSinceRelease > releaseDebtCommits
+    ? `${project.commitsSinceRelease} commits since release`
+    : null;
 }
 
 export function attentionReasons(project: Project, now = Date.now()): string[] {
   const reasons: string[] = [];
-  const unhydratedSearchProject = isUnhydratedSearchProject(project);
-  if (attentionFreshness.includes(project.freshness)) {
-    if (unhydratedSearchProject) {
-      reasons.push("release scan pending");
-    } else if (project.commitsSinceRelease !== null) {
-      reasons.push(`${project.commitsSinceRelease} commits since release`);
-    } else if (project.releaseDate) {
-      reasons.push("commits since release unknown");
-    }
+  const releaseDebt = releaseDebtText(project);
+  if (releaseDebt) {
+    reasons.push(releaseDebt);
   }
   if (project.releaseDate) {
     const ageDays = Math.floor((now - Date.parse(project.releaseDate)) / 86400000);
     if (Number.isFinite(ageDays) && ageDays >= staleReleaseDays) {
       reasons.push(`last release ${ageDays} days ago`);
     }
-  } else if (!unhydratedSearchProject) {
-    reasons.push("no GitHub release");
   }
   if (project.ciState === "failure" || project.ciState === "cancelled") {
     reasons.push(`CI ${project.ciState === "failure" ? "failing" : "cancelled"}`);

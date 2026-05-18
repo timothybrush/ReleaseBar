@@ -341,17 +341,23 @@ test("need attention explains release debt, stale releases, CI, and open work", 
     openPullRequests: 12,
     openIssues: 120,
   });
+  const releaseDebt = testProject({
+    owner: "owner",
+    name: "release-debt",
+    commitsSinceRelease: 201,
+    freshness: "hot",
+    releaseDate: "2026-05-01T00:00:00Z",
+  });
 
   assert.equal(needsAttention(stale), true);
   assert.deepEqual(attentionReasons(stale, Date.parse("2026-05-15T00:00:00Z")), [
     "last release 134 days ago",
   ]);
   assert.equal(needsAttention(pressured), true);
-  assert.deepEqual(attentionReasons(pressured), [
-    "42 commits since release",
-    "CI failing",
-    "12 open PRs",
-    "120 open issues",
+  assert.deepEqual(attentionReasons(pressured), ["CI failing", "12 open PRs", "120 open issues"]);
+  assert.equal(needsAttention(releaseDebt), true);
+  assert.deepEqual(attentionReasons(releaseDebt, Date.parse("2026-05-15T00:00:00Z")), [
+    "201 commits since release",
   ]);
   assert.equal(
     attentionReasons(
@@ -388,7 +394,7 @@ test("need attention explains release debt, stale releases, CI, and open work", 
       }),
       Date.parse("2026-05-15T00:00:00Z"),
     ),
-    ["release scan pending"],
+    [],
   );
   assert.deepEqual(
     attentionReasons(
@@ -403,7 +409,7 @@ test("need attention explains release debt, stale releases, CI, and open work", 
       }),
       Date.parse("2026-05-15T00:00:00Z"),
     ),
-    ["no GitHub release"],
+    [],
   );
 });
 

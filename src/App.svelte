@@ -18,6 +18,7 @@
     attentionReasons,
     needsAttention,
     parseViewState,
+    releaseDebtText,
     sortLabel,
     sortOptions,
     sortProjects,
@@ -1858,6 +1859,12 @@
               {#if project.archived}<span class="tag muted">archived</span>{/if}
               <span class="tag">{project.freshness}</span>
             </div>
+            {#if releaseDebtText(project)}
+              <p class="attention-reasons">
+                <span>needs attention</span>
+                {releaseDebtText(project)}
+              </p>
+            {/if}
           </div>
           <div class="stars-cell">
             <strong>{numberFormat.format(project.stars)}</strong>

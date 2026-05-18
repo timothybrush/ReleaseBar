@@ -1154,6 +1154,19 @@ body.dev-mode .table-head .since-heading .label-compact {
   color: var(--muted);
 }
 
+.attention-reasons {
+  margin: 10px 0 0;
+  color: color-mix(in srgb, var(--amber) 70%, var(--muted));
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.attention-reasons span {
+  margin-right: 8px;
+  color: var(--amber);
+  text-transform: uppercase;
+}
+
 .release-cell span,
 .activity-cell span,
 .ci-cell span {

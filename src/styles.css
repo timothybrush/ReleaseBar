@@ -417,7 +417,7 @@ h1 {
 
 .activity-panel {
   display: grid;
-  gap: 14px;
+  gap: 12px;
   margin: -8px 0 22px;
   padding: 20px;
   border: 1px solid var(--line);
@@ -425,6 +425,11 @@ h1 {
   background:
     linear-gradient(90deg, rgba(156, 255, 87, 0.055), transparent 42%), rgba(16, 19, 15, 0.78);
   box-shadow: var(--shadow);
+}
+
+.activity-panel .panel-heading {
+  align-items: center;
+  margin-bottom: 0;
 }
 
 .range-toggle {

@@ -1920,7 +1920,6 @@
       <div class="panel-heading">
         <div>
           <span class="panel-kicker">working on</span>
-          <h2>{activityRange}</h2>
         </div>
         <div class="range-toggle" aria-label="Activity range">
           {#each activityRanges as range}
@@ -1959,7 +1958,7 @@
         </div>
         <div class="activity-repos" aria-label="Touched repositories">
           {#each activity.repositories.slice(0, 5) as repo}
-            <a href={repo.url} target="_blank" rel="noreferrer">
+            <a href={repoDetailPath(repo.fullName)}>
               {repo.fullName}
               <small>{numberFormat.format(repo.events)}</small>
             </a>

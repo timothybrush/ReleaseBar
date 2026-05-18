@@ -189,6 +189,11 @@ export type RepoDetailWorkTrend = {
   pullRequestsClosed30d: number;
 };
 
+export type RepoDetailStatState = {
+  state: "ready" | "warming" | "unavailable";
+  message?: string;
+};
+
 export type RepoDetailPayload = {
   fullName: string;
   generatedAt: string;
@@ -198,6 +203,10 @@ export type RepoDetailPayload = {
     generatedAt: string;
     message?: string;
     quota?: ApiQuota;
+  };
+  stats?: {
+    commitActivity: RepoDetailStatState;
+    codeFrequency: RepoDetailStatState;
   };
   project: Project;
   releases: RepoDetailRelease[];

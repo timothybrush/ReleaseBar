@@ -975,7 +975,7 @@ test("worker builds cached repository detail with releases and stats", async () 
       });
     }
     if (path === "/repos/acme/releasebar/releases") {
-      assert.equal(url.searchParams.get("per_page"), "20");
+      assert.equal(url.searchParams.get("per_page"), "100");
       return Response.json([
         {
           tag_name: "v1.2.3",
@@ -1094,6 +1094,8 @@ test("worker builds cached repository detail with releases and stats", async () 
     assert.equal(body.commitActivity[0]?.total, 7);
     assert.equal(body.codeFrequency[0]?.additions, 120);
     assert.equal(body.codeFrequency[0]?.deletions, 20);
+    assert.equal(body.stats?.commitActivity.state, "ready");
+    assert.equal(body.stats?.codeFrequency.state, "ready");
     assert.equal(body.workTrend?.issuesOpened30d, 5);
     assert.equal(body.workTrend?.pullRequestsClosed30d, 2);
     assert.deepEqual(
@@ -1357,7 +1359,10 @@ test("worker ignores optional repository detail permission gaps", async () => {
       return Response.json([]);
     }
     if (path === "/repos/acme/limitedbar/stats/code_frequency") {
-      return Response.json([]);
+      return Response.json(
+        { message: "repository must have fewer than 10000 commits" },
+        { status: 422 },
+      );
     }
     throw new Error(`unexpected fetch ${url.pathname}`);
   };
@@ -1370,6 +1375,9 @@ test("worker ignores optional repository detail permission gaps", async () => {
     assert.equal(response.status, 200);
     const body = (await response.json()) as RepoDetailPayload;
     assert.equal(body.project.ciState, "unknown");
+    assert.equal(body.cache.state, "fresh");
+    assert.equal(body.stats?.codeFrequency.state, "unavailable");
+    assert.match(body.stats?.codeFrequency.message ?? "", /fewer than 10000 commits/);
   } finally {
     globalThis.fetch = originalFetch;
   }

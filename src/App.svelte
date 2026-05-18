@@ -193,10 +193,10 @@
   );
   $: stableReleases = (repoDetail?.releases ?? [])
     .filter((release) => !release.prerelease)
-    .slice(0, 4);
+    .slice(0, 3);
   $: preReleases = (repoDetail?.releases ?? [])
     .filter((release) => release.prerelease)
-    .slice(0, 4);
+    .slice(0, 3);
   $: detailLanguageTotal = (repoDetail?.languages ?? []).reduce(
     (sum, language) => sum + language.bytes,
     0,
@@ -301,6 +301,21 @@
 
   function codeTotal(kind: "additions" | "deletions"): number {
     return (repoDetail?.codeFrequency ?? []).reduce((sum, week) => sum + week[kind], 0);
+  }
+
+  function codeFrequencyEmptyText(): string {
+    const stats = repoDetail?.stats?.codeFrequency;
+    if (stats?.state === "warming") {
+      return "GitHub is preparing code-frequency stats. ReleaseBar will refresh this panel.";
+    }
+    if (stats?.message?.includes("fewer than 10000 commits")) {
+      return "GitHub does not expose code-frequency stats for repositories with 10,000+ commits.";
+    }
+    if (stats?.message) return stats.message;
+    if (stats?.state === "unavailable") {
+      return "GitHub does not expose code-frequency stats for this repository.";
+    }
+    return "Code-frequency stats are still warming or unavailable.";
   }
 
   function median(values: number[]): number | null {
@@ -1693,7 +1708,7 @@
                 </div>
               </div>
             {:else}
-              <p class="detail-empty">Code-frequency stats are still warming or unavailable.</p>
+              <p class="detail-empty">{codeFrequencyEmptyText()}</p>
             {/if}
           </section>
         </div>

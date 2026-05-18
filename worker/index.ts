@@ -2202,7 +2202,11 @@ async function detailGitHubStats<TSchema extends GenericSchema>(
   quotaSource: ApiQuota["source"],
   quotaAccount: string | null,
   onQuota: (quota: ApiQuota) => void,
-): Promise<{ state: "ready" | "warming" | "unavailable"; data: InferOutput<TSchema> | null }> {
+): Promise<{
+  state: "ready" | "warming" | "unavailable";
+  data: InferOutput<TSchema> | null;
+  message?: string;
+}> {
   const response = await workerFetch(`https://api.github.com${path}`, {
     headers: {
       accept: "application/vnd.github+json",
@@ -2212,20 +2216,34 @@ async function detailGitHubStats<TSchema extends GenericSchema>(
     },
   });
   onQuota(quotaFromGitHubResponse(response, quotaSource, quotaAccount));
-  if (response.status === 202) return { state: "warming", data: null };
-  if (response.status === 204 || response.status === 422) {
-    return { state: "unavailable", data: null };
+  if (response.status === 202) {
+    return {
+      state: "warming",
+      data: null,
+      message: "GitHub is preparing repository statistics.",
+    };
   }
-  const body = await response.json().catch(() => null);
+  const body = response.status === 204 ? null : await response.json().catch(() => null);
+  const message =
+    body && typeof body === "object" && "message" in body
+      ? String((body as { message?: unknown }).message)
+      : undefined;
+  if (response.status === 204 || response.status === 422) {
+    return {
+      state: "unavailable",
+      data: null,
+      ...(message ? { message } : {}),
+    };
+  }
   if (!response.ok) {
-    const message =
-      body && typeof body === "object" && "message" in body
-        ? String((body as { message?: unknown }).message)
-        : `GitHub API ${response.status}`;
-    if (isRateLimitResponse(response, message)) {
-      throw new GitHubRateLimitError(message, parseHeaderInt(response.headers.get("retry-after")));
+    const errorMessage = message ?? `GitHub API ${response.status}`;
+    if (isRateLimitResponse(response, errorMessage)) {
+      throw new GitHubRateLimitError(
+        errorMessage,
+        parseHeaderInt(response.headers.get("retry-after")),
+      );
     }
-    return { state: "unavailable", data: null };
+    return { state: "unavailable", data: null, message: errorMessage };
   }
   return { state: "ready", data: parseGitHubResponse(schema, body, path) };
 }
@@ -2459,7 +2477,7 @@ async function buildRepoDetail(
 
   const [releases, contributors, languages, latestCommit, openPullRequests] = await Promise.all([
     detailGitHubJson(
-      `${path}/releases?per_page=20`,
+      `${path}/releases?per_page=100`,
       v.array(gitHubReleaseSchema),
       "repository releases",
       token,
@@ -2592,6 +2610,16 @@ async function buildRepoDetail(
       generatedAt,
       ...(statsWarming ? { message: "GitHub is preparing repository statistics." } : {}),
       ...(quota ? { quota } : {}),
+    },
+    stats: {
+      commitActivity: {
+        state: commitActivity.state,
+        ...(commitActivity.message ? { message: commitActivity.message } : {}),
+      },
+      codeFrequency: {
+        state: codeFrequency.state,
+        ...(codeFrequency.message ? { message: codeFrequency.message } : {}),
+      },
     },
     project,
     releases: releases

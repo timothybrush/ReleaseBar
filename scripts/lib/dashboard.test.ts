@@ -1203,6 +1203,56 @@ test("worker throttles cached warming repository detail refreshes", async () => 
   }
 });
 
+test("worker refreshes cached warming repository detail after short grace window", async () => {
+  const generatedAt = new Date(Date.now() - 31_000).toISOString();
+  const payload: RepoDetailPayload = {
+    fullName: "acme/warmbar",
+    generatedAt,
+    cache: {
+      state: "warming",
+      stale: true,
+      generatedAt,
+      message: "GitHub is preparing repository statistics.",
+    },
+    project: testProject({ owner: "acme", name: "warmbar" }),
+    releases: [],
+    contributors: [],
+    commitActivity: [],
+    codeFrequency: [],
+    languages: [],
+    workTrend: null,
+  };
+  const waitUntilPromises: Promise<unknown>[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("queued refresh");
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/warmbar"),
+      {
+        DASHBOARD_CACHE: kvStore({
+          "repo-detail:v4:acme/warmbar": JSON.stringify(payload),
+        }),
+        GITHUB_TOKEN: "shared-token",
+      },
+      {
+        waitUntil: (promise) => {
+          waitUntilPromises.push(promise);
+        },
+      },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as RepoDetailPayload;
+    assert.equal(body.cache.state, "stale");
+    assert.equal(body.cache.message, "refreshing repository statistics");
+    assert.equal(waitUntilPromises.length, 1);
+    await Promise.all(waitUntilPromises);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("worker summarizes commits since release in the background", async () => {
   const generatedAt = new Date().toISOString();
   const payload: RepoDetailPayload = {

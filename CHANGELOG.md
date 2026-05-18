@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Retried warming repository detail statistics after 30 seconds instead of waiting five minutes.
 - Kept long repository detail titles from overlapping the account controls by truncating owner and repository names in the hero.
 - Added optional AI summaries of commit titles since the latest release on repository detail pages.
 - Hid the code churn panel when GitHub code-frequency stats are unavailable.

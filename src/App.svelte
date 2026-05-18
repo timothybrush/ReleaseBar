@@ -345,8 +345,9 @@
 
   function repoActivityMeta(payload: RepoDetailActivityPayload): string {
     const eventText = `${numberFormat.format(payload.totals.events)} public event${payload.totals.events === 1 ? "" : "s"}`;
-    const commitText = `${numberFormat.format(payload.totals.commits)} commit${payload.totals.commits === 1 ? "" : "s"}`;
-    return `${eventText} · ${commitText} · updated ${relativeDate(payload.generatedAt)}`;
+    const rangeText =
+      payload.range === "day" ? "today" : payload.range === "week" ? "this week" : "this month";
+    return `${eventText} ${rangeText} · updated ${relativeDate(payload.generatedAt)}`;
   }
 
   function median(values: number[]): number | null {

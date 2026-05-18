@@ -1572,6 +1572,30 @@
             </div>
           </section>
 
+          <section class="detail-panel detail-wide">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-kicker">commit graph</span>
+                <h2>last 52 weeks</h2>
+              </div>
+              <strong>{numberFormat.format(commitTotal())} commits</strong>
+            </div>
+            {#if repoDetail.commitActivity.length > 0}
+              <div class="spark-bars" aria-label="Weekly commits">
+                {#each repoDetail.commitActivity as week}
+                  <button
+                    type="button"
+                    aria-label={`${shortDate(week.week)} · ${numberFormat.format(week.total)} commits`}
+                    data-tooltip={`${shortDate(week.week)} · ${numberFormat.format(week.total)} commits`}
+                    style={`height: ${percent(week.total, detailMaxCommits)}%`}
+                  ></button>
+                {/each}
+              </div>
+            {:else}
+              <p class="detail-empty">Commit activity is still warming or unavailable.</p>
+            {/if}
+          </section>
+
           {#if showReleaseSummary(repoDetail.releaseSummary)}
             <section class="detail-panel detail-wide release-summary">
               <div class="panel-heading">
@@ -1596,30 +1620,6 @@
               {/if}
             </section>
           {/if}
-
-          <section class="detail-panel detail-wide">
-            <div class="panel-heading">
-              <div>
-                <span class="panel-kicker">commit graph</span>
-                <h2>last 52 weeks</h2>
-              </div>
-              <strong>{numberFormat.format(commitTotal())} commits</strong>
-            </div>
-            {#if repoDetail.commitActivity.length > 0}
-              <div class="spark-bars" aria-label="Weekly commits">
-                {#each repoDetail.commitActivity as week}
-                  <button
-                    type="button"
-                    aria-label={`${shortDate(week.week)} · ${numberFormat.format(week.total)} commits`}
-                    data-tooltip={`${shortDate(week.week)} · ${numberFormat.format(week.total)} commits`}
-                    style={`height: ${percent(week.total, detailMaxCommits)}%`}
-                  ></button>
-                {/each}
-              </div>
-            {:else}
-              <p class="detail-empty">Commit activity is still warming or unavailable.</p>
-            {/if}
-          </section>
 
           <section class="detail-panel">
             <div class="panel-heading">

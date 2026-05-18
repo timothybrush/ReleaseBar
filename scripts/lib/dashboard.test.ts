@@ -36,6 +36,7 @@ import type {
   DashboardPayload,
   OwnerActivityPayload,
   Project,
+  RepoDetailActivityPayload,
   RepoDetailPayload,
 } from "../../src/types.js";
 import worker, { DashboardBuildLock } from "../../worker/index.js";
@@ -1359,6 +1360,103 @@ test("worker summarizes commits since release in the background", async () => {
       await cache.get("release-summary:v1:acme/releasebar:v1.0.0:abcdef1:gpt-5.5"),
       null,
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker summarizes recent repository activity in the background", async () => {
+  const cache = kvStore();
+  const queued: Promise<unknown>[] = [];
+  const originalFetch = globalThis.fetch;
+  const now = new Date().toISOString();
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.hostname === "api.github.com" && url.pathname === "/repos/acme/unreleased") {
+      return Response.json({
+        owner: { login: "acme" },
+        name: "unreleased",
+        full_name: "acme/unreleased",
+        private: false,
+        fork: false,
+        archived: false,
+        html_url: "https://github.com/acme/unreleased",
+        description: "Unreleased repo",
+        default_branch: "main",
+        language: "TypeScript",
+        topics: [],
+        stargazers_count: 12,
+        forks_count: 1,
+        open_issues_count: 0,
+        pushed_at: now,
+        updated_at: now,
+      });
+    }
+    if (url.hostname === "api.github.com" && url.pathname === "/repos/acme/unreleased/events") {
+      if (url.searchParams.get("page") !== "1") return Response.json([]);
+      return Response.json([
+        {
+          id: "1",
+          type: "PushEvent",
+          public: true,
+          created_at: now,
+          repo: { name: "acme/unreleased" },
+          payload: {
+            size: 2,
+            commits: [
+              { message: "Add repository activity summary" },
+              { message: "Polish unreleased project copy" },
+            ],
+          },
+        },
+        {
+          id: "2",
+          type: "PullRequestEvent",
+          public: true,
+          created_at: now,
+          repo: { name: "acme/unreleased" },
+          payload: {
+            action: "merged",
+            pull_request: {
+              title: "Wire recent work panel",
+              html_url: "https://github.com/acme/unreleased/pull/1",
+            },
+          },
+        },
+      ]);
+    }
+    if (url.hostname === "api.openai.com" && url.pathname === "/v1/responses") {
+      const headers = init?.headers as Record<string, string> | undefined;
+      assert.equal(headers?.authorization, "Bearer openai-token");
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      assert.match(JSON.stringify(body.input), /Repository: acme\/unreleased/);
+      assert.match(JSON.stringify(body.input), /Add repository activity summary/);
+      return Response.json({
+        output_text:
+          "acme/unreleased added a recent-work panel for unreleased projects and polished the copy around that flow.",
+      });
+    }
+    throw new Error(`unexpected fetch ${url.toString()}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/unreleased/activity?range=month"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token", OPENAI_API_KEY: "openai-token" },
+      { waitUntil: (promise) => queued.push(promise) },
+    );
+    assert.equal(response.status, 202);
+    const body = (await response.json()) as RepoDetailActivityPayload;
+    assert.equal(body.fullName, "acme/unreleased");
+    assert.equal(body.range, "month");
+    assert.equal(body.summary?.state, "warming");
+    assert.equal(body.totals.commits, 2);
+    await Promise.all(queued);
+    const cached = JSON.parse(
+      (await cache.get("repo-activity:v1:acme/unreleased:month")) ?? "{}",
+    ) as RepoDetailActivityPayload;
+    assert.equal(cached.summary?.state, "ready");
+    assert.match(cached.summary?.text ?? "", /recent-work panel/);
+    assert.equal(cached.summary?.promptVersion, 2);
   } finally {
     globalThis.fetch = originalFetch;
   }

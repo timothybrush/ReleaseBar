@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added recent-work AI summaries to repository detail pages, including unreleased repositories and a since-release toggle for released repositories.
 - Made working-on AI summaries focus on concrete work instead of restating that the data came from GitHub activity.
 - Linked working-on repository chips to ReleaseBar repository detail pages and tightened the activity heading spacing.
 - Added a cached working-on activity block to owner dashboards with day, week, and month AI summaries from public GitHub events.

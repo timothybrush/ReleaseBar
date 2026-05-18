@@ -51,6 +51,7 @@ import type {
   OwnerActivityRepository,
   OwnerActivitySummary,
   Project,
+  RepoDetailActivityPayload,
   RepoDetailPayload,
   RepoDetailReleaseSummary,
   RepoDetailWorkTrend,
@@ -162,6 +163,13 @@ const workerFetch: typeof fetch = (input, init) => fetch(input, init);
 function isRepoDetailApiPath(pathname: string): boolean {
   const parts = pathname.split("/").filter(Boolean);
   return parts.length === 4 && parts[0] === "api" && parts[1] === "repos";
+}
+
+function isRepoActivityApiPath(pathname: string): boolean {
+  const parts = pathname.split("/").filter(Boolean);
+  return (
+    parts.length === 5 && parts[0] === "api" && parts[1] === "repos" && parts[4] === "activity"
+  );
 }
 
 function isOwnerActivityApiPath(pathname: string): boolean {
@@ -2409,6 +2417,25 @@ function ownerActivitySummaryCacheKey(
   ].join(":");
 }
 
+function repoActivityCacheKey(owner: string, repo: string, range: ActivityRange): string {
+  return `repo-activity:v1:${slugOwner(owner)}/${repo.toLowerCase()}:${range}`;
+}
+
+function repoActivitySummaryCacheKey(
+  fullName: string,
+  range: ActivityRange,
+  model: string,
+  inputHash: string,
+): string {
+  return [
+    `repo-activity-summary:v${activitySummaryPromptVersion}`,
+    fullName.toLowerCase(),
+    range,
+    encodeURIComponent(model),
+    inputHash,
+  ].join(":");
+}
+
 function ownerActivityAgeMs(payload: OwnerActivityPayload | null): number {
   if (!payload) return Number.POSITIVE_INFINITY;
   const generatedAt = Date.parse(payload.generatedAt);
@@ -2424,6 +2451,21 @@ async function writeOwnerActivity(
   env: Env,
   key: string,
   payload: OwnerActivityPayload,
+): Promise<void> {
+  await env.DASHBOARD_CACHE?.put(key, JSON.stringify(payload), {
+    expirationTtl: dashboardStorageTtlSeconds,
+  });
+}
+
+async function readRepoActivity(env: Env, key: string): Promise<RepoDetailActivityPayload | null> {
+  const raw = await env.DASHBOARD_CACHE?.get(key);
+  return raw ? tryJsonParse<RepoDetailActivityPayload>(raw, `repo activity ${key}`) : null;
+}
+
+async function writeRepoActivity(
+  env: Env,
+  key: string,
+  payload: RepoDetailActivityPayload,
 ): Promise<void> {
   await env.DASHBOARD_CACHE?.put(key, JSON.stringify(payload), {
     expirationTtl: dashboardStorageTtlSeconds,
@@ -2640,6 +2682,42 @@ async function fetchOwnerActivityEvents(
   return events.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
 }
 
+async function fetchRepoActivityEvents(
+  path: string,
+  since: number,
+  token: string | null,
+  quotaSource: ApiQuota["source"],
+  quotaAccount: string | null,
+  onQuota: (quota: ApiQuota) => void,
+): Promise<OwnerActivityEvent[]> {
+  const events: OwnerActivityEvent[] = [];
+  for (let page = 1; page <= activityEventPageLimit; page += 1) {
+    const pageEvents = await detailGitHubJson(
+      `${path}/events?per_page=100&page=${page}`,
+      gitHubPublicEventListSchema,
+      "repository public events",
+      token,
+      quotaSource,
+      quotaAccount,
+      onQuota,
+    );
+    if (pageEvents.length === 0) break;
+    const normalized = pageEvents.map(normalizeActivityEvent).filter((event) => event !== null);
+    events.push(
+      ...normalized.filter((event) => {
+        const time = Date.parse(event.createdAt);
+        return Number.isFinite(time) && time >= since;
+      }),
+    );
+    const oldest = pageEvents
+      .map((event) => Date.parse(event.created_at))
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b)[0];
+    if (oldest !== undefined && oldest < since) break;
+  }
+  return events.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+}
+
 function activityRepositories(events: OwnerActivityEvent[]): OwnerActivityRepository[] {
   const repos = new Map<string, OwnerActivityRepository>();
   for (const event of events) {
@@ -2683,11 +2761,13 @@ function activitySummaryModel(env: Env): string {
   return env.OPENAI_SUMMARY_MODEL || "gpt-5.5";
 }
 
-function activitySummaryEvents(payload: OwnerActivityPayload): OwnerActivityEvent[] {
+type ActivitySummaryPayload = Pick<OwnerActivityPayload, "events" | "repositories">;
+
+function activitySummaryEvents(payload: ActivitySummaryPayload): OwnerActivityEvent[] {
   return payload.events.slice(0, activitySummaryInputLimit);
 }
 
-function activitySummaryInput(payload: OwnerActivityPayload): string {
+function activitySummaryInput(payload: ActivitySummaryPayload): string {
   const summaryEvents = activitySummaryEvents(payload);
   if (summaryEvents.length === 0) return "";
   const topRepos = payload.repositories
@@ -2918,6 +2998,179 @@ async function buildOwnerActivity(
   };
 }
 
+async function repoActivitySummaryState(
+  payload: RepoDetailActivityPayload,
+  env: Env,
+): Promise<OwnerActivitySummary> {
+  const model = activitySummaryModel(env);
+  const input = activitySummaryInput(payload);
+  if (!input.trim()) {
+    return unavailableActivitySummary(model, null, "Not enough recent work to summarize.");
+  }
+  const inputHash = (await sha256Base64Url(input)).slice(0, 32);
+  const eventsUsed = activitySummaryEvents(payload).length;
+  const cacheKey = repoActivitySummaryCacheKey(payload.fullName, payload.range, model, inputHash);
+  const cached = await readOwnerActivitySummary(env, cacheKey);
+  if (cached?.state === "ready" && cached.promptVersion === activitySummaryPromptVersion) {
+    return cached;
+  }
+  if (!env.OPENAI_API_KEY) {
+    return unavailableActivitySummary(
+      model,
+      inputHash,
+      "AI activity summaries are not configured.",
+    );
+  }
+  return {
+    state: "warming",
+    text: null,
+    generatedAt: null,
+    model,
+    inputHash,
+    eventsUsed,
+    promptVersion: activitySummaryPromptVersion,
+    message: "Summarizing recent work.",
+  };
+}
+
+async function summarizeRepoActivity(
+  payload: RepoDetailActivityPayload,
+  env: Env,
+): Promise<OwnerActivitySummary> {
+  const model = activitySummaryModel(env);
+  const input = activitySummaryInput(payload);
+  if (!input.trim()) {
+    return unavailableActivitySummary(model, null, "Not enough recent work to summarize.");
+  }
+  const inputHash = (await sha256Base64Url(input)).slice(0, 32);
+  const eventsUsed = activitySummaryEvents(payload).length;
+  if (!env.OPENAI_API_KEY) {
+    return unavailableActivitySummary(
+      model,
+      inputHash,
+      "AI activity summaries are not configured.",
+    );
+  }
+  const response = await workerFetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      reasoning: { effort: "low" },
+      max_output_tokens: 420,
+      instructions: activitySummaryInstructions(),
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: [
+                `Repository: ${payload.fullName}`,
+                `Range: ${payload.range}`,
+                `Events included: ${eventsUsed}`,
+                "",
+                input,
+              ].join("\n"),
+            },
+          ],
+        },
+      ],
+    }),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message =
+      body && typeof body === "object" && "error" in body
+        ? String((body as { error?: { message?: string } }).error?.message ?? "OpenAI API error")
+        : `OpenAI API ${response.status}`;
+    throw new Error(message);
+  }
+  const text = openAIOutputText(body);
+  if (!text) throw new Error("OpenAI response did not include activity summary text");
+  const summary = {
+    state: "ready",
+    text: polishActivitySummaryText(text),
+    generatedAt: new Date().toISOString(),
+    model,
+    inputHash,
+    eventsUsed,
+    promptVersion: activitySummaryPromptVersion,
+  } satisfies OwnerActivitySummary;
+  await writeOwnerActivitySummary(
+    env,
+    repoActivitySummaryCacheKey(payload.fullName, payload.range, model, inputHash),
+    summary,
+  );
+  return summary;
+}
+
+async function buildRepoActivity(
+  owner: string,
+  repoName: string,
+  range: ActivityRange,
+  request: Request,
+  env: Env,
+): Promise<RepoDetailActivityPayload> {
+  const fullName = `${slugOwner(owner)}/${repoName.toLowerCase()}`;
+  const requestToken = await requestInstallationToken(request, env, {
+    owners: [],
+    repos: [fullName],
+  }).catch(() => null);
+  const token = requestToken?.token ?? env.GITHUB_TOKEN ?? null;
+  const quotaSource = requestToken?.quotaSource ?? (env.GITHUB_TOKEN ? "shared" : "anonymous");
+  const quotaAccount = requestToken?.quotaAccount ?? null;
+  let quota: ApiQuota | undefined;
+  const onQuota = (nextQuota: ApiQuota) => {
+    quota = nextQuota;
+  };
+  const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}`;
+  const repo = await detailGitHubJson(
+    path,
+    gitHubRepositorySchema,
+    "repository detail",
+    token,
+    quotaSource,
+    quotaAccount,
+    onQuota,
+  );
+  if (repo.private) {
+    throw new Error("private repositories are not visible in public dashboards");
+  }
+  const since = Date.now() - activityRangeMs(range);
+  const events = await fetchRepoActivityEvents(
+    path,
+    since,
+    token,
+    quotaSource,
+    quotaAccount,
+    onQuota,
+  );
+  const generatedAt = new Date().toISOString();
+  const payload: RepoDetailActivityPayload = {
+    fullName: repo.full_name,
+    range,
+    generatedAt,
+    cache: {
+      state: "fresh",
+      stale: false,
+      generatedAt,
+      message: "public data only",
+      ...(quota ? { quota } : {}),
+    },
+    totals: activityTotals(events),
+    repositories: activityRepositories(events),
+    events,
+  };
+  return {
+    ...payload,
+    summary: await repoActivitySummaryState(payload, env),
+  };
+}
+
 function withOwnerActivityState(
   payload: OwnerActivityPayload,
   state: OwnerActivityPayload["cache"]["state"],
@@ -3061,6 +3314,171 @@ async function ownerActivityResponse(
     if (cached) {
       return jsonResponse(
         withOwnerActivityState(cached, "stale", dashboardErrorMessage(error)),
+        200,
+        retryAfterHeaders(error),
+      );
+    }
+    return jsonResponse(
+      { error: dashboardErrorMessage(error) },
+      errorStatus(error),
+      retryAfterHeaders(error),
+    );
+  }
+}
+
+function repoActivityAgeMs(payload: RepoDetailActivityPayload | null): number {
+  if (!payload) return Number.POSITIVE_INFINITY;
+  const generatedAt = Date.parse(payload.generatedAt);
+  return Number.isFinite(generatedAt) ? Date.now() - generatedAt : Number.POSITIVE_INFINITY;
+}
+
+function withRepoActivityState(
+  payload: RepoDetailActivityPayload,
+  state: RepoDetailActivityPayload["cache"]["state"],
+  message = payload.cache.message,
+): RepoDetailActivityPayload {
+  return {
+    ...payload,
+    cache: {
+      ...payload.cache,
+      state,
+      stale: state !== "fresh",
+      ...(message ? { message } : {}),
+    },
+  };
+}
+
+function repoActivitySummaryNeedsRefresh(payload: RepoDetailActivityPayload | null): boolean {
+  return (
+    payload?.summary?.state === "warming" ||
+    (!!payload?.summary && payload.summary.promptVersion !== activitySummaryPromptVersion)
+  );
+}
+
+async function refreshRepoActivitySummary(
+  key: string,
+  payload: RepoDetailActivityPayload,
+  env: Env,
+): Promise<void> {
+  if (!repoActivitySummaryNeedsRefresh(payload)) return;
+  const payloadInputHash = (await sha256Base64Url(activitySummaryInput(payload))).slice(0, 32);
+  const lock = await acquireBuildLock(env, `${key}:summary`);
+  if (!lock) return;
+  try {
+    const summary = await summarizeRepoActivity(payload, env);
+    const latest = (await readRepoActivity(env, key)) ?? payload;
+    const latestInputHash = (await sha256Base64Url(activitySummaryInput(latest))).slice(0, 32);
+    if (
+      latest.fullName.toLowerCase() !== payload.fullName.toLowerCase() ||
+      latest.range !== payload.range ||
+      latestInputHash !== payloadInputHash ||
+      (summary.inputHash !== null && latestInputHash !== summary.inputHash)
+    ) {
+      return;
+    }
+    await writeRepoActivity(env, key, {
+      ...latest,
+      summary,
+    });
+  } catch (error) {
+    const latest = (await readRepoActivity(env, key)) ?? payload;
+    const latestInputHash = (await sha256Base64Url(activitySummaryInput(latest))).slice(0, 32);
+    if (
+      latest.fullName.toLowerCase() !== payload.fullName.toLowerCase() ||
+      latest.range !== payload.range ||
+      latestInputHash !== payloadInputHash
+    ) {
+      return;
+    }
+    await writeRepoActivity(env, key, {
+      ...latest,
+      summary: {
+        ...(latest.summary ?? payload.summary),
+        state: "unavailable",
+        text: null,
+        generatedAt: null,
+        model: latest.summary?.model ?? activitySummaryModel(env),
+        inputHash: payloadInputHash,
+        eventsUsed: activitySummaryEvents(latest).length,
+        promptVersion: activitySummaryPromptVersion,
+        message: errorMessage(error),
+      },
+    });
+  } finally {
+    await lock.release();
+  }
+}
+
+async function refreshRepoActivity(
+  key: string,
+  owner: string,
+  repo: string,
+  range: ActivityRange,
+  request: Request,
+  env: Env,
+): Promise<void> {
+  const lock = await acquireBuildLock(env, key);
+  if (!lock) return;
+  try {
+    const payload = await buildRepoActivity(owner, repo, range, request, env);
+    await writeRepoActivity(env, key, payload);
+    if (repoActivitySummaryNeedsRefresh(payload)) {
+      await refreshRepoActivitySummary(key, payload, env);
+    }
+  } finally {
+    await lock.release();
+  }
+}
+
+async function repoActivityResponse(
+  request: Request,
+  env: Env,
+  context: ExecutionContext,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const [, , , rawOwner, rawRepo] = url.pathname.split("/");
+  const owner = slugOwner(decodeURIComponent(rawOwner ?? ""));
+  const repo = decodeURIComponent(rawRepo ?? "").toLowerCase();
+  const fullName = `${owner}/${repo}`;
+  if (!validRepoSlug(fullName)) {
+    return jsonResponse({ error: "invalid repository" }, 400, { "cache-control": "no-store" });
+  }
+  const range = activityRangeFromUrl(url);
+  const key = repoActivityCacheKey(owner, repo, range);
+  const cached = await readRepoActivity(env, key);
+  const age = repoActivityAgeMs(cached);
+  if (cached && age < activityCacheTtlMs(range)) {
+    if (repoActivitySummaryNeedsRefresh(cached)) {
+      context.waitUntil(refreshRepoActivitySummary(key, cached, env).catch(() => undefined));
+    }
+    return jsonResponse(cached, cached.summary?.state === "warming" ? 202 : 200, {
+      "cache-control": "public, max-age=60, stale-while-revalidate=600",
+    });
+  }
+  if (cached && age < maxDisplayStaleMs) {
+    context.waitUntil(
+      refreshRepoActivity(key, owner, repo, range, request, env).catch(() => undefined),
+    );
+    return jsonResponse(
+      withRepoActivityState(cached, "stale", "showing cached work while refreshing"),
+      200,
+      { "cache-control": "no-store" },
+    );
+  }
+
+  try {
+    const payload = await buildRepoActivity(owner, repo, range, request, env);
+    await writeRepoActivity(env, key, payload);
+    if (repoActivitySummaryNeedsRefresh(payload)) {
+      context.waitUntil(refreshRepoActivitySummary(key, payload, env).catch(() => undefined));
+    }
+    return jsonResponse(payload, payload.summary?.state === "warming" ? 202 : 200, {
+      "cache-control": "no-store",
+    });
+  } catch (error) {
+    if (cached) {
+      return jsonResponse(
+        withRepoActivityState(cached, "stale", dashboardErrorMessage(error)),
         200,
         retryAfterHeaders(error),
       );
@@ -4874,6 +5292,9 @@ async function routeRequest(
   }
   if (isOwnerActivityApiPath(url.pathname)) {
     return ownerActivityResponse(request, env, context);
+  }
+  if (isRepoActivityApiPath(url.pathname)) {
+    return repoActivityResponse(request, env, context);
   }
   if (isRepoDetailApiPath(url.pathname)) {
     return repoDetailResponse(request, env, context);

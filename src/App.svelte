@@ -45,6 +45,8 @@
     Owner,
     OwnerActivityPayload,
     Project,
+    RepoActivityRange,
+    RepoDetailActivityPayload,
     RepoDetailPayload,
     RepoDetailReleaseSummary,
   } from "./types.js";
@@ -88,11 +90,16 @@
   let dashboardRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let repoDetailRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let activityRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let repoActivityRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let dashboardEventSource: EventSource | null = null;
   let activityRange: ActivityRange = "week";
   let activity: OwnerActivityPayload | null = null;
   let activityLoading = false;
   let activityError = "";
+  let repoSummaryRange: RepoActivityRange = "release";
+  let repoActivity: RepoDetailActivityPayload | null = null;
+  let repoActivityLoading = false;
+  let repoActivityError = "";
 
   const numberFormat = new Intl.NumberFormat("en", { notation: "compact" });
   const dateFormat = new Intl.DateTimeFormat("en", {
@@ -119,6 +126,9 @@
     { value: "month", label: "month" },
   ];
 
+  $: repoSummaryRanges = repoDetail?.project.releaseDate
+    ? [...activityRanges, { value: "release" as RepoActivityRange, label: "since release" }]
+    : activityRanges;
   $: label = repoRoute ? (repoDetail?.fullName ?? repoRoute.fullName) : data ? ownerLabel(data) : initialRoute.label;
   $: heroOwner = ownerHero(data);
   $: heroExtraCount = initialRoute.extraOwners.length + initialRoute.repos.length;
@@ -320,14 +330,6 @@
     return (repoDetail?.codeFrequency ?? []).reduce((sum, week) => sum + week[kind], 0);
   }
 
-  function showReleaseSummary(summary: RepoDetailReleaseSummary | undefined): boolean {
-    return Boolean(
-      summary &&
-        (summary.state !== "unavailable" ||
-          summary.message !== "AI release summaries are not configured."),
-    );
-  }
-
   function releaseSummaryMeta(summary: RepoDetailReleaseSummary): string {
     const count =
       summary.commitCount === null ? "" : `${numberFormat.format(summary.commitCount)} commits`;
@@ -337,6 +339,12 @@
         : "";
     const model = summary.model ?? "";
     return [count, used, model].filter(Boolean).join(" · ");
+  }
+
+  function repoActivityMeta(payload: RepoDetailActivityPayload): string {
+    const eventText = `${numberFormat.format(payload.totals.events)} public event${payload.totals.events === 1 ? "" : "s"}`;
+    const commitText = `${numberFormat.format(payload.totals.commits)} commit${payload.totals.commits === 1 ? "" : "s"}`;
+    return `${eventText} · ${commitText} · updated ${relativeDate(payload.generatedAt)}`;
   }
 
   function median(values: number[]): number | null {
@@ -816,6 +824,23 @@
     }, delay);
   }
 
+  function scheduleRepoActivityRefresh(attempt: number): void {
+    if (!repoRoute || repoSummaryRange === "release") return;
+    if (repoActivityRefreshTimer !== null) {
+      globalThis.clearTimeout(repoActivityRefreshTimer);
+    }
+    if (attempt >= 8) return;
+    const delay = attempt < 3 ? 5000 : 15000;
+    repoActivityRefreshTimer = globalThis.setTimeout(() => {
+      repoActivityRefreshTimer = null;
+      if (document.hidden) {
+        scheduleRepoActivityRefresh(attempt);
+        return;
+      }
+      void loadRepoActivity(attempt + 1).catch(() => undefined);
+    }, delay);
+  }
+
   function activityApiPaths(): string[] {
     if (!initialRoute.owner) return [];
     const path = `/api/${encodeURIComponent(initialRoute.owner)}/activity`;
@@ -825,6 +850,25 @@
     if (initialRoute.fallbackApiPath) {
       const fallback = new URL(path, workersDevApiOrigin);
       fallback.searchParams.set("range", activityRange);
+      urls.push(fallback.toString());
+    }
+    return urls;
+  }
+
+  function repoActivityApiPaths(): string[] {
+    if (!repoRoute || repoSummaryRange === "release") return [];
+    const appendActivity = (apiPath: string): string => {
+      const url = new URL(`${apiPath.replace(/\/$/, "")}/activity`, location.origin);
+      url.searchParams.set("range", repoSummaryRange);
+      return url.toString();
+    };
+    const urls = [appendActivity(repoRoute.apiPath)];
+    if (repoRoute.fallbackApiPath) {
+      const fallback = new URL(
+        `${repoRoute.fallbackApiPath.replace(/\/$/, "")}/activity`,
+        workersDevApiOrigin,
+      );
+      fallback.searchParams.set("range", repoSummaryRange);
       urls.push(fallback.toString());
     }
     return urls;
@@ -874,6 +918,56 @@
       activityRefreshTimer = null;
     }
     void loadOwnerActivity();
+  }
+
+  async function loadRepoActivity(attempt = 0): Promise<void> {
+    if (!repoRoute || repoSummaryRange === "release") return;
+    const paths = repoActivityApiPaths();
+    if (paths.length === 0) return;
+    const requestedRange = repoSummaryRange;
+    repoActivityLoading = attempt === 0 && !repoActivity;
+    repoActivityError = "";
+    try {
+      for (const path of paths) {
+        const response = await fetch(path, {
+          cache: attempt > 0 ? "no-store" : "default",
+        });
+        const body = (await response.json().catch(() => null)) as
+          | RepoDetailActivityPayload
+          | { error?: string }
+          | null;
+        if (body && "events" in body) {
+          if (requestedRange !== repoSummaryRange) return;
+          repoActivity = body;
+          if (body.summary?.state === "warming" || body.cache.state === "stale") {
+            scheduleRepoActivityRefresh(attempt);
+          }
+          return;
+        }
+        repoActivityError =
+          body && "error" in body
+            ? (body.error ?? "")
+            : `repository activity fetch failed: ${response.status}`;
+      }
+    } catch (error) {
+      repoActivityError = error instanceof Error ? error.message : String(error);
+    } finally {
+      repoActivityLoading = false;
+    }
+  }
+
+  function setRepoSummaryRange(range: RepoActivityRange): void {
+    if (repoSummaryRange === range) return;
+    repoSummaryRange = range;
+    repoActivity = null;
+    repoActivityError = "";
+    if (repoActivityRefreshTimer !== null) {
+      globalThis.clearTimeout(repoActivityRefreshTimer);
+      repoActivityRefreshTimer = null;
+    }
+    if (range !== "release") {
+      void loadRepoActivity();
+    }
   }
 
   function activityMeta(payload: OwnerActivityPayload): string {
@@ -991,6 +1085,9 @@
     }
     if (body && "project" in body) {
       repoDetail = body;
+      if (!body.project.releaseDate && repoSummaryRange === "release") {
+        repoSummaryRange = "month";
+      }
       updateRepoDetailStatus();
       if (
         body.cache.state === "warming" ||
@@ -998,6 +1095,9 @@
         body.releaseSummary?.state === "warming"
       ) {
         scheduleRepoDetailRefresh(attempt);
+      }
+      if (repoSummaryRange !== "release" && !repoActivity) {
+        void loadRepoActivity();
       }
       return;
     }
@@ -1388,6 +1488,9 @@
     if (activityRefreshTimer !== null) {
       globalThis.clearTimeout(activityRefreshTimer);
     }
+    if (repoActivityRefreshTimer !== null) {
+      globalThis.clearTimeout(repoActivityRefreshTimer);
+    }
     closeDashboardStream();
     document.body.classList.remove("dev-mode");
   });
@@ -1745,19 +1848,26 @@
             {/if}
           </section>
 
-          {#if showReleaseSummary(repoDetail.releaseSummary)}
-            <section class="detail-panel detail-wide release-summary">
-              <div class="panel-heading">
-                <div>
-                  <span class="panel-kicker">AI summary</span>
-                  <h2>since last release</h2>
-                </div>
-                {#if repoDetail.releaseSummary?.state === "ready"}
-                  <strong>{repoDetail.releaseSummary.releaseTag}</strong>
-                {:else}
-                  <strong>{repoDetail.releaseSummary?.state}</strong>
-                {/if}
+          <section class="detail-panel detail-wide release-summary">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-kicker">AI summary</span>
+                <h2>{repoSummaryRange === "release" ? "since last release" : "recent work"}</h2>
               </div>
+              <div class="range-toggle" aria-label="Repository summary range">
+                {#each repoSummaryRanges as range}
+                  <button
+                    class:active={repoSummaryRange === range.value}
+                    type="button"
+                    aria-pressed={repoSummaryRange === range.value}
+                    onclick={() => setRepoSummaryRange(range.value)}
+                  >
+                    {range.label}
+                  </button>
+                {/each}
+              </div>
+            </div>
+            {#if repoSummaryRange === "release"}
               {#if repoDetail.releaseSummary?.state === "ready" && repoDetail.releaseSummary.text}
                 <p>{repoDetail.releaseSummary.text}</p>
                 <small>{releaseSummaryMeta(repoDetail.releaseSummary)}</small>
@@ -1766,9 +1876,25 @@
                 <small>{releaseSummaryMeta(repoDetail.releaseSummary)}</small>
               {:else if repoDetail.releaseSummary?.message}
                 <p class="detail-empty">{repoDetail.releaseSummary.message}</p>
+              {:else}
+                <p class="detail-empty">No release summary is available yet.</p>
               {/if}
-            </section>
-          {/if}
+            {:else if repoActivityLoading}
+              <p>Loading recent work.</p>
+            {:else if repoActivity?.summary?.state === "ready" && repoActivity.summary.text}
+              <p>{repoActivity.summary.text}</p>
+              <small>{repoActivityMeta(repoActivity)}</small>
+            {:else if repoActivity?.summary?.state === "warming"}
+              <p>Summarizing recent work.</p>
+              <small>{repoActivityMeta(repoActivity)}</small>
+            {:else if repoActivity?.summary?.message}
+              <p class="detail-empty">{repoActivity.summary.message}</p>
+            {:else if repoActivityError}
+              <p class="detail-empty">{repoActivityError}</p>
+            {:else}
+              <p class="detail-empty">Recent work will appear here when GitHub returns enough signal.</p>
+            {/if}
+          </section>
 
           <section class="detail-panel">
             <div class="panel-heading">

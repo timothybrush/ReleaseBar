@@ -150,6 +150,7 @@ export type DashboardPayload = {
 };
 
 export type ActivityRange = "day" | "week" | "month";
+export type RepoActivityRange = ActivityRange | "release";
 
 export type OwnerActivityKind =
   | "commit"
@@ -191,6 +192,31 @@ export type OwnerActivitySummary = {
 
 export type OwnerActivityPayload = {
   owner: Owner;
+  range: ActivityRange;
+  generatedAt: string;
+  cache: {
+    state: "fresh" | "stale" | "warming" | "error";
+    stale: boolean;
+    generatedAt: string;
+    message?: string;
+    quota?: ApiQuota;
+  };
+  totals: {
+    events: number;
+    commits: number;
+    pullRequests: number;
+    issues: number;
+    comments: number;
+    releases: number;
+    repositories: number;
+  };
+  repositories: OwnerActivityRepository[];
+  events: OwnerActivityEvent[];
+  summary?: OwnerActivitySummary;
+};
+
+export type RepoDetailActivityPayload = {
+  fullName: string;
   range: ActivityRange;
   generatedAt: string;
   cache: {

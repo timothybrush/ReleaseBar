@@ -595,7 +595,7 @@ test("worker social cards include owner avatars and repository release metrics",
   };
   const env = {
     DASHBOARD_CACHE: kvStore({
-      "repo-detail:v2:acme/releasebar": JSON.stringify(repoPayload),
+      "repo-detail:v3:acme/releasebar": JSON.stringify(repoPayload),
     }),
   };
 
@@ -706,7 +706,7 @@ test("worker social cards include owner avatars and repository release metrics",
       new Request("https://release.bar/og/stale%2Frepo.svg"),
       {
         DASHBOARD_CACHE: kvStore({
-          "repo-detail:v2:stale/repo": JSON.stringify(stalePayload),
+          "repo-detail:v3:stale/repo": JSON.stringify(stalePayload),
         }),
       },
       { waitUntil: (promise) => queued.push(promise) },
@@ -1143,7 +1143,7 @@ test("worker throttles cached warming repository detail refreshes", async () => 
       new Request("https://release.bar/api/repos/acme/warmbar"),
       {
         DASHBOARD_CACHE: kvStore({
-          "repo-detail:v2:acme/warmbar": JSON.stringify(payload),
+          "repo-detail:v3:acme/warmbar": JSON.stringify(payload),
         }),
         GITHUB_TOKEN: "shared-token",
       },
@@ -1501,7 +1501,7 @@ test("worker keeps repository detail when work trend search is rate limited", as
     assert.equal(response.status, 200);
     const body = (await response.json()) as RepoDetailPayload;
     assert.equal(body.workTrend, null);
-    assert.notEqual(await cache.get("repo-detail:v2:acme/trendbar"), null);
+    assert.notEqual(await cache.get("repo-detail:v3:acme/trendbar"), null);
   } finally {
     globalThis.fetch = originalFetch;
   }

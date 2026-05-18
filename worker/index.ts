@@ -2398,7 +2398,7 @@ function releaseProject(repo: InferOutput<typeof gitHubRepositorySchema>): Proje
 }
 
 function repoDetailCacheKey(owner: string, repo: string): string {
-  return `repo-detail:v2:${slugOwner(owner)}/${repo.toLowerCase()}`;
+  return `repo-detail:v3:${slugOwner(owner)}/${repo.toLowerCase()}`;
 }
 
 async function readRepoDetail(env: Env, key: string): Promise<RepoDetailPayload | null> {

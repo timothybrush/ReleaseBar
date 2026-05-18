@@ -4,6 +4,7 @@
 
 - Explained when GitHub code-frequency stats are unavailable for very large repositories.
 - Fetched deeper repository release history so prerelease-heavy projects can still show recent stable releases.
+- Rebuilt repository detail caches for the expanded release and stats metadata.
 - Added owner avatars to repository detail hero headings.
 - Made repository detail stat values shrink for long release names before truncating.
 - Split repository detail releases into recent stable and prerelease groups.

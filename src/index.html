@@ -25,11 +25,21 @@
       content="Release freshness across open source projects: versions, stale releases, commits, issues, PRs, and CI."
     />
     <meta name="twitter:image" content="https://release.bar/og-card.png" />
-    <title>ReleaseBar Hot · ReleaseBar</title>
+    <title>ReleaseBar Hot · release.bar</title>
     <link rel="canonical" href="https://release.bar/" />
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem("releasedeck:theme");
+          if (stored === "light") {
+            document.documentElement.setAttribute("data-theme", "light");
+          }
+        } catch (_) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>

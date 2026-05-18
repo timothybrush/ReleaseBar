@@ -1423,6 +1423,7 @@ body.dev-mode .table-head .since-heading .label-compact {
 }
 
 .detail-overview > div {
+  container-type: inline-size;
   min-width: 0;
   padding: 18px;
   border-right: 1px solid var(--line);
@@ -1444,7 +1445,11 @@ body.dev-mode .table-head .since-heading .label-compact {
   margin-top: 10px;
   overflow: hidden;
   color: var(--text);
-  font-size: min(clamp(24px, 3vw, 42px), var(--detail-value-size, 42px));
+  font-size: min(
+    clamp(20px, 12cqw, 42px),
+    var(--detail-value-size, 42px),
+    var(--detail-fit-size, 42px)
+  );
   line-height: 1;
   text-overflow: ellipsis;
   white-space: nowrap;

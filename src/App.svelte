@@ -361,7 +361,48 @@
   function detailValueStyle(value: string | number | null): string {
     const length = String(value ?? "").length;
     const size = length > 22 ? 24 : length > 16 ? 30 : length > 12 ? 34 : 42;
-    return `--detail-value-size: ${size}px`;
+    return `--detail-value-size: ${size}px; --detail-fit-size: ${size}px`;
+  }
+
+  function fitDetailValue(node: HTMLElement, _value: string | number | null) {
+    let frame = 0;
+    const minSize = 20;
+
+    function preferredSize(): number {
+      const parsed = Number.parseFloat(getComputedStyle(node).getPropertyValue("--detail-value-size"));
+      return Number.isFinite(parsed) ? parsed : 42;
+    }
+
+    function fit() {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const preferred = preferredSize();
+        node.style.setProperty("--detail-fit-size", `${preferred}px`);
+        const rendered = Number.parseFloat(getComputedStyle(node).fontSize);
+        const base = Number.isFinite(rendered) ? rendered : preferred;
+        const available = node.clientWidth;
+        const needed = node.scrollWidth;
+        const next =
+          available > 0 && needed > available
+            ? Math.max(minSize, Math.floor(base * (available / needed) * 0.96))
+            : preferred;
+        node.style.setProperty("--detail-fit-size", `${next}px`);
+      });
+    }
+
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(fit);
+    observer?.observe(node);
+    fit();
+
+    return {
+      update(_next: string | number | null) {
+        fit();
+      },
+      destroy() {
+        cancelAnimationFrame(frame);
+        observer?.disconnect();
+      },
+    };
   }
 
   function attentionText(project: Project): string {
@@ -1527,6 +1568,7 @@
               <strong
                 style={detailValueStyle(repoDetail.project.version)}
                 title={repoDetail.project.version}
+                use:fitDetailValue={repoDetail.project.version}
               >
                 {repoDetail.project.version}
               </strong>
@@ -1534,28 +1576,40 @@
             </div>
             <div>
               <span class="panel-kicker">commits since</span>
-              <strong style={detailValueStyle(repoDetail.project.commitsSinceRelease ?? "n/a")}>
+              <strong
+                style={detailValueStyle(repoDetail.project.commitsSinceRelease ?? "n/a")}
+                use:fitDetailValue={repoDetail.project.commitsSinceRelease ?? "n/a"}
+              >
                 {repoDetail.project.commitsSinceRelease ?? "n/a"}
               </strong>
               <small>{repoDetail.project.freshness}</small>
             </div>
             <div>
               <span class="panel-kicker">stars</span>
-              <strong style={detailValueStyle(numberFormat.format(repoDetail.project.stars))}>
+              <strong
+                style={detailValueStyle(numberFormat.format(repoDetail.project.stars))}
+                use:fitDetailValue={numberFormat.format(repoDetail.project.stars)}
+              >
                 {numberFormat.format(repoDetail.project.stars)}
               </strong>
               <small>{numberFormat.format(repoDetail.project.forks)} forks</small>
             </div>
             <div>
               <span class="panel-kicker">open work</span>
-              <strong style={detailValueStyle(numberFormat.format(repoDetail.project.openIssues + repoDetail.project.openPullRequests))}>
+              <strong
+                style={detailValueStyle(numberFormat.format(repoDetail.project.openIssues + repoDetail.project.openPullRequests))}
+                use:fitDetailValue={numberFormat.format(repoDetail.project.openIssues + repoDetail.project.openPullRequests)}
+              >
                 {numberFormat.format(repoDetail.project.openIssues + repoDetail.project.openPullRequests)}
               </strong>
               <small>{repoDetail.project.openIssues} issues · {repoDetail.project.openPullRequests} PRs</small>
             </div>
             <div>
               <span class="panel-kicker">cadence</span>
-              <strong style={detailValueStyle(formatDays(releaseCadence.medianDays))}>
+              <strong
+                style={detailValueStyle(formatDays(releaseCadence.medianDays))}
+                use:fitDetailValue={formatDays(releaseCadence.medianDays)}
+              >
                 {formatDays(releaseCadence.medianDays)}
               </strong>
               <small>median release gap · {releaseCadence.releaseCount} recent releases</small>

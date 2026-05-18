@@ -103,6 +103,11 @@ a:hover {
   margin-bottom: 28px;
 }
 
+.hero-copy {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
 .subtitle {
   max-width: 760px;
   margin: 14px 0 0;
@@ -195,8 +200,9 @@ a:hover {
 }
 
 h1 {
+  min-width: 0;
   margin: 0;
-  font-size: clamp(30px, 4.5vw, 64px);
+  font-size: clamp(24px, 3.6vw, 51px);
   line-height: 1;
   letter-spacing: 0;
 }
@@ -233,11 +239,12 @@ h1 {
   object-fit: cover;
 }
 
-.repo-title {
+.repo-hero-title {
   display: flex;
   align-items: center;
   gap: clamp(14px, 2vw, 24px);
   min-width: 0;
+  max-width: 100%;
 }
 
 .repo-title-avatar-link {
@@ -267,8 +274,35 @@ h1 {
 }
 
 .repo-title-text {
+  display: inline-flex;
   min-width: 0;
-  overflow-wrap: anywhere;
+  max-width: 100%;
+  align-items: baseline;
+  overflow: hidden;
+}
+
+.repo-title-owner,
+.repo-title-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repo-title-owner {
+  max-width: 42%;
+  flex: 0 1 auto;
+  color: color-mix(in srgb, var(--text) 88%, var(--muted));
+}
+
+.repo-title-slash {
+  flex: 0 0 auto;
+  padding: 0 0.08em;
+  color: color-mix(in srgb, var(--text) 78%, var(--muted));
+}
+
+.repo-title-name {
+  flex: 1 1 auto;
 }
 
 .status {
@@ -330,6 +364,7 @@ h1 {
   display: flex;
   align-items: center;
   align-self: flex-start;
+  flex: 0 0 auto;
   gap: 14px;
 }
 

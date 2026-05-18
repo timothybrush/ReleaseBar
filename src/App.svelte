@@ -1249,7 +1249,7 @@
 
 <main class="shell">
   <header class="topline">
-    <div>
+    <div class="hero-copy">
       <nav class="eyebrow-nav" aria-label="Page navigation">
         <a class="eyebrow" href="/">ReleaseBar</a>
         {#if repoRoute}
@@ -1279,7 +1279,7 @@
             {/if}
           </span>
         {:else if repoRoute && repoDetail}
-          <span class="repo-title">
+          <span class="repo-hero-title">
             <a
               class="repo-title-avatar-link"
               href={ownerDashboardPath(repoDetail.project.owner)}
@@ -1294,7 +1294,11 @@
                 loading="eager"
               />
             </a>
-            <span class="repo-title-text">{label}</span>
+            <span class="repo-title-text" title={label}>
+              <span class="repo-title-owner">{repoDetail.project.owner}</span>
+              <span class="repo-title-slash" aria-hidden="true">/</span>
+              <span class="repo-title-name">{repoDetail.project.name}</span>
+            </span>
           </span>
         {:else}
           {label}

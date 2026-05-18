@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Kept long repository detail titles from overlapping the account controls by truncating owner and repository names in the hero.
 - Added optional AI summaries of commit titles since the latest release on repository detail pages.
 - Hid the code churn panel when GitHub code-frequency stats are unavailable.
 - Fetched deeper repository release history so prerelease-heavy projects can still show recent stable releases.

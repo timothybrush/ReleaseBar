@@ -1466,7 +1466,8 @@ test("worker summarizes public owner activity in the background", async () => {
     assert.equal(body.totals.commits, 4);
     assert.equal(body.totals.pullRequests, 1);
     assert.equal(body.totals.repositories, 1);
-    assert.match(body.events[0]?.title ?? "", /\+3 commits/);
+    const commitEvent = body.events.find((event) => event.kind === "commit");
+    assert.match(commitEvent?.title ?? "", /\+3 commits/);
     assert.equal(
       body.events.some((event) => event.repo === "acme/private"),
       false,

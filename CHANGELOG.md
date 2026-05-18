@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Added optional AI summaries of commit titles since the latest release on repository detail pages.
-- Explained when GitHub code-frequency stats are unavailable for very large repositories.
+- Hid the code churn panel when GitHub code-frequency stats are unavailable.
 - Fetched deeper repository release history so prerelease-heavy projects can still show recent stable releases.
 - Rebuilt repository detail caches for the expanded release and stats metadata.
 - Added owner avatars to repository detail hero headings.

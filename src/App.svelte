@@ -19,6 +19,7 @@
     needsAttention,
     parseViewState,
     releaseDebtText,
+    showCodeChurn,
     sortLabel,
     sortOptions,
     sortProjects,
@@ -302,21 +303,6 @@
 
   function codeTotal(kind: "additions" | "deletions"): number {
     return (repoDetail?.codeFrequency ?? []).reduce((sum, week) => sum + week[kind], 0);
-  }
-
-  function codeFrequencyEmptyText(): string {
-    const stats = repoDetail?.stats?.codeFrequency;
-    if (stats?.state === "warming") {
-      return "GitHub is preparing code-frequency stats. ReleaseBar will refresh this panel.";
-    }
-    if (stats?.message?.includes("fewer than 10000 commits")) {
-      return "GitHub does not expose code-frequency stats for repositories with 10,000+ commits.";
-    }
-    if (stats?.message) return stats.message;
-    if (stats?.state === "unavailable") {
-      return "GitHub does not expose code-frequency stats for this repository.";
-    }
-    return "Code-frequency stats are still warming or unavailable.";
   }
 
   function showReleaseSummary(summary: RepoDetailReleaseSummary | undefined): boolean {
@@ -1738,28 +1724,30 @@
             </div>
           </section>
 
-          <section class="detail-panel detail-tail">
-            <div class="panel-heading">
-              <div>
-                <span class="panel-kicker">code churn</span>
-                <h2>last year</h2>
-              </div>
-            </div>
-            {#if repoDetail.codeFrequency.length > 0}
-              <div class="churn-meter">
+          {#if showCodeChurn(repoDetail)}
+            <section class="detail-panel detail-tail">
+              <div class="panel-heading">
                 <div>
-                  <span>additions</span>
-                  <strong>{numberFormat.format(codeTotal("additions"))}</strong>
-                </div>
-                <div>
-                  <span>deletions</span>
-                  <strong>{numberFormat.format(codeTotal("deletions"))}</strong>
+                  <span class="panel-kicker">code churn</span>
+                  <h2>last year</h2>
                 </div>
               </div>
-            {:else}
-              <p class="detail-empty">{codeFrequencyEmptyText()}</p>
-            {/if}
-          </section>
+              {#if repoDetail.codeFrequency.length > 0}
+                <div class="churn-meter">
+                  <div>
+                    <span>additions</span>
+                    <strong>{numberFormat.format(codeTotal("additions"))}</strong>
+                  </div>
+                  <div>
+                    <span>deletions</span>
+                    <strong>{numberFormat.format(codeTotal("deletions"))}</strong>
+                  </div>
+                </div>
+              {:else}
+                <p class="detail-empty">GitHub is preparing code-frequency stats. ReleaseBar will refresh this panel.</p>
+              {/if}
+            </section>
+          {/if}
         </div>
       {/if}
     </section>

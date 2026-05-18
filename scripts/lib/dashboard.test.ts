@@ -27,6 +27,7 @@ import {
   attentionReasons,
   needsAttention,
   parseViewState,
+  showCodeChurn,
   sortProjects,
   viewStateSearch,
   type DashboardViewState,
@@ -323,6 +324,51 @@ test("dashboard project sorting handles dev issue and pull request counts numeri
       "desc",
     ).map((project) => project.name),
     ["large", "small"],
+  );
+});
+
+test("repository detail hides unavailable code churn", () => {
+  const base: RepoDetailPayload = {
+    fullName: "owner/repo",
+    generatedAt: "2026-05-18T00:00:00Z",
+    cache: {
+      state: "fresh",
+      stale: false,
+      generatedAt: "2026-05-18T00:00:00Z",
+    },
+    stats: {
+      commitActivity: { state: "ready" },
+      codeFrequency: {
+        state: "unavailable",
+        message: "repository must have fewer than 10000 commits",
+      },
+    },
+    project: testProject({ owner: "owner", name: "repo" }),
+    releases: [],
+    contributors: [],
+    commitActivity: [],
+    codeFrequency: [],
+    languages: [],
+    workTrend: null,
+  };
+
+  assert.equal(showCodeChurn(base), false);
+  assert.equal(
+    showCodeChurn({
+      ...base,
+      stats: {
+        commitActivity: base.stats?.commitActivity ?? { state: "ready" },
+        codeFrequency: { state: "warming", message: "GitHub is preparing repository statistics." },
+      },
+    }),
+    true,
+  );
+  assert.equal(
+    showCodeChurn({
+      ...base,
+      codeFrequency: [{ week: "2026-05-18T00:00:00Z", additions: 10, deletions: 3 }],
+    }),
+    true,
   );
 });
 

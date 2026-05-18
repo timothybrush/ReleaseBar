@@ -1,4 +1,4 @@
-import type { Freshness, Project } from "./types.js";
+import type { Freshness, Project, RepoDetailPayload } from "./types.js";
 
 export type SortKey = "repo" | "stars" | "release" | "since" | "activity" | "issues" | "prs" | "ci";
 export type SortDirection = "asc" | "desc";
@@ -174,6 +174,12 @@ export function sortProjects(
     }
     return ((aValue as number) - (bValue as number)) * direction;
   });
+}
+
+export function showCodeChurn(payload: RepoDetailPayload | null): boolean {
+  return Boolean(
+    payload?.codeFrequency.length || payload?.stats?.codeFrequency.state === "warming",
+  );
 }
 
 function setOrDelete(params: URLSearchParams, key: string, value: string): void {

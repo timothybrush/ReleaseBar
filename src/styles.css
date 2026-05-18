@@ -242,7 +242,7 @@ h1 {
 .repo-hero-title {
   display: flex;
   align-items: center;
-  gap: clamp(14px, 2vw, 24px);
+  gap: clamp(12px, 1.5vw, 20px);
   min-width: 0;
   max-width: 100%;
 }
@@ -275,6 +275,7 @@ h1 {
 
 .repo-title-text {
   display: inline-flex;
+  flex: 1 1 auto;
   min-width: 0;
   max-width: 100%;
   align-items: baseline;
@@ -290,7 +291,6 @@ h1 {
 }
 
 .repo-title-owner {
-  max-width: 42%;
   flex: 0 1 auto;
   color: color-mix(in srgb, var(--text) 88%, var(--muted));
 }
@@ -302,7 +302,7 @@ h1 {
 }
 
 .repo-title-name {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
 }
 
 .status {

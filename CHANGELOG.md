@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Made repository detail owner names less eager to truncate when the full owner/repo title can fit.
 - Simplified the footer credit to a quieter Peter Steinberger link.
 - Let repository detail metrics shrink to fit their card width before truncating long release tags.
 - Retried warming repository detail statistics after 30 seconds instead of waiting five minutes.

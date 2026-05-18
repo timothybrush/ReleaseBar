@@ -23,6 +23,7 @@ import {
   gitHubLanguageSchema,
   gitHubOAuthTokenSchema,
   gitHubOAuthUserSchema,
+  gitHubPublicEventListSchema,
   gitHubReleaseSchema,
   gitHubRepositorySchema,
   gitHubSearchRepositoryListSchema,
@@ -33,6 +34,7 @@ import {
   storedAuthSessionSchema,
   tryJsonParse,
   type GitHubInstallationRepository,
+  type GitHubPublicEvent,
   type GitHubSearchRepository,
 } from "./schemas.js";
 import type {
@@ -40,9 +42,14 @@ import type {
   AuthInstallation,
   AuthPayload,
   AuthUser,
+  ActivityRange,
   DashboardProfile,
   DashboardPayload,
   Owner,
+  OwnerActivityEvent,
+  OwnerActivityPayload,
+  OwnerActivityRepository,
+  OwnerActivitySummary,
   Project,
   RepoDetailPayload,
   RepoDetailReleaseSummary,
@@ -125,6 +132,9 @@ const repoDetailCacheTtlMs = 6 * 60 * 60 * 1000;
 const repoDetailWarmingRefreshMs = 30 * 1000;
 const releaseSummaryPromptVersion = 1;
 const releaseSummaryCommitLimit = 500;
+const activitySummaryPromptVersion = 1;
+const activityEventPageLimit = 3;
+const activitySummaryInputLimit = 120;
 const maxCustomSources = 8;
 const dashboardSchemaVersion = 5;
 const previousDashboardSchemaVersion = 4;
@@ -152,6 +162,11 @@ const workerFetch: typeof fetch = (input, init) => fetch(input, init);
 function isRepoDetailApiPath(pathname: string): boolean {
   const parts = pathname.split("/").filter(Boolean);
   return parts.length === 4 && parts[0] === "api" && parts[1] === "repos";
+}
+
+function isOwnerActivityApiPath(pathname: string): boolean {
+  const parts = pathname.split("/").filter(Boolean);
+  return parts.length === 3 && parts[0] === "api" && parts[2] === "activity";
 }
 
 type DashboardRequest = {
@@ -294,6 +309,11 @@ async function hmac(secret: string, value: string): Promise<string> {
   );
   const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
   return base64Url(new Uint8Array(signature));
+}
+
+async function sha256Base64Url(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return base64Url(new Uint8Array(digest));
 }
 
 async function signedJson(secret: string, value: unknown): Promise<string> {
@@ -2353,6 +2373,674 @@ async function buildWorkTrend(
   };
 }
 
+function activityRangeFromUrl(url: URL): ActivityRange {
+  const value = url.searchParams.get("range")?.toLowerCase();
+  return value === "day" || value === "month" ? value : "week";
+}
+
+function activityRangeMs(range: ActivityRange): number {
+  if (range === "day") return 24 * 60 * 60 * 1000;
+  if (range === "month") return 30 * 24 * 60 * 60 * 1000;
+  return 7 * 24 * 60 * 60 * 1000;
+}
+
+function activityCacheTtlMs(range: ActivityRange): number {
+  if (range === "day") return 10 * 60 * 1000;
+  if (range === "month") return 6 * 60 * 60 * 1000;
+  return 60 * 60 * 1000;
+}
+
+function ownerActivityCacheKey(owner: string, range: ActivityRange): string {
+  return `owner-activity:v1:${slugOwner(owner)}:${range}`;
+}
+
+function ownerActivitySummaryCacheKey(
+  owner: string,
+  range: ActivityRange,
+  model: string,
+  inputHash: string,
+): string {
+  return [
+    `owner-activity-summary:v${activitySummaryPromptVersion}`,
+    slugOwner(owner),
+    range,
+    encodeURIComponent(model),
+    inputHash,
+  ].join(":");
+}
+
+function ownerActivityAgeMs(payload: OwnerActivityPayload | null): number {
+  if (!payload) return Number.POSITIVE_INFINITY;
+  const generatedAt = Date.parse(payload.generatedAt);
+  return Number.isFinite(generatedAt) ? Date.now() - generatedAt : Number.POSITIVE_INFINITY;
+}
+
+async function readOwnerActivity(env: Env, key: string): Promise<OwnerActivityPayload | null> {
+  const raw = await env.DASHBOARD_CACHE?.get(key);
+  return raw ? tryJsonParse<OwnerActivityPayload>(raw, `owner activity ${key}`) : null;
+}
+
+async function writeOwnerActivity(
+  env: Env,
+  key: string,
+  payload: OwnerActivityPayload,
+): Promise<void> {
+  await env.DASHBOARD_CACHE?.put(key, JSON.stringify(payload), {
+    expirationTtl: dashboardStorageTtlSeconds,
+  });
+}
+
+async function readOwnerActivitySummary(
+  env: Env,
+  key: string,
+): Promise<OwnerActivitySummary | null> {
+  const raw = await env.DASHBOARD_CACHE?.get(key);
+  return raw ? tryJsonParse<OwnerActivitySummary>(raw, `owner activity summary ${key}`) : null;
+}
+
+async function writeOwnerActivitySummary(
+  env: Env,
+  key: string,
+  summary: OwnerActivitySummary,
+): Promise<void> {
+  await env.DASHBOARD_CACHE?.put(key, JSON.stringify(summary), {
+    expirationTtl: dashboardStorageTtlSeconds,
+  });
+}
+
+function payloadRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+function payloadString(value: unknown, key: string): string | null {
+  const result = payloadRecord(value)[key];
+  return typeof result === "string" && result.trim() ? result.trim() : null;
+}
+
+function nestedRecord(value: unknown, key: string): Record<string, unknown> {
+  return payloadRecord(payloadRecord(value)[key]);
+}
+
+function nestedString(value: unknown, key: string, nestedKey: string): string | null {
+  const result = nestedRecord(value, key)[nestedKey];
+  return typeof result === "string" && result.trim() ? result.trim() : null;
+}
+
+function activityRepoUrl(repo: string): string {
+  return `https://github.com/${repo}`;
+}
+
+function normalizeActivityEvent(event: GitHubPublicEvent): OwnerActivityEvent | null {
+  if (event.public === false) return null;
+  const repo = event.repo.name;
+  const payload = event.payload;
+  const createdAt = event.created_at;
+  const repoUrl = activityRepoUrl(repo);
+  if (!repo || !createdAt) return null;
+
+  if (event.type === "PushEvent") {
+    const payloadData = payloadRecord(payload);
+    const commits = payloadData.commits;
+    const commitList = Array.isArray(commits) ? commits : [];
+    const titles = commitList
+      .map((commit) => commitTitle(payloadString(commit, "message") ?? ""))
+      .filter(Boolean);
+    const size = Number(payloadData.size ?? 0);
+    const count = Math.max(1, titles.length, Number.isFinite(size) ? size : 0);
+    return {
+      id: event.id,
+      kind: "commit",
+      title:
+        titles[0] && count > 1
+          ? `${titles[0]} +${count - 1} commits`
+          : (titles[0] ?? `${count} commit${count === 1 ? "" : "s"}`),
+      repo,
+      url: repoUrl,
+      createdAt,
+      count,
+    };
+  }
+
+  if (event.type === "PullRequestEvent") {
+    const action = payloadString(payload, "action") ?? "updated";
+    const title = nestedString(payload, "pull_request", "title") ?? "pull request";
+    return {
+      id: event.id,
+      kind: "pull_request",
+      title: `${action} PR: ${title}`,
+      repo,
+      url: nestedString(payload, "pull_request", "html_url") ?? `${repoUrl}/pulls`,
+      createdAt,
+      count: 1,
+    };
+  }
+
+  if (event.type === "PullRequestReviewEvent") {
+    const action = payloadString(payload, "action") ?? "reviewed";
+    const title = nestedString(payload, "pull_request", "title") ?? "pull request";
+    return {
+      id: event.id,
+      kind: "pull_request",
+      title: `${action} review: ${title}`,
+      repo,
+      url: nestedString(payload, "pull_request", "html_url") ?? `${repoUrl}/pulls`,
+      createdAt,
+      count: 1,
+    };
+  }
+
+  if (event.type === "IssuesEvent") {
+    const action = payloadString(payload, "action") ?? "updated";
+    const title = nestedString(payload, "issue", "title") ?? "issue";
+    return {
+      id: event.id,
+      kind: "issue",
+      title: `${action} issue: ${title}`,
+      repo,
+      url: nestedString(payload, "issue", "html_url") ?? `${repoUrl}/issues`,
+      createdAt,
+      count: 1,
+    };
+  }
+
+  if (event.type === "IssueCommentEvent") {
+    const title = nestedString(payload, "issue", "title") ?? "issue";
+    return {
+      id: event.id,
+      kind: "comment",
+      title: `commented on: ${title}`,
+      repo,
+      url:
+        nestedString(payload, "comment", "html_url") ?? nestedString(payload, "issue", "html_url"),
+      createdAt,
+      count: 1,
+    };
+  }
+
+  if (event.type === "ReleaseEvent") {
+    const action = payloadString(payload, "action") ?? "published";
+    const tag = nestedString(payload, "release", "tag_name");
+    const name = nestedString(payload, "release", "name");
+    return {
+      id: event.id,
+      kind: "release",
+      title: `${action} release: ${name || tag || repo}`,
+      repo,
+      url: nestedString(payload, "release", "html_url") ?? `${repoUrl}/releases`,
+      createdAt,
+      count: 1,
+    };
+  }
+
+  if (event.type === "CreateEvent") {
+    const refType = payloadString(payload, "ref_type") ?? "thing";
+    const ref = payloadString(payload, "ref");
+    return {
+      id: event.id,
+      kind: "repository",
+      title: `created ${refType}${ref ? ` ${ref}` : ""}`,
+      repo,
+      url: repoUrl,
+      createdAt,
+      count: 1,
+    };
+  }
+
+  return {
+    id: event.id,
+    kind: "other",
+    title: event.type
+      .replace(/Event$/, "")
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .toLowerCase(),
+    repo,
+    url: repoUrl,
+    createdAt,
+    count: 1,
+  };
+}
+
+async function fetchOwnerActivityEvents(
+  owner: Owner,
+  since: number,
+  token: string | null,
+  quotaSource: ApiQuota["source"],
+  quotaAccount: string | null,
+  onQuota: (quota: ApiQuota) => void,
+): Promise<OwnerActivityEvent[]> {
+  const events: OwnerActivityEvent[] = [];
+  const base =
+    owner.type === "org"
+      ? `/orgs/${encodeURIComponent(owner.login)}/events`
+      : `/users/${encodeURIComponent(owner.login)}/events/public`;
+  for (let page = 1; page <= activityEventPageLimit; page += 1) {
+    const pageEvents = await detailGitHubJson(
+      `${base}?per_page=100&page=${page}`,
+      gitHubPublicEventListSchema,
+      "owner public events",
+      token,
+      quotaSource,
+      quotaAccount,
+      onQuota,
+    );
+    if (pageEvents.length === 0) break;
+    const normalized = pageEvents.map(normalizeActivityEvent).filter((event) => event !== null);
+    events.push(
+      ...normalized.filter((event) => {
+        const time = Date.parse(event.createdAt);
+        return Number.isFinite(time) && time >= since;
+      }),
+    );
+    const oldest = pageEvents
+      .map((event) => Date.parse(event.created_at))
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b)[0];
+    if (oldest !== undefined && oldest < since) break;
+  }
+  return events.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+}
+
+function activityRepositories(events: OwnerActivityEvent[]): OwnerActivityRepository[] {
+  const repos = new Map<string, OwnerActivityRepository>();
+  for (const event of events) {
+    const existing = repos.get(event.repo) ?? {
+      fullName: event.repo,
+      url: activityRepoUrl(event.repo),
+      events: 0,
+      commits: 0,
+      lastActiveAt: event.createdAt,
+    };
+    existing.events += 1;
+    existing.commits += event.kind === "commit" ? event.count : 0;
+    if (Date.parse(event.createdAt) > Date.parse(existing.lastActiveAt)) {
+      existing.lastActiveAt = event.createdAt;
+    }
+    repos.set(event.repo, existing);
+  }
+  return [...repos.values()].sort(
+    (a, b) =>
+      b.events - a.events ||
+      Date.parse(b.lastActiveAt) - Date.parse(a.lastActiveAt) ||
+      a.fullName.localeCompare(b.fullName),
+  );
+}
+
+function activityTotals(events: OwnerActivityEvent[]): OwnerActivityPayload["totals"] {
+  return {
+    events: events.reduce((sum, event) => sum + event.count, 0),
+    commits: events
+      .filter((event) => event.kind === "commit")
+      .reduce((sum, event) => sum + event.count, 0),
+    pullRequests: events.filter((event) => event.kind === "pull_request").length,
+    issues: events.filter((event) => event.kind === "issue").length,
+    comments: events.filter((event) => event.kind === "comment").length,
+    releases: events.filter((event) => event.kind === "release").length,
+    repositories: new Set(events.map((event) => event.repo)).size,
+  };
+}
+
+function activitySummaryModel(env: Env): string {
+  return env.OPENAI_SUMMARY_MODEL || "gpt-5.5";
+}
+
+function activitySummaryEvents(payload: OwnerActivityPayload): OwnerActivityEvent[] {
+  return payload.events.slice(0, activitySummaryInputLimit);
+}
+
+function activitySummaryInput(payload: OwnerActivityPayload): string {
+  return activitySummaryEvents(payload)
+    .map((event, index) =>
+      [
+        `${index + 1}. ${event.kind}`,
+        event.repo,
+        event.createdAt,
+        event.count > 1 ? `${event.count} items` : "1 item",
+        event.title,
+      ].join(" · "),
+    )
+    .join("\n");
+}
+
+function unavailableActivitySummary(
+  model: string | null,
+  inputHash: string | null,
+  message: string,
+): OwnerActivitySummary {
+  return {
+    state: "unavailable",
+    text: null,
+    generatedAt: null,
+    model,
+    inputHash,
+    eventsUsed: 0,
+    message,
+  };
+}
+
+async function activitySummaryState(
+  payload: OwnerActivityPayload,
+  env: Env,
+): Promise<OwnerActivitySummary> {
+  const model = activitySummaryModel(env);
+  const input = activitySummaryInput(payload);
+  if (!input.trim()) {
+    return unavailableActivitySummary(
+      model,
+      null,
+      "Not enough recent public activity to summarize.",
+    );
+  }
+  const inputHash = (await sha256Base64Url(input)).slice(0, 32);
+  const eventsUsed = activitySummaryEvents(payload).length;
+  const cacheKey = ownerActivitySummaryCacheKey(
+    payload.owner.login,
+    payload.range,
+    model,
+    inputHash,
+  );
+  const cached = await readOwnerActivitySummary(env, cacheKey);
+  if (cached?.state === "ready") return cached;
+  if (!env.OPENAI_API_KEY) {
+    return unavailableActivitySummary(
+      model,
+      inputHash,
+      "AI activity summaries are not configured.",
+    );
+  }
+  return {
+    state: "warming",
+    text: null,
+    generatedAt: null,
+    model,
+    inputHash,
+    eventsUsed,
+    message: "Summarizing recent public GitHub activity.",
+  };
+}
+
+async function summarizeOwnerActivity(
+  payload: OwnerActivityPayload,
+  env: Env,
+): Promise<OwnerActivitySummary> {
+  const model = activitySummaryModel(env);
+  const input = activitySummaryInput(payload);
+  if (!input.trim()) {
+    return unavailableActivitySummary(
+      model,
+      null,
+      "Not enough recent public activity to summarize.",
+    );
+  }
+  const inputHash = (await sha256Base64Url(input)).slice(0, 32);
+  const eventsUsed = activitySummaryEvents(payload).length;
+  if (!env.OPENAI_API_KEY) {
+    return unavailableActivitySummary(
+      model,
+      inputHash,
+      "AI activity summaries are not configured.",
+    );
+  }
+  const response = await workerFetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      reasoning: { effort: "low" },
+      max_output_tokens: 420,
+      instructions:
+        "You summarize public GitHub activity for an open source dashboard. Write 2-4 concise sentences, present perfect or recent past, no bullets, no hype, no markdown. Say this is public activity if useful. Mention broad themes, repositories, and work types only when the event titles support them. Do not infer private work or invent details.",
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: [
+                `Owner: @${payload.owner.login}`,
+                `Owner type: ${payload.owner.type}`,
+                `Range: ${payload.range}`,
+                `Events included: ${eventsUsed}`,
+                "",
+                input,
+              ].join("\n"),
+            },
+          ],
+        },
+      ],
+    }),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message =
+      body && typeof body === "object" && "error" in body
+        ? String((body as { error?: { message?: string } }).error?.message ?? "OpenAI API error")
+        : `OpenAI API ${response.status}`;
+    throw new Error(message);
+  }
+  const text = openAIOutputText(body);
+  if (!text) throw new Error("OpenAI response did not include activity summary text");
+  const summary = {
+    state: "ready",
+    text,
+    generatedAt: new Date().toISOString(),
+    model,
+    inputHash,
+    eventsUsed,
+  } satisfies OwnerActivitySummary;
+  await writeOwnerActivitySummary(
+    env,
+    ownerActivitySummaryCacheKey(payload.owner.login, payload.range, model, inputHash),
+    summary,
+  );
+  return summary;
+}
+
+async function buildOwnerActivity(
+  ownerSlug: string,
+  range: ActivityRange,
+  request: Request,
+  env: Env,
+): Promise<OwnerActivityPayload> {
+  const requestToken = await requestInstallationToken(request, env, {
+    owners: [ownerSlug],
+    repos: [],
+  }).catch(() => null);
+  const token = requestToken?.token ?? env.GITHUB_TOKEN ?? null;
+  const quotaSource = requestToken?.quotaSource ?? (env.GITHUB_TOKEN ? "shared" : "anonymous");
+  const quotaAccount = requestToken?.quotaAccount ?? null;
+  let quota: ApiQuota | undefined;
+  const onQuota = (nextQuota: ApiQuota) => {
+    quota = nextQuota;
+  };
+  const owner = await resolveOwnerType(ownerSlug, {
+    token: token ?? undefined,
+    fetch: workerFetch,
+  });
+  if (!owner) {
+    throw new Error(`owner not found: ${ownerSlug}`);
+  }
+  const since = Date.now() - activityRangeMs(range);
+  const events = await fetchOwnerActivityEvents(
+    owner,
+    since,
+    token,
+    quotaSource,
+    quotaAccount,
+    onQuota,
+  );
+  const generatedAt = new Date().toISOString();
+  const payload: OwnerActivityPayload = {
+    owner,
+    range,
+    generatedAt,
+    cache: {
+      state: "fresh",
+      stale: false,
+      generatedAt,
+      message: "public GitHub activity only",
+      ...(quota ? { quota } : {}),
+    },
+    totals: activityTotals(events),
+    repositories: activityRepositories(events),
+    events,
+  };
+  return {
+    ...payload,
+    summary: await activitySummaryState(payload, env),
+  };
+}
+
+function withOwnerActivityState(
+  payload: OwnerActivityPayload,
+  state: OwnerActivityPayload["cache"]["state"],
+  message = payload.cache.message,
+): OwnerActivityPayload {
+  return {
+    ...payload,
+    cache: {
+      ...payload.cache,
+      state,
+      stale: state !== "fresh",
+      ...(message ? { message } : {}),
+    },
+  };
+}
+
+function ownerActivitySummaryNeedsRefresh(payload: OwnerActivityPayload | null): boolean {
+  return payload?.summary?.state === "warming";
+}
+
+async function refreshOwnerActivitySummary(
+  key: string,
+  payload: OwnerActivityPayload,
+  env: Env,
+): Promise<void> {
+  if (!ownerActivitySummaryNeedsRefresh(payload)) return;
+  const lock = await acquireBuildLock(env, `${key}:summary`);
+  if (!lock) return;
+  try {
+    const summary = await summarizeOwnerActivity(payload, env);
+    const latest = (await readOwnerActivity(env, key)) ?? payload;
+    if (
+      latest.owner.login.toLowerCase() !== payload.owner.login.toLowerCase() ||
+      latest.range !== payload.range ||
+      latest.summary?.inputHash !== payload.summary?.inputHash ||
+      latest.summary?.inputHash !== summary.inputHash
+    ) {
+      return;
+    }
+    await writeOwnerActivity(env, key, {
+      ...latest,
+      summary,
+    });
+  } catch (error) {
+    const latest = (await readOwnerActivity(env, key)) ?? payload;
+    if (
+      latest.owner.login.toLowerCase() !== payload.owner.login.toLowerCase() ||
+      latest.range !== payload.range ||
+      latest.summary?.inputHash !== payload.summary?.inputHash
+    ) {
+      return;
+    }
+    await writeOwnerActivity(env, key, {
+      ...latest,
+      summary: {
+        ...(latest.summary ?? payload.summary),
+        state: "unavailable",
+        text: null,
+        generatedAt: null,
+        model: latest.summary?.model ?? activitySummaryModel(env),
+        inputHash: latest.summary?.inputHash ?? payload.summary?.inputHash ?? null,
+        eventsUsed: latest.events.length,
+        message: errorMessage(error),
+      },
+    });
+  } finally {
+    await lock.release();
+  }
+}
+
+async function refreshOwnerActivity(
+  key: string,
+  ownerSlug: string,
+  range: ActivityRange,
+  request: Request,
+  env: Env,
+): Promise<void> {
+  const lock = await acquireBuildLock(env, key);
+  if (!lock) return;
+  try {
+    const payload = await buildOwnerActivity(ownerSlug, range, request, env);
+    await writeOwnerActivity(env, key, payload);
+    if (ownerActivitySummaryNeedsRefresh(payload)) {
+      await refreshOwnerActivitySummary(key, payload, env);
+    }
+  } finally {
+    await lock.release();
+  }
+}
+
+async function ownerActivityResponse(
+  request: Request,
+  env: Env,
+  context: ExecutionContext,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const ownerSlug = slugOwner(url.pathname.replace(/^\/api\//, "").split("/")[0] ?? "");
+  if (!validOwnerSlug(ownerSlug)) {
+    return jsonResponse({ error: "invalid owner" }, 400);
+  }
+  const range = activityRangeFromUrl(url);
+  const key = ownerActivityCacheKey(ownerSlug, range);
+  const cached = await readOwnerActivity(env, key);
+  const age = ownerActivityAgeMs(cached);
+  if (cached && age < activityCacheTtlMs(range)) {
+    if (ownerActivitySummaryNeedsRefresh(cached)) {
+      context.waitUntil(refreshOwnerActivitySummary(key, cached, env).catch(() => undefined));
+    }
+    return jsonResponse(cached, cached.summary?.state === "warming" ? 202 : 200, {
+      "cache-control": "public, max-age=60, stale-while-revalidate=600",
+    });
+  }
+  if (cached && age < maxDisplayStaleMs) {
+    context.waitUntil(
+      refreshOwnerActivity(key, ownerSlug, range, request, env).catch(() => undefined),
+    );
+    return jsonResponse(
+      withOwnerActivityState(cached, "stale", "showing cached public activity while refreshing"),
+      200,
+      { "cache-control": "no-store" },
+    );
+  }
+
+  try {
+    const payload = await buildOwnerActivity(ownerSlug, range, request, env);
+    await writeOwnerActivity(env, key, payload);
+    if (ownerActivitySummaryNeedsRefresh(payload)) {
+      context.waitUntil(refreshOwnerActivitySummary(key, payload, env).catch(() => undefined));
+    }
+    return jsonResponse(payload, payload.summary?.state === "warming" ? 202 : 200, {
+      "cache-control": "no-store",
+    });
+  } catch (error) {
+    if (cached) {
+      return jsonResponse(
+        withOwnerActivityState(cached, "stale", dashboardErrorMessage(error)),
+        200,
+        retryAfterHeaders(error),
+      );
+    }
+    return jsonResponse(
+      { error: dashboardErrorMessage(error) },
+      errorStatus(error),
+      retryAfterHeaders(error),
+    );
+  }
+}
+
 function lastPageFromLink(link: string | null): number | null {
   if (!link) return null;
   const last = link
@@ -4151,6 +4839,9 @@ async function routeRequest(
   }
   if (url.pathname === "/api/_discover") {
     return discoverResponse(env, url, context);
+  }
+  if (isOwnerActivityApiPath(url.pathname)) {
+    return ownerActivityResponse(request, env, context);
   }
   if (isRepoDetailApiPath(url.pathname)) {
     return repoDetailResponse(request, env, context);

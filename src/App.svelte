@@ -34,13 +34,16 @@
     repoDetailPath,
     repoFromPath,
     validRepoSlug,
+    workersDevApiOrigin,
     type DiscoverPeriod,
   } from "./routing.js";
   import type {
     ApiQuota,
+    ActivityRange,
     AuthPayload,
     DashboardPayload,
     Owner,
+    OwnerActivityPayload,
     Project,
     RepoDetailPayload,
     RepoDetailReleaseSummary,
@@ -84,7 +87,12 @@
   let mounted = false;
   let dashboardRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let repoDetailRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let activityRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let dashboardEventSource: EventSource | null = null;
+  let activityRange: ActivityRange = "week";
+  let activity: OwnerActivityPayload | null = null;
+  let activityLoading = false;
+  let activityError = "";
 
   const numberFormat = new Intl.NumberFormat("en", { notation: "compact" });
   const dateFormat = new Intl.DateTimeFormat("en", {
@@ -105,6 +113,11 @@
     { value: "releasebar", label: "releasebar" },
   ];
   const discoverLanguages = ["TypeScript", "Python", "Rust", "Go", "Swift"];
+  const activityRanges: Array<{ value: ActivityRange; label: string }> = [
+    { value: "day", label: "day" },
+    { value: "week", label: "week" },
+    { value: "month", label: "month" },
+  ];
 
   $: label = repoRoute ? (repoDetail?.fullName ?? repoRoute.fullName) : data ? ownerLabel(data) : initialRoute.label;
   $: heroOwner = ownerHero(data);
@@ -205,6 +218,8 @@
   );
   $: releaseCadence = cadenceSummary(repoDetail?.releases ?? []);
   $: workTrend = repoDetail?.workTrend ?? null;
+  $: showOwnerActivity =
+    !repoRoute && !initialRoute.isDefault && Boolean(initialRoute.owner) && heroExtraCount === 0;
 
   function ownerLabel(payload: DashboardPayload): string {
     if (initialRoute.isDefault) {
@@ -784,6 +799,89 @@
     }, delay);
   }
 
+  function scheduleActivityRefresh(attempt: number): void {
+    if (!showOwnerActivity) return;
+    if (activityRefreshTimer !== null) {
+      globalThis.clearTimeout(activityRefreshTimer);
+    }
+    if (attempt >= 8) return;
+    const delay = attempt < 3 ? 5000 : 15000;
+    activityRefreshTimer = globalThis.setTimeout(() => {
+      activityRefreshTimer = null;
+      if (document.hidden) {
+        scheduleActivityRefresh(attempt);
+        return;
+      }
+      void loadOwnerActivity(attempt + 1).catch(() => undefined);
+    }, delay);
+  }
+
+  function activityApiPaths(): string[] {
+    if (!initialRoute.owner) return [];
+    const path = `/api/${encodeURIComponent(initialRoute.owner)}/activity`;
+    const url = new URL(path, location.origin);
+    url.searchParams.set("range", activityRange);
+    const urls = [url.toString()];
+    if (initialRoute.fallbackApiPath) {
+      const fallback = new URL(path, workersDevApiOrigin);
+      fallback.searchParams.set("range", activityRange);
+      urls.push(fallback.toString());
+    }
+    return urls;
+  }
+
+  async function loadOwnerActivity(attempt = 0): Promise<void> {
+    if (!showOwnerActivity) return;
+    const paths = activityApiPaths();
+    if (paths.length === 0) return;
+    const requestedRange = activityRange;
+    activityLoading = attempt === 0 && !activity;
+    activityError = "";
+    try {
+      for (const path of paths) {
+        const response = await fetch(path, {
+          cache: attempt > 0 ? "no-store" : "default",
+        });
+        const body = (await response.json().catch(() => null)) as
+          | OwnerActivityPayload
+          | { error?: string }
+          | null;
+        if (body && "events" in body) {
+          if (requestedRange !== activityRange) return;
+          activity = body;
+          if (body.summary?.state === "warming" || body.cache.state === "stale") {
+            scheduleActivityRefresh(attempt);
+          }
+          return;
+        }
+        activityError =
+          body && "error" in body ? (body.error ?? "") : `activity fetch failed: ${response.status}`;
+      }
+    } catch (error) {
+      activityError = error instanceof Error ? error.message : String(error);
+    } finally {
+      activityLoading = false;
+    }
+  }
+
+  function setActivityRange(range: ActivityRange): void {
+    if (activityRange === range) return;
+    activityRange = range;
+    activity = null;
+    activityError = "";
+    if (activityRefreshTimer !== null) {
+      globalThis.clearTimeout(activityRefreshTimer);
+      activityRefreshTimer = null;
+    }
+    void loadOwnerActivity();
+  }
+
+  function activityMeta(payload: OwnerActivityPayload): string {
+    const repoText = `${numberFormat.format(payload.totals.repositories)} repo${payload.totals.repositories === 1 ? "" : "s"}`;
+    const eventText = `${numberFormat.format(payload.totals.events)} public event${payload.totals.events === 1 ? "" : "s"}`;
+    return `${eventText} · ${repoText} · updated ${relativeDate(payload.generatedAt)}`;
+  }
+
   function closeDashboardStream(): void {
     dashboardEventSource?.close();
     dashboardEventSource = null;
@@ -1268,7 +1366,11 @@
     const unsubscribe = paletteStore.subscribe((value: PaletteStoreParams) => {
       paletteText = value.textInput;
     });
-    void Promise.all([loadAuth(), repoRoute ? loadRepoDetail() : loadDashboard()]).catch((error) => {
+    void Promise.all([
+      loadAuth(),
+      repoRoute ? loadRepoDetail() : loadDashboard(),
+      showOwnerActivity ? loadOwnerActivity() : Promise.resolve(),
+    ]).catch((error) => {
       generatedLabel = "failed";
       generatedDetail = error instanceof Error ? error.message : String(error);
       errorMessage = generatedDetail;
@@ -1282,6 +1384,9 @@
     }
     if (repoDetailRefreshTimer !== null) {
       globalThis.clearTimeout(repoDetailRefreshTimer);
+    }
+    if (activityRefreshTimer !== null) {
+      globalThis.clearTimeout(activityRefreshTimer);
     }
     closeDashboardStream();
     document.body.classList.remove("dev-mode");
@@ -1810,6 +1915,66 @@
       {/if}
     </section>
   {:else}
+  {#if showOwnerActivity}
+    <section class="activity-panel" aria-label="Recent public activity">
+      <div class="panel-heading">
+        <div>
+          <span class="panel-kicker">working on</span>
+          <h2>{activityRange}</h2>
+        </div>
+        <div class="range-toggle" aria-label="Activity range">
+          {#each activityRanges as range}
+            <button
+              class:active={activityRange === range.value}
+              type="button"
+              aria-pressed={activityRange === range.value}
+              onclick={() => setActivityRange(range.value)}
+            >
+              {range.label}
+            </button>
+          {/each}
+        </div>
+      </div>
+
+      {#if activityLoading}
+        <p class="activity-text">Loading recent public GitHub activity.</p>
+      {:else if activity?.summary?.state === "ready" && activity.summary.text}
+        <p class="activity-text">{activity.summary.text}</p>
+      {:else if activity?.summary?.state === "warming"}
+        <p class="activity-text">Summarizing recent public GitHub activity.</p>
+      {:else if activity?.summary?.message}
+        <p class="activity-text muted">{activity.summary.message}</p>
+      {:else if activityError}
+        <p class="activity-text muted">{activityError}</p>
+      {:else}
+        <p class="activity-text muted">Recent public activity will appear here when GitHub returns enough signal.</p>
+      {/if}
+
+      {#if activity}
+        <div class="activity-stats" aria-label="Activity totals">
+          <span>{numberFormat.format(activity.totals.commits)} commits</span>
+          <span>{numberFormat.format(activity.totals.pullRequests)} PRs</span>
+          <span>{numberFormat.format(activity.totals.issues)} issues</span>
+          <span>{numberFormat.format(activity.totals.comments)} comments</span>
+        </div>
+        <div class="activity-repos" aria-label="Touched repositories">
+          {#each activity.repositories.slice(0, 5) as repo}
+            <a href={repo.url} target="_blank" rel="noreferrer">
+              {repo.fullName}
+              <small>{numberFormat.format(repo.events)}</small>
+            </a>
+          {/each}
+        </div>
+        <small class="activity-meta">
+          {activityMeta(activity)}
+          {#if activity.cache.state === "stale"}
+            · refreshing
+          {/if}
+        </small>
+      {/if}
+    </section>
+  {/if}
+
   <section class="console" aria-label="Project search and metrics">
     <div class="prompt">
       <span class="mark">$</span>

@@ -173,6 +173,19 @@ export const gitHubCodeFrequencySchema = v.array(v.tuple([v.number(), v.number()
 
 export const gitHubLanguageSchema = v.record(v.string(), v.number());
 
+export const gitHubPublicEventSchema = v.looseObject({
+  id: v.string(),
+  type: v.string(),
+  public: v.optional(v.boolean()),
+  created_at: v.string(),
+  repo: v.looseObject({
+    name: v.string(),
+  }),
+  payload: v.optional(v.unknown()),
+});
+
+export const gitHubPublicEventListSchema = v.array(gitHubPublicEventSchema);
+
 const authUserSchema = v.object({
   id: v.number(),
   login: v.string(),
@@ -210,6 +223,7 @@ export type GitHubInstallationToken = v.InferOutput<typeof gitHubInstallationTok
 export type GitHubRepository = v.InferOutput<typeof gitHubRepositorySchema>;
 export type GitHubRelease = v.InferOutput<typeof gitHubReleaseSchema>;
 export type GitHubSearchRepository = v.InferOutput<typeof gitHubSearchRepositorySchema>;
+export type GitHubPublicEvent = v.InferOutput<typeof gitHubPublicEventSchema>;
 
 export function parseGitHubResponse<TSchema extends v.GenericSchema>(
   schema: TSchema,

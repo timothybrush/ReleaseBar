@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added a cached working-on activity block to owner dashboards with day, week, and month AI summaries from public GitHub events.
 - Renamed the repository commit graph heading from last 52 weeks to last year.
 - Made repository detail owner names less eager to truncate when the full owner/repo title can fit.
 - Simplified the footer credit to a quieter Peter Steinberger link.

@@ -149,6 +149,70 @@ export type DashboardPayload = {
   projects: Project[];
 };
 
+export type ActivityRange = "day" | "week" | "month";
+
+export type OwnerActivityKind =
+  | "commit"
+  | "pull_request"
+  | "issue"
+  | "comment"
+  | "release"
+  | "repository"
+  | "other";
+
+export type OwnerActivityEvent = {
+  id: string;
+  kind: OwnerActivityKind;
+  title: string;
+  repo: string;
+  url: string | null;
+  createdAt: string;
+  count: number;
+};
+
+export type OwnerActivityRepository = {
+  fullName: string;
+  url: string;
+  events: number;
+  commits: number;
+  lastActiveAt: string;
+};
+
+export type OwnerActivitySummary = {
+  state: "ready" | "warming" | "unavailable";
+  text: string | null;
+  generatedAt: string | null;
+  model: string | null;
+  inputHash: string | null;
+  eventsUsed: number;
+  message?: string;
+};
+
+export type OwnerActivityPayload = {
+  owner: Owner;
+  range: ActivityRange;
+  generatedAt: string;
+  cache: {
+    state: "fresh" | "stale" | "warming" | "error";
+    stale: boolean;
+    generatedAt: string;
+    message?: string;
+    quota?: ApiQuota;
+  };
+  totals: {
+    events: number;
+    commits: number;
+    pullRequests: number;
+    issues: number;
+    comments: number;
+    releases: number;
+    repositories: number;
+  };
+  repositories: OwnerActivityRepository[];
+  events: OwnerActivityEvent[];
+  summary?: OwnerActivitySummary;
+};
+
 export type RepoDetailContributor = {
   login: string;
   avatarUrl: string | null;

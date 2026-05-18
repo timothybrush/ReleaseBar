@@ -413,6 +413,92 @@ h1 {
   background: rgba(156, 255, 87, 0.075);
 }
 
+/* Owner activity */
+
+.activity-panel {
+  display: grid;
+  gap: 14px;
+  margin: -8px 0 22px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background:
+    linear-gradient(90deg, rgba(156, 255, 87, 0.055), transparent 42%), rgba(16, 19, 15, 0.78);
+  box-shadow: var(--shadow);
+}
+
+.range-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.range-toggle button {
+  min-height: 32px;
+  padding: 0 11px;
+  background: rgba(8, 9, 8, 0.52);
+  font-size: 13px;
+}
+
+.range-toggle button.active {
+  background: rgba(156, 255, 87, 0.075);
+  color: var(--text);
+}
+
+.activity-text {
+  max-width: 980px;
+  margin: 0;
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+.activity-text.muted {
+  color: var(--muted);
+}
+
+.activity-stats,
+.activity-repos {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.activity-stats span,
+.activity-repos a {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 10px;
+  background: rgba(8, 9, 8, 0.5);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.activity-repos a {
+  color: var(--text);
+}
+
+.activity-repos a:hover,
+.activity-repos a:focus-visible {
+  border-color: var(--green);
+  color: var(--green);
+  outline: 0;
+}
+
+.activity-repos small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.activity-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 /* Console */
 
 .console {

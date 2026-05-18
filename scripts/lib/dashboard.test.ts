@@ -32,7 +32,12 @@ import {
   viewStateSearch,
   type DashboardViewState,
 } from "../../src/dashboard-view.js";
-import type { DashboardPayload, Project, RepoDetailPayload } from "../../src/types.js";
+import type {
+  DashboardPayload,
+  OwnerActivityPayload,
+  Project,
+  RepoDetailPayload,
+} from "../../src/types.js";
 import worker, { DashboardBuildLock } from "../../worker/index.js";
 
 const textEncoder = new TextEncoder();
@@ -1354,6 +1359,366 @@ test("worker summarizes commits since release in the background", async () => {
       await cache.get("release-summary:v1:acme/releasebar:v1.0.0:abcdef1:gpt-5.5"),
       null,
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker summarizes public owner activity in the background", async () => {
+  const cache = kvStore();
+  const queued: Promise<unknown>[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.hostname === "api.github.com" && url.pathname === "/users/acme") {
+      return Response.json({
+        login: "acme",
+        type: "User",
+        avatar_url: "https://github.com/acme.png",
+        html_url: "https://github.com/acme",
+      });
+    }
+    if (url.hostname === "api.github.com" && url.pathname === "/users/acme/events/public") {
+      assert.equal(url.searchParams.get("per_page"), "100");
+      if (url.searchParams.get("page") !== "1") {
+        return Response.json([]);
+      }
+      const events: unknown[] = [
+        {
+          id: "1",
+          type: "PushEvent",
+          public: true,
+          created_at: new Date().toISOString(),
+          repo: { name: "acme/releasebar" },
+          payload: {
+            size: 4,
+            commits: [
+              { message: "Add owner activity panel\n\nLong body" },
+              { message: "Cache activity summaries" },
+            ],
+          },
+        },
+        {
+          id: "2",
+          type: "PullRequestEvent",
+          public: true,
+          created_at: new Date().toISOString(),
+          repo: { name: "acme/releasebar" },
+          payload: {
+            action: "opened",
+            pull_request: {
+              title: "Polish working-on copy",
+              html_url: "https://github.com/acme/releasebar/pull/1",
+            },
+          },
+        },
+        {
+          id: "3",
+          type: "PushEvent",
+          public: false,
+          created_at: new Date().toISOString(),
+          repo: { name: "acme/private" },
+          payload: { commits: [{ message: "private work" }] },
+        },
+      ];
+      for (let index = 4; index <= 125; index += 1) {
+        events.push({
+          id: String(index),
+          type: "IssueCommentEvent",
+          public: true,
+          created_at: new Date().toISOString(),
+          repo: { name: "acme/releasebar" },
+          payload: {
+            issue: {
+              title: `Activity thread ${index}`,
+              html_url: `https://github.com/acme/releasebar/issues/${index}`,
+            },
+          },
+        });
+      }
+      return Response.json(events);
+    }
+    if (url.hostname === "api.openai.com" && url.pathname === "/v1/responses") {
+      const headers = init?.headers as Record<string, string> | undefined;
+      assert.equal(headers?.authorization, "Bearer openai-token");
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      assert.equal(body.model, "gpt-5.5");
+      assert.equal(body.reasoning?.effort, "low");
+      assert.match(JSON.stringify(body.input), /Add owner activity panel/);
+      assert.match(JSON.stringify(body.input), /Events included: 120/);
+      return Response.json({
+        output_text:
+          "Acme has been working on ReleaseBar activity summaries, cache behavior, and dashboard copy.",
+      });
+    }
+    throw new Error(`unexpected fetch ${url.toString()}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/acme/activity?range=week"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token", OPENAI_API_KEY: "openai-token" },
+      { waitUntil: (promise) => queued.push(promise) },
+    );
+    assert.equal(response.status, 202);
+    const body = (await response.json()) as OwnerActivityPayload;
+    assert.equal(body.owner.login, "acme");
+    assert.equal(body.range, "week");
+    assert.equal(body.totals.commits, 4);
+    assert.equal(body.totals.pullRequests, 1);
+    assert.equal(body.totals.repositories, 1);
+    assert.match(body.events[0]?.title ?? "", /\+3 commits/);
+    assert.equal(
+      body.events.some((event) => event.repo === "acme/private"),
+      false,
+    );
+    assert.equal(body.summary?.state, "warming");
+    await Promise.all(queued);
+    const cached = JSON.parse(
+      (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
+    ) as OwnerActivityPayload;
+    assert.equal(cached.summary?.state, "ready");
+    assert.match(cached.summary?.text ?? "", /activity summaries/);
+    assert.notEqual(cached.summary?.inputHash, null);
+    assert.equal(cached.summary?.eventsUsed, 120);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker skips stale public owner activity summaries when events changed", async () => {
+  const generatedAt = new Date().toISOString();
+  const oldPayload: OwnerActivityPayload = {
+    owner: {
+      type: "user",
+      login: "acme",
+      avatarUrl: "https://github.com/acme.png",
+      url: "https://github.com/acme",
+    },
+    range: "week",
+    generatedAt,
+    cache: {
+      state: "fresh",
+      stale: false,
+      generatedAt,
+    },
+    totals: {
+      events: 1,
+      commits: 1,
+      pullRequests: 0,
+      issues: 0,
+      comments: 0,
+      releases: 0,
+      repositories: 1,
+    },
+    repositories: [
+      {
+        fullName: "acme/releasebar",
+        url: "https://github.com/acme/releasebar",
+        events: 1,
+        commits: 1,
+        lastActiveAt: generatedAt,
+      },
+    ],
+    events: [
+      {
+        id: "old",
+        kind: "commit",
+        title: "Add old activity",
+        repo: "acme/releasebar",
+        url: "https://github.com/acme/releasebar",
+        createdAt: generatedAt,
+        count: 1,
+      },
+    ],
+    summary: {
+      state: "warming",
+      text: null,
+      generatedAt: null,
+      model: "gpt-5.5",
+      inputHash: "old-hash",
+      eventsUsed: 1,
+    },
+  };
+  const newPayload: OwnerActivityPayload = {
+    ...oldPayload,
+    events: [
+      {
+        id: "new",
+        kind: "commit",
+        title: "Add new activity",
+        repo: "acme/releasebar",
+        url: "https://github.com/acme/releasebar",
+        createdAt: generatedAt,
+        count: 1,
+      },
+    ],
+    summary: {
+      state: "warming",
+      text: null,
+      generatedAt: null,
+      model: "gpt-5.5",
+      inputHash: "new-hash",
+      eventsUsed: 1,
+    },
+  };
+  const cache = kvStore({
+    "owner-activity:v1:acme:week": JSON.stringify(oldPayload),
+  });
+  const queued: Promise<unknown>[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.hostname === "api.openai.com" && url.pathname === "/v1/responses") {
+      await cache.put("owner-activity:v1:acme:week", JSON.stringify(newPayload));
+      return Response.json({
+        output_text: "Acme worked on old activity.",
+      });
+    }
+    throw new Error(`unexpected fetch ${url.toString()}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/acme/activity?range=week"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token", OPENAI_API_KEY: "openai-token" },
+      { waitUntil: (promise) => queued.push(promise) },
+    );
+    assert.equal(response.status, 202);
+    await Promise.all(queued);
+    const cached = JSON.parse(
+      (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
+    ) as OwnerActivityPayload;
+    assert.equal(cached.events[0]?.id, "new");
+    assert.equal(cached.summary?.state, "warming");
+    assert.equal(cached.summary?.inputHash, "new-hash");
+    assert.equal(cached.summary?.text, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker persists public owner activity summary failures", async () => {
+  const generatedAt = new Date().toISOString();
+  const payload: OwnerActivityPayload = {
+    owner: {
+      type: "user",
+      login: "acme",
+      avatarUrl: "https://github.com/acme.png",
+      url: "https://github.com/acme",
+    },
+    range: "week",
+    generatedAt,
+    cache: {
+      state: "fresh",
+      stale: false,
+      generatedAt,
+    },
+    totals: {
+      events: 1,
+      commits: 1,
+      pullRequests: 0,
+      issues: 0,
+      comments: 0,
+      releases: 0,
+      repositories: 1,
+    },
+    repositories: [
+      {
+        fullName: "acme/releasebar",
+        url: "https://github.com/acme/releasebar",
+        events: 1,
+        commits: 1,
+        lastActiveAt: generatedAt,
+      },
+    ],
+    events: [
+      {
+        id: "event",
+        kind: "commit",
+        title: "Add activity summary",
+        repo: "acme/releasebar",
+        url: "https://github.com/acme/releasebar",
+        createdAt: generatedAt,
+        count: 1,
+      },
+    ],
+    summary: {
+      state: "warming",
+      text: null,
+      generatedAt: null,
+      model: "gpt-5.5",
+      inputHash: "activity-hash",
+      eventsUsed: 1,
+    },
+  };
+  const cache = kvStore({
+    "owner-activity:v1:acme:week": JSON.stringify(payload),
+  });
+  const queued: Promise<unknown>[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.hostname === "api.openai.com" && url.pathname === "/v1/responses") {
+      return Response.json({ error: { message: "summary unavailable" } }, { status: 500 });
+    }
+    throw new Error(`unexpected fetch ${url.toString()}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/acme/activity?range=week"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token", OPENAI_API_KEY: "openai-token" },
+      { waitUntil: (promise) => queued.push(promise) },
+    );
+    assert.equal(response.status, 202);
+    await Promise.all(queued);
+    const cached = JSON.parse(
+      (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
+    ) as OwnerActivityPayload;
+    assert.equal(cached.summary?.state, "unavailable");
+    assert.match(cached.summary?.message ?? "", /summary unavailable/);
+    assert.equal(cached.summary?.inputHash, "activity-hash");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker keeps repository detail routes for repositories named activity", async () => {
+  const generatedAt = new Date().toISOString();
+  const payload: RepoDetailPayload = {
+    fullName: "acme/activity",
+    generatedAt,
+    cache: {
+      state: "fresh",
+      stale: false,
+      generatedAt,
+    },
+    project: testProject({
+      owner: "acme",
+      name: "activity",
+      commitsSinceRelease: 1,
+    }),
+    releases: [],
+    contributors: [],
+    commitActivity: [],
+    codeFrequency: [],
+    languages: [],
+    workTrend: null,
+  };
+  const cache = kvStore({
+    "repo-detail:v4:acme/activity": JSON.stringify(payload),
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    throw new Error(`unexpected fetch ${String(input)}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/activity"),
+      { DASHBOARD_CACHE: cache },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as RepoDetailPayload;
+    assert.equal(body.fullName, "acme/activity");
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Loosened repository evidence spacing between names and language labels.
 - Hide repeated external-link markers in repository table cells until hover or keyboard focus.
 - Kept the owner trust overview action aligned with the factors action by placing the trust tier before the button.
 - Use compact sort arrows in dashboard table headers so narrow metric columns stay on one line.

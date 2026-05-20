@@ -741,6 +741,11 @@ h1 {
   white-space: nowrap;
 }
 
+.trust-table small {
+  margin-top: 4px;
+  line-height: 1.2;
+}
+
 .trust-tags {
   display: flex;
   flex-wrap: wrap;

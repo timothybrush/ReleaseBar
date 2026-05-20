@@ -297,7 +297,7 @@
 
   function ownerHero(payload: DashboardPayload | null): Owner | null {
     if (repoRoute || initialRoute.isDefault || !initialRoute.owner) return null;
-    return payload?.owners[0] ?? null;
+    return payload?.owners[0] ?? { type: "user", login: initialRoute.owner };
   }
 
   function ownerAvatarUrl(owner: Owner): string {

@@ -1675,6 +1675,23 @@ body.dev-mode .table-head .since-heading .label-compact {
     center / contain no-repeat;
 }
 
+.projects .external-link::after {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.projects .external-link:hover::after,
+.projects .external-link:focus-visible::after {
+  opacity: 1;
+}
+
+.projects .external-link:hover,
+.projects .external-link:focus-visible {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
 .since-cell a,
 .since-cell {
   color: var(--amber);

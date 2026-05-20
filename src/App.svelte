@@ -2660,10 +2660,10 @@
           <h2>{trustProfile ? `${trustProfile.score}` : "loading"}</h2>
         </div>
         <div class="trust-panel-actions">
-          <button type="button" onclick={() => setOwnerTab("overview")}>overview</button>
           {#if trustProfile}
             <span class={`audience-tier tier-${trustProfile.tier}`}>{trustProfile.tier}</span>
           {/if}
+          <button type="button" onclick={() => setOwnerTab("overview")}>overview</button>
         </div>
       </div>
 

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Kept the owner trust overview action aligned with the factors action by placing the trust tier before the button.
 - Use compact sort arrows in dashboard table headers so narrow metric columns stay on one line.
 - Show repository GitHub, release, issue, and PR links immediately while detail data loads.
 - Reduced owner dashboard layout shift by rendering route-owner hero avatars before cached dashboard data arrives and reserving a stable account-menu width.

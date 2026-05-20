@@ -684,6 +684,15 @@
     }
   }
 
+  function sortDirectionGlyph(direction: SortDirection): string {
+    return direction === "asc" ? "↑" : "↓";
+  }
+
+  function sortButtonLabel(key: SortKey): string {
+    const label = sortLabel(key);
+    return sortKey === key ? `Sort by ${label}, ${sortDirection === "asc" ? "ascending" : "descending"}` : `Sort by ${label}`;
+  }
+
   function applyTheme(next: "dark" | "light"): void {
     theme = next;
     if (next === "light") {
@@ -2889,9 +2898,10 @@
           class:dev-only={devSortOptions.includes(key)}
           class:since-heading={key === "since"}
           type="button"
-          aria-label={sortLabel(key)}
+          aria-label={sortButtonLabel(key)}
           aria-current={sortKey === key ? "true" : undefined}
           data-direction={sortKey === key ? sortDirection : ""}
+          data-sort-symbol={sortKey === key ? sortDirectionGlyph(sortDirection) : ""}
           onclick={() => setSort(key)}
         >
           {#if key === "since"}

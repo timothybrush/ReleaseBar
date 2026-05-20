@@ -1321,9 +1321,12 @@ body.dev-mode .dev-only {
 }
 
 .table-head button[aria-current="true"]::after {
-  content: " " attr(data-direction);
+  content: attr(data-sort-symbol);
+  display: inline-block;
+  width: 1ch;
+  margin-left: 0.45ch;
   color: var(--muted);
-  text-transform: lowercase;
+  text-align: center;
 }
 
 .table-head .label-compact {

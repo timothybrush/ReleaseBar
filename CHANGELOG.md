@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Use compact sort arrows in dashboard table headers so narrow metric columns stay on one line.
 - Show repository GitHub, release, issue, and PR links immediately while detail data loads.
 - Simplified owner trust navigation by removing the overview tab buttons and trimming the trust snapshot copy.
 - Matched the trust tab's content spacing to the overview tab.

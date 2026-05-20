@@ -390,6 +390,40 @@ function repoSearchProject(repo: GitHubRepo): Project {
   };
 }
 
+function mergeRepoMetadata(project: Project, repo: GitHubRepo): Project;
+function mergeRepoMetadata(
+  project: Omit<Project, "freshness">,
+  repo: GitHubRepo,
+): Omit<Project, "freshness">;
+function mergeRepoMetadata(
+  project: Project | Omit<Project, "freshness">,
+  repo: GitHubRepo,
+): Project | Omit<Project, "freshness"> {
+  const metadata = repoSearchProject(repo);
+  const hasSplitCounts =
+    repo.open_issues_total !== undefined || repo.open_pull_requests_total !== undefined;
+  return {
+    ...project,
+    owner: metadata.owner,
+    name: metadata.name,
+    fullName: metadata.fullName,
+    description: metadata.description,
+    url: metadata.url,
+    defaultBranch: metadata.defaultBranch,
+    language: metadata.language,
+    topics: metadata.topics,
+    stars: metadata.stars,
+    forks: metadata.forks,
+    openIssues: hasSplitCounts ? metadata.openIssues : project.openIssues,
+    openPullRequests: hasSplitCounts ? metadata.openPullRequests : project.openPullRequests,
+    issuesUrl: metadata.issuesUrl,
+    pullRequestsUrl: metadata.pullRequestsUrl,
+    archived: metadata.archived,
+    pushedAt: metadata.pushedAt,
+    updatedAt: metadata.updatedAt,
+  };
+}
+
 function isRepoSearchProject(project: Project): boolean {
   return (
     project.version === "repo search" &&
@@ -1039,16 +1073,20 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
       options.log?.(`skip ${repo.full_name}: no releases`);
       return false;
     }
+    const projectWithFreshMetadata = mergeRepoMetadata(project, repo);
     if (!cached) {
       await writeProjectCache(
         options.projectCache,
         repo,
         includeUnreleased,
         includeReleaseData,
-        project,
+        projectWithFreshMetadata,
       );
     }
-    const hydrated = { ...project, freshness: freshness(project) };
+    const hydrated = {
+      ...projectWithFreshMetadata,
+      freshness: freshness(projectWithFreshMetadata),
+    };
     if (existingIndex >= 0) {
       projects[existingIndex] = hydrated;
     } else {
@@ -1068,6 +1106,114 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
       const scanLimit = includeReleaseData
         ? (options.repoScanLimit ?? Number.POSITIVE_INFINITY)
         : Number.POSITIVE_INFINITY;
+      if (includeReleaseData && options.includeUnreleased) {
+        const hydrateQueue: GitHubRepo[] = [];
+        let metadataChanged = false;
+        const hasScanLimit = Number.isFinite(scanLimit);
+        while (
+          ownerVisible < options.repoLimit ||
+          (hasScanLimit && hydrateQueue.length < scanLimit)
+        ) {
+          const repos = await ownerRepos(client, owner, includeReleaseData, page);
+          if (repos.length === 0) {
+            break;
+          }
+          let exhaustedPage = false;
+          let visibleAddedThisPage = 0;
+          for (const [index, repo] of repos.entries()) {
+            const fullName = repo.full_name.toLowerCase();
+            if (!filterRepo(repo, options)) {
+              continue;
+            }
+            const existingIndex = projects.findIndex(
+              (project) => project.fullName.toLowerCase() === fullName,
+            );
+            let visibleForHydration = false;
+            if (existingIndex >= 0) {
+              projects[existingIndex] = mergeRepoMetadata(projects[existingIndex]!, repo);
+              metadataChanged = true;
+              visibleForHydration = true;
+            } else if (ownerVisible < options.repoLimit) {
+              projects.push(repoSearchProject(repo));
+              seen.add(fullName);
+              ownerVisible += 1;
+              visibleAddedThisPage += 1;
+              metadataChanged = true;
+              visibleForHydration = true;
+              if (
+                ownerVisible >= options.repoLimit &&
+                (index < repos.length - 1 || repos.length === 100)
+              ) {
+                capped = true;
+              }
+            } else {
+              capped = true;
+              if (ownerVisible >= options.repoLimit) {
+                exhaustedPage = true;
+              }
+            }
+            if (visibleForHydration && !skippedRepos.has(fullName)) {
+              if (!hasScanLimit || hydrateQueue.length < scanLimit) {
+                hydrateQueue.push(repo);
+              } else {
+                capped = true;
+                if (options.repoScanTarget) {
+                  scanIncomplete = true;
+                }
+              }
+            }
+            if (
+              ownerVisible >= options.repoLimit &&
+              (!hasScanLimit || hydrateQueue.length >= scanLimit)
+            ) {
+              if (index < repos.length - 1 || repos.length === 100) {
+                capped = true;
+                if (options.repoScanTarget) {
+                  scanIncomplete = true;
+                }
+              }
+              exhaustedPage = true;
+              break;
+            }
+            if (exhaustedPage) {
+              break;
+            }
+          }
+          if (repos.length < 100 || exhaustedPage) {
+            break;
+          }
+          if (hasScanLimit && hydrateQueue.length >= scanLimit && visibleAddedThisPage === 0) {
+            break;
+          }
+          page += 1;
+        }
+        if (metadataChanged) {
+          const progressPayload = payload("partial");
+          if (progressPayload.cache?.progress) {
+            progressPayload.cache.progress.done = false;
+          }
+          await options.onProgress?.(progressPayload, {
+            scannedRepo: "",
+            scanned: skippedRepos.size + scannedThisRun,
+            done: false,
+          });
+        }
+        for (const repo of hydrateQueue) {
+          hydratedThisOwner += 1;
+          scannedThisRun += 1;
+          await addRepo(repo, `${owner.login} ${ownerVisible}/${options.repoLimit}`);
+          const progressPayload = payload("partial");
+          if (progressPayload.cache?.progress) {
+            progressPayload.cache.progress.done = false;
+          }
+          await options.onProgress?.(progressPayload, {
+            scannedRepo: repo.full_name,
+            scanned: skippedRepos.size + scannedThisRun,
+            done: false,
+          });
+        }
+        continue;
+      }
       while (ownerVisible < options.repoLimit || hydratedThisOwner < scanLimit) {
         const repos = await ownerRepos(client, owner, includeReleaseData, page);
         if (repos.length === 0) {

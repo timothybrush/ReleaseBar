@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Prioritized owner dashboard repository counts so issue and PR totals render before release and CI hydration finishes.
 - Loosened repository evidence spacing between names and language labels.
 - Hide repeated external-link markers in repository table cells until hover or keyboard focus.
 - Kept the owner trust overview action aligned with the factors action by placing the trust tier before the button.

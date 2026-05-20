@@ -6371,6 +6371,169 @@ test("dashboard build uses GraphQL owner metadata when token is available", asyn
   );
 });
 
+test("dashboard build emits owner metadata before release hydration", async () => {
+  const progress: Awaited<ReturnType<typeof buildDashboard>>[] = [];
+  const repoNode = (name: string, issues: number, pullRequests: number) => ({
+    owner: { login: "owner", __typename: "User" },
+    name,
+    nameWithOwner: `owner/${name}`,
+    description: null,
+    url: `https://github.com/owner/${name}`,
+    defaultBranchRef: { name: "main" },
+    primaryLanguage: null,
+    repositoryTopics: { nodes: [] },
+    stargazerCount: 0,
+    forkCount: 0,
+    issues: { totalCount: issues },
+    pullRequests: { totalCount: pullRequests },
+    isArchived: false,
+    isFork: false,
+    isPrivate: false,
+    pushedAt: `2026-01-0${issues}T00:00:00Z`,
+    updatedAt: `2026-01-0${issues}T00:00:00Z`,
+    releases: { nodes: [] },
+  });
+
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    repoLimit: 3,
+    repoScanLimit: 1,
+    repoScanTarget: 3,
+    token: "token",
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      if (path === "/graphql") {
+        return Response.json({
+          data: {
+            repositoryOwner: {
+              __typename: "User",
+              repositories: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [repoNode("one", 5, 2), repoNode("two", 4, 1), repoNode("three", 3, 0)],
+              },
+            },
+          },
+        });
+      }
+      if (path === "/repos/owner/one/commits/main") {
+        return Response.json({
+          sha: "abcdef123456",
+          commit: { committer: { date: "2026-01-04T00:00:00Z" } },
+        });
+      }
+      if (path === "/repos/owner/one/commits/abcdef123456/check-runs") {
+        return Response.json({ check_runs: [] });
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+    onProgress: (partial) => {
+      progress.push(partial);
+    },
+  });
+
+  assert.equal(progress[0]?.projects.length, 3);
+  assert.deepEqual(
+    progress[0]?.projects.map((project) => [
+      project.name,
+      project.openIssues,
+      project.openPullRequests,
+      project.version,
+    ]),
+    [
+      ["one", 5, 2, "repo search"],
+      ["two", 4, 1, "repo search"],
+      ["three", 3, 0, "repo search"],
+    ],
+  );
+  assert.equal(progress[0]?.cache?.progress?.scanned, 0);
+  assert.equal(payload.cache?.state, "partial");
+  assert.deepEqual(
+    payload.projects.map((project) => project.name),
+    ["one", "two", "three"],
+  );
+});
+
+test("dashboard cached hydration keeps fresh owner issue and PR totals", async () => {
+  const cache = kvStore();
+  let openIssues = 1;
+  let openPullRequests = 1;
+  const repoNode = () => ({
+    owner: { login: "owner", __typename: "User" },
+    name: "one",
+    nameWithOwner: "owner/one",
+    description: null,
+    url: "https://github.com/owner/one",
+    defaultBranchRef: { name: "main" },
+    primaryLanguage: null,
+    repositoryTopics: { nodes: [] },
+    stargazerCount: 0,
+    forkCount: 0,
+    issues: { totalCount: openIssues },
+    pullRequests: { totalCount: openPullRequests },
+    isArchived: false,
+    isFork: false,
+    isPrivate: false,
+    pushedAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T00:00:00Z",
+    releases: { nodes: [] },
+  });
+  const fetch: typeof globalThis.fetch = async (url) => {
+    const path = new URL(String(url)).pathname;
+    if (path === "/graphql") {
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "User",
+            repositories: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [repoNode()],
+            },
+          },
+        },
+      });
+    }
+    if (path === "/repos/owner/one/commits/main") {
+      return Response.json({
+        sha: "abcdef123456",
+        commit: { committer: { date: "2026-01-02T00:00:00Z" } },
+      });
+    }
+    if (path === "/repos/owner/one/commits/abcdef123456/check-runs") {
+      return Response.json({ check_runs: [] });
+    }
+    throw new Error(`unexpected ${path}`);
+  };
+  const options = {
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user" as const, login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    repoLimit: 1,
+    repoScanLimit: 1,
+    repoScanTarget: 1,
+    token: "token",
+    projectCache: cache,
+    fetch,
+  };
+
+  await buildDashboard(options);
+  openIssues = 8;
+  openPullRequests = 5;
+  const payload = await buildDashboard(options);
+
+  assert.equal(payload.projects[0]?.openIssues, 8);
+  assert.equal(payload.projects[0]?.openPullRequests, 5);
+});
+
 test("dashboard build reuses cached repo fragments when metadata is unchanged", async () => {
   const cache = kvStore();
   let fanoutCalls = 0;
@@ -7215,6 +7378,94 @@ test("dashboard repo scan cap marks full page boundary truncation as capped", as
   assert.equal(payload.totals.repos, 100);
   assert.equal(payload.cache?.capped, true);
   assert.match(payload.cache?.message ?? "", /scanned 100 recently pushed repos/);
+});
+
+test("dashboard resume stops paging when visible cap is already scanned", async () => {
+  const repo = (name: string) => ({
+    owner: { login: "owner" },
+    name,
+    full_name: `owner/${name}`,
+    description: null,
+    html_url: `https://github.com/owner/${name}`,
+    default_branch: "main",
+    language: null,
+    stargazers_count: 0,
+    forks_count: 0,
+    open_issues_count: 0,
+    archived: false,
+    pushed_at: null,
+    updated_at: null,
+    fork: false,
+    private: false,
+  });
+  const project = (
+    name: string,
+  ): Awaited<ReturnType<typeof buildDashboard>>["projects"][number] => ({
+    owner: "owner",
+    name,
+    fullName: `owner/${name}`,
+    description: null,
+    url: `https://github.com/owner/${name}`,
+    defaultBranch: "main",
+    language: null,
+    topics: [],
+    stars: 0,
+    forks: 0,
+    openIssues: 0,
+    openPullRequests: 0,
+    issuesUrl: `https://github.com/owner/${name}/issues`,
+    pullRequestsUrl: `https://github.com/owner/${name}/pulls`,
+    archived: false,
+    pushedAt: null,
+    updatedAt: null,
+    latestCommitSha: null,
+    latestCommitDate: null,
+    version: "repo search",
+    releaseName: null,
+    releaseUrl: `https://github.com/owner/${name}/releases`,
+    releaseDate: null,
+    commitsSinceRelease: null,
+    compareUrl: null,
+    ciState: "unknown",
+    ciStatus: null,
+    ciConclusion: null,
+    ciWorkflow: null,
+    ciUrl: null,
+    ciRunDate: null,
+    freshness: "hot",
+  });
+  const pages: string[] = [];
+
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    repoLimit: 2,
+    repoScanLimit: 2,
+    repoScanTarget: 2,
+    initialProjects: [project("one"), project("two")],
+    skipRepos: ["owner/one", "owner/two"],
+    fetch: async (url) => {
+      const parsed = new URL(String(url));
+      const path = parsed.pathname;
+      if (path === "/users/owner/repos") {
+        pages.push(parsed.searchParams.get("page") ?? "");
+        return Response.json([repo("one"), repo("two"), repo("three")]);
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+  });
+
+  assert.deepEqual(pages, ["1"]);
+  assert.deepEqual(
+    payload.projects.map((project) => project.name),
+    ["one", "two"],
+  );
+  assert.equal(payload.cache?.progress?.done, true);
 });
 
 test("dashboard repo cap keeps paginating until eligible repos survive filters", async () => {

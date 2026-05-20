@@ -177,6 +177,9 @@
   $: subtitle = repoRoute
     ? (repoDetail?.project.description ?? "Repository release and activity detail.")
     : data?.subtitle ?? "Release debt across recently requested public dashboards.";
+  $: repoActionUrl = repoRoute
+    ? (repoDetail?.project.url ?? `https://github.com/${encodeURIComponent(repoRoute.owner)}/${encodeURIComponent(repoRoute.repo)}`)
+    : null;
   $: profileSourceCount =
     (data?.profile?.includeOwners.length ?? 0) + (data?.profile?.includeRepos.length ?? 0);
   $: subtitleOwner =
@@ -1987,12 +1990,12 @@
           {subtitle}
         {/if}
       </p>
-      {#if repoRoute && repoDetail}
+      {#if repoActionUrl}
         <nav class="repo-actions" aria-label="Repository links">
-          <a class="external-link" href={repoDetail.project.url} target="_blank" rel="noreferrer">GitHub</a>
-          <a class="external-link" href={`${repoDetail.project.url}/releases`} target="_blank" rel="noreferrer">Releases</a>
-          <a class="external-link" href={repoDetail.project.issuesUrl} target="_blank" rel="noreferrer">Issues</a>
-          <a class="external-link" href={repoDetail.project.pullRequestsUrl} target="_blank" rel="noreferrer">PRs</a>
+          <a class="external-link" href={repoActionUrl} target="_blank" rel="noreferrer">GitHub</a>
+          <a class="external-link" href={`${repoActionUrl}/releases`} target="_blank" rel="noreferrer">Releases</a>
+          <a class="external-link" href={repoDetail?.project.issuesUrl ?? `${repoActionUrl}/issues`} target="_blank" rel="noreferrer">Issues</a>
+          <a class="external-link" href={repoDetail?.project.pullRequestsUrl ?? `${repoActionUrl}/pulls`} target="_blank" rel="noreferrer">PRs</a>
         </nav>
       {/if}
     </div>

@@ -44,7 +44,7 @@ import type {
   RepoDetailPayload,
   TrustProfilePayload,
 } from "../../src/types.js";
-import worker, { DashboardBuildLock } from "../../worker/index.js";
+import worker, { DashboardBuildLock, dashboardStreamSignature } from "../../worker/index.js";
 
 const textEncoder = new TextEncoder();
 
@@ -343,6 +343,28 @@ test("dashboard project sorting handles dev issue and pull request counts numeri
       "desc",
     ).map((project) => project.name),
     ["large", "small"],
+  );
+});
+
+test("dashboard stream signature changes when dev sort counts change", () => {
+  const payload = testDashboard("owner", [
+    testProject({ owner: "owner", name: "one", openIssues: 1, openPullRequests: 2 }),
+  ]);
+  payload.generatedAt = "2026-05-22T00:00:00.000Z";
+  payload.cache = {
+    state: "partial",
+    stale: true,
+    capped: false,
+    repoLimit: 200,
+    generatedAt: payload.generatedAt,
+    progress: { scanned: 16, limit: 200, done: false },
+  };
+  const next = JSON.parse(JSON.stringify(payload)) as DashboardPayload;
+  next.projects[0]!.openPullRequests = 9;
+
+  assert.notEqual(
+    dashboardStreamSignature(payload, "partial"),
+    dashboardStreamSignature(next, "partial"),
   );
 });
 

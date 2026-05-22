@@ -6710,6 +6710,36 @@ function dashboardStreamState(
   return cacheAgeMs(payload) < fullTtlMs ? "fresh" : "stale";
 }
 
+export function dashboardStreamSignature(
+  payload: DashboardPayload,
+  state: NonNullable<DashboardPayload["cache"]>["state"] = dashboardStreamState(payload),
+): string {
+  const progress = payload.cache?.progress;
+  const projects = payload.projects
+    .map((project) =>
+      [
+        project.fullName,
+        project.openIssues,
+        project.openPullRequests,
+        project.commitsSinceRelease ?? "",
+        project.latestCommitSha ?? "",
+        project.ciState,
+        project.ciStatus ?? "",
+        project.ciConclusion ?? "",
+        project.version,
+      ].join(":"),
+    )
+    .join("|");
+  return [
+    payload.generatedAt,
+    state,
+    progress?.scanned ?? "",
+    progress?.done ?? "",
+    payload.projects.length,
+    projects,
+  ].join(":");
+}
+
 async function ownerEventsResponse(request: Request, env: Env): Promise<Response> {
   const parts = await dashboardEventParts(request, env);
   if (!parts) {
@@ -6731,7 +6761,7 @@ async function ownerEventsResponse(request: Request, env: Env): Promise<Response
         if (canDisplayCached(payload)) {
           const state = dashboardStreamState(payload);
           const next = withCacheState(payload, state);
-          const signature = `${next.generatedAt}:${state}:${next.cache?.progress?.scanned ?? ""}:${next.projects.length}`;
+          const signature = dashboardStreamSignature(next, state);
           if (signature !== lastSignature) {
             lastSignature = signature;
             send("dashboard", next);

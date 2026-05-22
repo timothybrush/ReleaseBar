@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Refreshed live owner dashboard streams when issue or PR totals change so active dev sorting can reorder rows during background updates.
 - Prioritized owner dashboard repository counts so issue and PR totals render before release and CI hydration finishes.
 - Loosened repository evidence spacing between names and language labels.
 - Hide repeated external-link markers in repository table cells until hover or keyboard focus.

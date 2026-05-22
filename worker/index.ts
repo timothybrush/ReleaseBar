@@ -2740,6 +2740,103 @@ async function auditSyncEvent(
   await auditScheduler(env, event).catch(() => undefined);
 }
 
+function timingNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  if (value < 0 || value > 10 * 60 * 1000) return undefined;
+  return Math.round(value);
+}
+
+function timingText(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value.slice(0, 160) : fallback;
+}
+
+function timingPath(value: unknown): string {
+  const path = timingText(value, "/");
+  return path.startsWith("/") ? path.slice(0, 160) : "/";
+}
+
+function timingBool(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function timingDetail(input: Record<string, unknown>): string {
+  const pairs: Array<[string, string | number | boolean | null | undefined]> = [
+    ["source", timingText(input.source, "unknown")],
+    ["path", timingPath(input.path)],
+    ["api", timingPath(input.apiPath)],
+    ["route", timingText(input.route)],
+    ["attempt", timingNumber(input.attempt)],
+    ["http", timingNumber(input.httpStatus)],
+    ["cache", timingText(input.cacheState)],
+    ["headerMs", timingNumber(input.headerMs)],
+    ["bodyMs", timingNumber(input.bodyMs)],
+    ["renderMs", timingNumber(input.renderMs)],
+    ["streamMs", timingNumber(input.streamMs)],
+    ["totalMs", timingNumber(input.totalMs)],
+    ["navTtfbMs", timingNumber(input.navigationTtfbMs)],
+    ["navInteractiveMs", timingNumber(input.navigationInteractiveMs)],
+  ];
+  return pairs
+    .filter(([, value]) => value !== undefined && value !== "")
+    .map(([key, value]) => `${key}=${value}`)
+    .join(" ");
+}
+
+async function clientTimingRateLimited(request: Request, env: Env): Promise<boolean> {
+  if (!env.DASHBOARD_CACHE) return false;
+  const forwardedFor = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+  const client =
+    request.headers.get("cf-connecting-ip") ??
+    forwardedFor ??
+    request.headers.get("user-agent") ??
+    "unknown";
+  const minute = Math.floor(Date.now() / 60000);
+  const id = (await sha256Base64Url(client)).slice(0, 16);
+  const key = `client:timing:rate:v1:${id}:${minute}`;
+  const current = Number.parseInt((await env.DASHBOARD_CACHE.get(key)) ?? "0", 10);
+  if (Number.isFinite(current) && current >= 30) return true;
+  await env.DASHBOARD_CACHE.put(key, String((Number.isFinite(current) ? current : 0) + 1), {
+    expirationTtl: 120,
+  });
+  return false;
+}
+
+async function clientTimingResponse(
+  request: Request,
+  env: Env,
+  context: ExecutionContext,
+): Promise<Response> {
+  const origin = request.headers.get("origin");
+  if (origin && origin !== new URL(request.url).origin) {
+    return jsonResponse({ error: "forbidden" }, 403, { "cache-control": "no-store" });
+  }
+  if (await clientTimingRateLimited(request, env)) {
+    return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+  }
+  const raw = await request.text().catch(() => "");
+  if (raw.length > 2048) {
+    return jsonResponse({ error: "payload too large" }, 413, { "cache-control": "no-store" });
+  }
+  const input = tryJsonParse<Record<string, unknown>>(raw, "client timing");
+  if (!input || typeof input !== "object") {
+    return jsonResponse({ error: "invalid timing" }, 400, { "cache-control": "no-store" });
+  }
+  const cacheState = timingText(input.cacheState, "ok");
+  auditDashboardSync(context, env, {
+    event: "client_dashboard_timing",
+    status: cacheState,
+    source: "browser",
+    reason: timingText(input.source, "unknown"),
+    durationMs: timingNumber(input.totalMs),
+    projects: timingNumber(input.projects),
+    scanned: timingNumber(input.scanned),
+    limit: timingNumber(input.limit),
+    done: timingBool(input.done),
+    detail: timingDetail(input),
+  });
+  return jsonResponse({ ok: true }, 202, { "cache-control": "no-store" });
+}
+
 function refreshAuditStorageKey(event: Pick<SchedulerAuditEvent, "id" | "at">): string {
   const timestamp = safeIso(event.at) || Date.now();
   const reverseTimestamp = String(Number.MAX_SAFE_INTEGER - timestamp).padStart(16, "0");
@@ -8311,12 +8408,14 @@ export default {
     const audienceBackfillWrite =
       isRepoAudienceBackfillApiPath(url.pathname) && request.method === "POST";
     const adminWrite = url.pathname === "/api/admin/scheduler/run" && request.method === "POST";
+    const clientTimingWrite = url.pathname === "/api/_client-timing" && request.method === "POST";
     if (
       request.method !== "GET" &&
       !isHead &&
       !profileWrite &&
       !audienceBackfillWrite &&
-      !adminWrite
+      !adminWrite &&
+      !clientTimingWrite
     ) {
       return jsonResponse({ error: "method not allowed" }, 405, { allow: "GET" });
     }
@@ -8369,6 +8468,9 @@ async function routeRequest(
   }
   if (url.pathname === "/api/me") {
     return meResponse(request, env);
+  }
+  if (url.pathname === "/api/_client-timing" && request.method === "POST") {
+    return clientTimingResponse(request, env, context);
   }
   if (url.pathname.startsWith("/api/admin/")) {
     return adminResponse(request, env, context);

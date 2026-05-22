@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import CommandPalette, {
     defineActions,
     paletteStore,
@@ -123,6 +123,7 @@
   let activityRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let repoActivityRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let dashboardEventSource: EventSource | null = null;
+  let dashboardStreamTimingSent = false;
   let activityRange: ActivityRange = "week";
   let activity: OwnerActivityPayload | null = null;
   let activityLoading = false;
@@ -376,6 +377,79 @@
 
   function percentOfTotal(value: number, total: number): number {
     return total <= 0 ? 0 : Math.round((value / total) * 100);
+  }
+
+  function nowMs(): number {
+    return typeof performance === "undefined" ? Date.now() : performance.now();
+  }
+
+  function roundedMs(value: number | null | undefined): number | undefined {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0
+      ? Math.round(value)
+      : undefined;
+  }
+
+  function navigationTiming(): Record<string, number> {
+    if (typeof performance === "undefined") return {};
+    const [entry] = performance.getEntriesByType("navigation") as PerformanceNavigationTiming[];
+    if (!entry) return {};
+    return {
+      ...(roundedMs(entry.responseStart - entry.startTime) !== undefined
+        ? { navigationTtfbMs: roundedMs(entry.responseStart - entry.startTime) as number }
+        : {}),
+      ...(roundedMs(entry.domInteractive - entry.startTime) !== undefined
+        ? { navigationInteractiveMs: roundedMs(entry.domInteractive - entry.startTime) as number }
+        : {}),
+    };
+  }
+
+  function dashboardTimingFields(payload: DashboardPayload): Record<string, string | number | boolean | null> {
+    return {
+      cacheState: payload.cache?.state ?? "ready",
+      projects: payload.projects.length,
+      scanned: payload.cache?.progress?.scanned ?? null,
+      limit: payload.cache?.progress?.limit ?? null,
+      done: payload.cache?.progress?.done ?? null,
+    };
+  }
+
+  function postClientTiming(fields: Record<string, string | number | boolean | null | undefined>): void {
+    const body = JSON.stringify({
+      route: repoRoute ? "repo" : "dashboard",
+      path: location.pathname,
+      ...fields,
+    });
+    const blob = new Blob([body], { type: "application/json" });
+    if (navigator.sendBeacon?.("/api/_client-timing", blob)) return;
+    void fetch("/api/_client-timing", {
+      method: "POST",
+      body,
+      headers: { "content-type": "application/json" },
+      cache: "no-store",
+      keepalive: true,
+    }).catch(() => undefined);
+  }
+
+  async function reportDashboardTiming(
+    payload: DashboardPayload,
+    fields: Record<string, string | number | boolean | null | undefined>,
+  ): Promise<void> {
+    const renderStart = nowMs();
+    await tick();
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    const renderMs = roundedMs(nowMs() - renderStart);
+    const baseTotalMs = typeof fields.totalMs === "number" ? fields.totalMs : undefined;
+    postClientTiming({
+      event: "dashboard",
+      ...dashboardTimingFields(payload),
+      ...navigationTiming(),
+      ...fields,
+      renderMs: fields.renderMs ?? renderMs,
+      totalMs:
+        baseTotalMs === undefined || renderMs === undefined
+          ? fields.totalMs
+          : roundedMs(baseTotalMs + renderMs),
+    });
   }
 
   function shortDate(value: string | null): string {
@@ -1398,11 +1472,24 @@
     const eventsPath = dashboardEventsPath(initialRoute.apiPath);
     if (!eventsPath) return false;
     closeDashboardStream();
+    const startedAt = nowMs();
+    dashboardStreamTimingSent = false;
     dashboardEventSource = new EventSource(eventsPath);
     dashboardEventSource.addEventListener("dashboard", (event) => {
+      const receivedAt = nowMs();
       const next = JSON.parse((event as MessageEvent).data) as DashboardPayload;
       data = next;
       updateStatus();
+      if (!dashboardStreamTimingSent) {
+        dashboardStreamTimingSent = true;
+        void reportDashboardTiming(next, {
+          source: "stream",
+          attempt,
+          apiPath: new URL(eventsPath).pathname,
+          streamMs: roundedMs(receivedAt - startedAt),
+          totalMs: roundedMs(nowMs() - startedAt),
+        });
+      }
       if (!shouldAutoRefresh(next)) {
         closeDashboardStream();
       }
@@ -1505,11 +1592,23 @@
     const forceRefresh = new URLSearchParams(location.search).has("rdRefresh");
     const bypassCache = attempt > 0 || forceRefresh;
     try {
+      const startedAt = nowMs();
       let response = await fetchPayload(initialRoute.apiPath, bypassCache);
+      const headerAt = nowMs();
       let body = await readDashboardResponse(response);
+      const bodyAt = nowMs();
       if (response.ok && body && "projects" in body) {
         data = body;
         updateStatus();
+        void reportDashboardTiming(body, {
+          source: "fetch",
+          attempt,
+          apiPath: new URL(initialRoute.apiPath, location.origin).pathname,
+          httpStatus: response.status,
+          headerMs: roundedMs(headerAt - startedAt),
+          bodyMs: roundedMs(bodyAt - headerAt),
+          totalMs: roundedMs(bodyAt - startedAt),
+        });
         if (shouldAutoRefresh(data)) {
           if (!startDashboardStream(attempt)) {
             scheduleDashboardRefresh(attempt);
@@ -1526,11 +1625,23 @@
         return;
       }
       if (initialRoute.fallbackApiPath) {
+        const fallbackStartedAt = nowMs();
         response = await fetchPayload(initialRoute.fallbackApiPath, bypassCache);
+        const fallbackHeaderAt = nowMs();
         body = await readDashboardResponse(response);
+        const fallbackBodyAt = nowMs();
         if (response.ok && body && "projects" in body) {
           data = body;
           updateStatus();
+          void reportDashboardTiming(body, {
+            source: "fetch-fallback",
+            attempt,
+            apiPath: new URL(initialRoute.fallbackApiPath, location.origin).pathname,
+            httpStatus: response.status,
+            headerMs: roundedMs(fallbackHeaderAt - fallbackStartedAt),
+            bodyMs: roundedMs(fallbackBodyAt - fallbackHeaderAt),
+            totalMs: roundedMs(fallbackBodyAt - fallbackStartedAt),
+          });
           return;
         }
       }
@@ -1982,6 +2093,11 @@
       }
       if (!repoRoute && data) {
         updateStatus();
+        void reportDashboardTiming(data, {
+          source: "embedded",
+          attempt: 0,
+          totalMs: roundedMs(nowMs()),
+        });
         if (new URLSearchParams(location.search).has("rdRefresh")) {
           return loadDashboard();
         }

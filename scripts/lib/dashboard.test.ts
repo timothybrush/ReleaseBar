@@ -91,6 +91,53 @@ async function refreshAuditEvents(
     .sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
 }
 
+test("worker records client dashboard timing beacons in audit log", async () => {
+  const cache = kvStore();
+  const waits: Array<Promise<unknown>> = [];
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/_client-timing", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        route: "dashboard",
+        source: "fetch",
+        path: "/steipete",
+        apiPath: "/api/steipete",
+        attempt: 0,
+        httpStatus: 200,
+        cacheState: "stale",
+        headerMs: 42.4,
+        bodyMs: 3.2,
+        renderMs: 17.8,
+        totalMs: 63.4,
+        navigationTtfbMs: 91.2,
+        projects: 58,
+        scanned: 12,
+        limit: 200,
+        done: false,
+      }),
+    }),
+    { DASHBOARD_CACHE: cache },
+    { waitUntil: (promise) => waits.push(promise) },
+  );
+
+  assert.equal(response.status, 202);
+  await Promise.all(waits);
+  const [event] = await refreshAuditEvents(cache);
+  assert.equal(event?.event, "client_dashboard_timing");
+  assert.equal(event?.source, "browser");
+  assert.equal(event?.reason, "fetch");
+  assert.equal(event?.status, "stale");
+  assert.equal(event?.durationMs, 63);
+  assert.equal(event?.projects, 58);
+  assert.equal(event?.scanned, 12);
+  assert.equal(event?.limit, 200);
+  assert.equal(event?.done, false);
+  assert.match(event?.detail ?? "", /path=\/steipete/);
+  assert.match(event?.detail ?? "", /headerMs=42/);
+  assert.match(event?.detail ?? "", /navTtfbMs=91/);
+});
+
 function base64Url(bytes: Uint8Array): string {
   let binary = "";
   for (const byte of bytes) {

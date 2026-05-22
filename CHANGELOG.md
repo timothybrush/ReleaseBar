@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added browser-side dashboard timing beacons for cached boot renders, API fetches, and streamed updates so client latency can be compared with Worker background tail duration.
 - Logged dashboard sync, progressive refresh, stream delivery, and discover hydration phases so fast visible data and slower GitHub scans can be studied separately.
 - Documented the refresh scheduler's target, queue, quota, retry, and admin audit behavior.
 - Hardcoded admin access to @steipete and moved the admin console link into dashboard settings.

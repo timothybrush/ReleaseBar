@@ -2272,6 +2272,18 @@
       {/if}
     </div>
     <div class="top-actions">
+      <button
+        type="button"
+        class="status"
+        aria-live="polite"
+        aria-label={generatedDetail ? `${generatedLabel} · ${generatedDetail}` : generatedLabel}
+        data-tooltip={generatedDetail || undefined}
+        tabindex={generatedDetail ? 0 : undefined}
+      >
+        <span class="pulse"></span>
+        <span>{generatedLabel}</span>
+      </button>
+
       {#if manualRefreshAvailable}
         <button
           type="button"
@@ -2289,18 +2301,6 @@
           </svg>
         </button>
       {/if}
-
-      <button
-        type="button"
-        class="status"
-        aria-live="polite"
-        aria-label={generatedDetail ? `${generatedLabel} · ${generatedDetail}` : generatedLabel}
-        data-tooltip={generatedDetail || undefined}
-        tabindex={generatedDetail ? 0 : undefined}
-      >
-        <span class="pulse"></span>
-        <span>{generatedLabel}</span>
-      </button>
 
       <button
         type="button"

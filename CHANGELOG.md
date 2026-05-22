@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Placed dashboard cache status before the manual refresh button so the refresh action no longer interrupts the status text.
 - Improved the mobile dashboard layout with scrollable filter/sort rails, compact repository cards, and tighter header/search controls.
 - Added a manual dashboard refresh button that refreshes cheap issue and PR counts first, then continues release hydration in the background.
 - Replaced the generic `</>` favicon with a green release-tag silhouette so the tab icon reads as ReleaseBar at 16px and aligns with the release/version brand.

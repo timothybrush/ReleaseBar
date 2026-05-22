@@ -217,6 +217,23 @@ type GraphQLRepoPage = {
   errors?: Array<{ message?: string; type?: string }>;
 };
 
+type GraphQLRepoDetailNode = {
+  nameWithOwner: string;
+  defaultBranchRef: null | {
+    name: string;
+    target?: {
+      oid: string;
+      committedDate: string | null;
+      statusCheckRollup?: GitHubStatusCheckRollup | null;
+    } | null;
+  };
+};
+
+type GraphQLRepoDetailsPage = {
+  data?: Record<string, GraphQLRepoDetailNode | null>;
+  errors?: Array<{ message?: string; type?: string }>;
+};
+
 type ProjectCacheEntry = {
   signature: string;
   project: Omit<Project, "freshness">;
@@ -642,29 +659,6 @@ const ownerReposQuery = /* GraphQL */ `
               ... on Commit {
                 oid
                 committedDate
-                statusCheckRollup {
-                  state
-                  contexts(first: 100) {
-                    totalCount
-                    nodes {
-                      __typename
-                      ... on CheckRun {
-                        name
-                        status
-                        conclusion
-                        detailsUrl
-                        completedAt
-                        startedAt
-                      }
-                      ... on StatusContext {
-                        context
-                        state
-                        targetUrl
-                        createdAt
-                      }
-                    }
-                  }
-                }
               }
             }
           }
@@ -760,6 +754,109 @@ async function ownerReposGraphqlPage(
     : undefined;
   client.graphqlCursors.set(cursorKey, cursors);
   return repos;
+}
+
+function repoDetailsQuery(repos: GitHubRepo[]): string {
+  const fields = repos
+    .map((repo, index) => {
+      const [owner, name] = repo.full_name.split("/");
+      return `
+        r${index}: repository(owner: ${JSON.stringify(owner ?? "")}, name: ${JSON.stringify(
+          name ?? "",
+        )}) {
+          nameWithOwner
+          defaultBranchRef {
+            name
+            target {
+              ... on Commit {
+                oid
+                committedDate
+                statusCheckRollup {
+                  state
+                  contexts(first: 100) {
+                    totalCount
+                    nodes {
+                      __typename
+                      ... on CheckRun {
+                        name
+                        status
+                        conclusion
+                        detailsUrl
+                        completedAt
+                        startedAt
+                      }
+                      ... on StatusContext {
+                        context
+                        state
+                        targetUrl
+                        createdAt
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `;
+    })
+    .join("\n");
+  return `query ReleaseBarRepoDetails { ${fields} }`;
+}
+
+async function hydrateRepoDetailsGraphql(
+  client: GitHubClient,
+  repos: GitHubRepo[],
+): Promise<Map<string, Partial<GitHubRepo>>> {
+  const details = new Map<string, Partial<GitHubRepo>>();
+  const candidates = repos.filter((repo) => repo.full_name.includes("/"));
+  if (candidates.length === 0 || !client.headers.Authorization) return details;
+  const body = await githubGraphql<GraphQLRepoDetailsPage>(
+    client,
+    repoDetailsQuery(candidates),
+    {},
+  );
+  for (const node of Object.values(body?.data ?? {})) {
+    if (!node?.nameWithOwner) continue;
+    const target = node.defaultBranchRef?.target;
+    const detail: Partial<GitHubRepo> = {};
+    if (node.defaultBranchRef?.name) {
+      detail.default_branch = node.defaultBranchRef.name;
+    }
+    if (target && "oid" in target) {
+      detail.latest_commit = {
+        sha: target.oid,
+        commit: {
+          committer: {
+            date: target.committedDate ?? undefined,
+          },
+        },
+      };
+      if ("statusCheckRollup" in target) {
+        detail.status_check_rollup = target.statusCheckRollup ?? null;
+      }
+    }
+    details.set(node.nameWithOwner.toLowerCase(), detail);
+  }
+  return details;
+}
+
+async function hydrateRepoDetailsOrEmpty(
+  client: GitHubClient,
+  repos: GitHubRepo[],
+): Promise<Map<string, Partial<GitHubRepo>>> {
+  return hydrateRepoDetailsGraphql(client, repos).catch((error: unknown) => {
+    if (error instanceof GitHubRateLimitError) throw error;
+    return new Map<string, Partial<GitHubRepo>>();
+  });
+}
+
+function repoWithGraphqlDetails(
+  repo: GitHubRepo,
+  details: Map<string, Partial<GitHubRepo>>,
+): GitHubRepo {
+  const detail = details.get(repo.full_name.toLowerCase());
+  return detail ? { ...repo, ...detail } : repo;
 }
 
 async function githubCount(client: GitHubClient, pathname: string): Promise<number> {
@@ -1393,16 +1490,18 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             scanIncomplete = true;
           }
         }
+        const graphqlDetails = await hydrateRepoDetailsOrEmpty(client, hydrationBatch);
         for (const repo of hydrationBatch) {
+          const hydratedRepo = repoWithGraphqlDetails(repo, graphqlDetails);
           hydratedThisOwner += 1;
           scannedThisRun += 1;
-          await addRepo(repo, `${owner.login} ${ownerVisible}/${options.repoLimit}`);
+          await addRepo(hydratedRepo, `${owner.login} ${ownerVisible}/${options.repoLimit}`);
           const progressPayload = payload("partial");
           if (progressPayload.cache?.progress) {
             progressPayload.cache.progress.done = false;
           }
           await options.onProgress?.(progressPayload, {
-            scannedRepo: repo.full_name,
+            scannedRepo: hydratedRepo.full_name,
             scanned: skippedRepos.size + scannedThisRun,
             done: false,
             phase: "hydrate",
@@ -1415,9 +1514,23 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
         if (repos.length === 0) {
           break;
         }
+        const detailLimit = Number.isFinite(scanLimit)
+          ? Math.max(0, scanLimit - hydratedThisOwner)
+          : repos.length;
+        const graphqlDetails =
+          includeReleaseData && detailLimit > 0
+            ? await hydrateRepoDetailsOrEmpty(
+                client,
+                repos
+                  .filter((repo) => filterRepo(repo, options))
+                  .filter((repo) => !skippedRepos.has(repo.full_name.toLowerCase()))
+                  .slice(0, detailLimit),
+              )
+            : new Map<string, Partial<GitHubRepo>>();
         let exhaustedPage = false;
         let visibleAddedThisPage = 0;
         for (const [index, repo] of repos.entries()) {
+          const hydratedRepo = repoWithGraphqlDetails(repo, graphqlDetails);
           const fullName = repo.full_name.toLowerCase();
           if (!filterRepo(repo, options)) {
             continue;
@@ -1454,7 +1567,10 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
           }
           hydratedThisOwner += 1;
           scannedThisRun += 1;
-          const added = await addRepo(repo, `${owner.login} ${ownerVisible}/${options.repoLimit}`);
+          const added = await addRepo(
+            hydratedRepo,
+            `${owner.login} ${ownerVisible}/${options.repoLimit}`,
+          );
           if (added && !seededVisibleRow && existingIndex < 0) {
             ownerVisible += 1;
             visibleAddedThisPage += 1;
@@ -1470,7 +1586,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             progressPayload.cache.progress.done = false;
           }
           await options.onProgress?.(progressPayload, {
-            scannedRepo: repo.full_name,
+            scannedRepo: hydratedRepo.full_name,
             scanned: skippedRepos.size + scannedThisRun,
             done: false,
             phase: "hydrate",

@@ -7124,6 +7124,7 @@ test("dashboard build uses GraphQL owner metadata when token is available", asyn
     owners: [{ type: "user", login: "owner" }],
     includeForks: false,
     includeArchived: false,
+    includeUnreleased: true,
     repoLimit: 1,
     token: "token",
     fetch: async (url, init) => {
@@ -7132,6 +7133,47 @@ test("dashboard build uses GraphQL owner metadata when token is available", asyn
       requested.push(`${path}${parsed.search}`);
       if (path === "/graphql") {
         assert.equal(init?.method, "POST");
+        const body = JSON.parse(String(init.body ?? "{}")) as { query?: string };
+        if (body.query?.includes("ReleaseBarRepoDetails")) {
+          return Response.json({
+            data: {
+              r0: {
+                nameWithOwner: "owner/repo",
+                defaultBranchRef: {
+                  name: "main",
+                  target: {
+                    oid: "abcdef123456",
+                    committedDate: "2026-01-03T00:00:00Z",
+                    statusCheckRollup: {
+                      state: "SUCCESS",
+                      contexts: {
+                        totalCount: 2,
+                        nodes: [
+                          {
+                            __typename: "CheckRun",
+                            name: "test",
+                            status: "COMPLETED",
+                            conclusion: "SUCCESS",
+                            detailsUrl: "https://github.com/owner/repo/actions/runs/1",
+                            completedAt: "2026-01-03T00:10:00Z",
+                          },
+                          {
+                            __typename: "CheckRun",
+                            name: "lint",
+                            status: "COMPLETED",
+                            conclusion: "SUCCESS",
+                            detailsUrl: "https://github.com/owner/repo/actions/runs/2",
+                            completedAt: "2026-01-03T00:11:00Z",
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          });
+        }
         return Response.json({
           data: {
             repositoryOwner: {
@@ -7150,30 +7192,6 @@ test("dashboard build uses GraphQL owner metadata when token is available", asyn
                       target: {
                         oid: "abcdef123456",
                         committedDate: "2026-01-03T00:00:00Z",
-                        statusCheckRollup: {
-                          state: "SUCCESS",
-                          contexts: {
-                            totalCount: 2,
-                            nodes: [
-                              {
-                                __typename: "CheckRun",
-                                name: "test",
-                                status: "COMPLETED",
-                                conclusion: "SUCCESS",
-                                detailsUrl: "https://github.com/owner/repo/actions/runs/1",
-                                completedAt: "2026-01-03T00:10:00Z",
-                              },
-                              {
-                                __typename: "CheckRun",
-                                name: "lint",
-                                status: "COMPLETED",
-                                conclusion: "SUCCESS",
-                                detailsUrl: "https://github.com/owner/repo/actions/runs/2",
-                                completedAt: "2026-01-03T00:11:00Z",
-                              },
-                            ],
-                          },
-                        },
                       },
                     },
                     primaryLanguage: { name: "TypeScript" },
@@ -7242,6 +7260,129 @@ test("dashboard build uses GraphQL owner metadata when token is available", asyn
   );
   assert.equal(
     requested.some((path) => path.includes("/pulls")),
+    false,
+  );
+});
+
+test("dashboard released-only build uses GraphQL detail hydration for CI", async () => {
+  const requested: string[] = [];
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: false,
+    repoLimit: 1,
+    token: "token",
+    fetch: async (url, init) => {
+      const parsed = new URL(String(url));
+      const path = parsed.pathname;
+      requested.push(`${path}${parsed.search}`);
+      if (path === "/graphql") {
+        assert.equal(init?.method, "POST");
+        const body = JSON.parse(String(init.body ?? "{}")) as { query?: string };
+        if (body.query?.includes("ReleaseBarRepoDetails")) {
+          return Response.json({
+            data: {
+              r0: {
+                nameWithOwner: "owner/repo",
+                defaultBranchRef: {
+                  name: "main",
+                  target: {
+                    oid: "abcdef123456",
+                    committedDate: "2026-01-03T00:00:00Z",
+                    statusCheckRollup: {
+                      state: "SUCCESS",
+                      contexts: {
+                        totalCount: 1,
+                        nodes: [
+                          {
+                            __typename: "CheckRun",
+                            name: "test",
+                            status: "COMPLETED",
+                            conclusion: "SUCCESS",
+                            detailsUrl: "https://github.com/owner/repo/actions/runs/1",
+                            completedAt: "2026-01-03T00:10:00Z",
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          });
+        }
+        return Response.json({
+          data: {
+            repositoryOwner: {
+              __typename: "User",
+              repositories: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    owner: { login: "owner", __typename: "User" },
+                    name: "repo",
+                    nameWithOwner: "owner/repo",
+                    description: "GraphQL repo",
+                    url: "https://github.com/owner/repo",
+                    defaultBranchRef: {
+                      name: "main",
+                      target: {
+                        oid: "abcdef123456",
+                        committedDate: "2026-01-03T00:00:00Z",
+                      },
+                    },
+                    primaryLanguage: { name: "TypeScript" },
+                    stargazerCount: 42,
+                    forkCount: 2,
+                    issues: { totalCount: 7 },
+                    pullRequests: { totalCount: 3 },
+                    isArchived: false,
+                    isFork: false,
+                    isPrivate: false,
+                    pushedAt: "2026-01-03T00:00:00Z",
+                    updatedAt: "2026-01-03T00:00:00Z",
+                    releases: {
+                      nodes: [
+                        {
+                          tagName: "v1.0.0",
+                          name: null,
+                          url: "https://github.com/owner/repo/releases/tag/v1.0.0",
+                          isDraft: false,
+                          publishedAt: "2026-01-01T00:00:00Z",
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        });
+      }
+      if (path === "/repos/owner/repo/compare/v1.0.0...main") {
+        return Response.json({
+          total_commits: 4,
+          html_url: "https://github.com/owner/repo/compare/v1.0.0...main",
+        });
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+  });
+
+  assert.equal(payload.totals.repos, 1);
+  assert.equal(payload.projects[0]?.version, "v1.0.0");
+  assert.equal(payload.projects[0]?.ciState, "success");
+  assert.equal(payload.projects[0]?.ciWorkflow, "1/1 checks");
+  assert.equal(
+    requested.some((path) => path.includes("/commits/main")),
+    false,
+  );
+  assert.equal(
+    requested.some((path) => path.includes("/check-runs")),
     false,
   );
 });

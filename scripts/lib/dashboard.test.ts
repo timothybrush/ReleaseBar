@@ -5854,8 +5854,10 @@ test("worker login returns 503 when GitHub App is not configured", async () => {
 
 test("worker admin scheduler requires an admin session and reports refresh targets", async () => {
   const sessionId = "session-admin";
+  const otherSessionId = "session-admin-other";
   const exp = Math.floor(Date.now() / 1000) + 600;
   const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const otherAuthCookie = await signedJson("test-secret", { id: otherSessionId, exp });
   const target: RefreshTarget = {
     key: "dashboard:v5:owner=openclaw",
     kind: "dashboard",
@@ -5897,6 +5899,18 @@ test("worker admin scheduler requires an admin session and reports refresh targe
       iat: exp - 600,
       exp,
     }),
+    [`auth:session:${otherSessionId}`]: JSON.stringify({
+      user: {
+        id: 2,
+        login: "octocat",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/2",
+        url: "https://github.com/octocat",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
     [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
     [`refresh:job:v1:${activeJob.id}`]: JSON.stringify(activeJob),
     "refresh:jobs:index:v1": JSON.stringify([activeJob.id]),
@@ -5905,7 +5919,6 @@ test("worker admin scheduler requires an admin session and reports refresh targe
   const env = {
     AUTH_COOKIE_SECRET: "test-secret",
     DASHBOARD_CACHE: cache,
-    RELEASEBAR_ADMIN_LOGINS: "steipete",
     REFRESH_QUEUE: {
       async send(job: RefreshJob) {
         sentJobs.push(job);
@@ -5919,6 +5932,15 @@ test("worker admin scheduler requires an admin session and reports refresh targe
     { waitUntil: () => undefined },
   );
   assert.equal(anonymous.status, 401);
+
+  const nonAdmin = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler", {
+      headers: { cookie: `rd_session=${otherAuthCookie}` },
+    }),
+    env,
+    { waitUntil: () => undefined },
+  );
+  assert.equal(nonAdmin.status, 403);
 
   const response = await worker.fetch(
     new Request("https://release.bar/api/admin/scheduler", {
@@ -5992,7 +6014,6 @@ test("worker admin scheduler counts missing caches as due even before nextDueAt"
     {
       AUTH_COOKIE_SECRET: "test-secret",
       DASHBOARD_CACHE: cache,
-      RELEASEBAR_ADMIN_LOGINS: "steipete",
     },
     { waitUntil: () => undefined },
   );
@@ -6046,7 +6067,6 @@ test("worker scheduler marks jobs failed when queue delivery fails", async () =>
       {
         AUTH_COOKIE_SECRET: "test-secret",
         DASHBOARD_CACHE: cache,
-        RELEASEBAR_ADMIN_LOGINS: "steipete",
         REFRESH_QUEUE: {
           async send() {
             throw new Error("queue unavailable");

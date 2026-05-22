@@ -180,6 +180,7 @@
   $: repoSummaryRanges = repoDetail?.project.releaseDate
     ? [...activityRanges, { value: "release" as RepoActivityRange, label: "since release" }]
     : activityRanges;
+  $: isAdminUser = auth?.user?.login.toLowerCase() === "steipete";
   $: label = adminRoute
     ? "ReleaseBar Admin"
     : repoRoute
@@ -2145,9 +2146,6 @@
             <DropdownMenu.Item class="menu-action" onSelect={openSignedInUserDashboard}>
               My Dashboard
             </DropdownMenu.Item>
-            <DropdownMenu.Item class="menu-action" onSelect={() => location.assign("/_admin")}>
-              Admin
-            </DropdownMenu.Item>
             {#if !repoRoute}
               <DropdownMenu.Item class="menu-action" onSelect={() => (settingsOpen = !settingsOpen)}>
                 Settings
@@ -2236,6 +2234,9 @@
         </p>
         <p class="public-note">Only public GitHub repositories are listed, stored, and selectable.</p>
         <p class="connection-status">{connectionStatus}</p>
+        {#if isAdminUser}
+          <a class="settings-admin-link" href="/_admin">Admin</a>
+        {/if}
         <form class="source-form" onsubmit={handleSourceSubmit}>
           <input
             bind:value={sourceInput}
@@ -2301,7 +2302,7 @@
         <div class="error-state">
           <span class="loading-kicker">admin unavailable</span>
           <strong>{adminError}</strong>
-          <small>Admin access requires a signed-in account listed in RELEASEBAR_ADMIN_LOGINS.</small>
+          <small>Admin access requires signing in as @steipete.</small>
           {#if auth?.configured && !auth.user}
             <button type="button" onclick={login}>Connect GitHub</button>
           {/if}

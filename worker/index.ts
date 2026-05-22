@@ -132,7 +132,6 @@ type Env = {
   OPENAI_API_KEY?: string;
   OPENAI_SUMMARY_MODEL?: string;
   RELEASEDECK_CANONICAL_DOMAIN?: string;
-  RELEASEBAR_ADMIN_LOGINS?: string;
   REFRESH_QUEUE?: Queue<RefreshJob>;
 };
 
@@ -1921,13 +1920,8 @@ function authDependentAppShellHeaders(request: Request, env: Env): Record<string
     : { "cache-control": "public, max-age=300" };
 }
 
-function adminLoginSet(env: Env): Set<string> {
-  return new Set(
-    (env.RELEASEBAR_ADMIN_LOGINS || "steipete")
-      .split(",")
-      .map((login) => login.trim().toLowerCase())
-      .filter(Boolean),
-  );
+function isAdminLogin(login: string): boolean {
+  return login.toLowerCase() === "steipete";
 }
 
 async function requireAdmin(request: Request, env: Env): Promise<StoredAuthSession | Response> {
@@ -1935,7 +1929,7 @@ async function requireAdmin(request: Request, env: Env): Promise<StoredAuthSessi
   if (!session) {
     return jsonResponse({ error: "login required" }, 401, { "cache-control": "no-store" });
   }
-  if (!adminLoginSet(env).has(session.user.login.toLowerCase())) {
+  if (!isAdminLogin(session.user.login)) {
     return jsonResponse({ error: "admin required" }, 403, { "cache-control": "no-store" });
   }
   return session;

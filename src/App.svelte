@@ -52,9 +52,14 @@
     RepoDetailActivityPayload,
     RepoDetailPayload,
     RepoDetailReleaseSummary,
+    RefreshJob,
+    RefreshTarget,
+    SchedulerAdminPayload,
+    SchedulerAuditEvent,
     TrustProfilePayload,
   } from "./types.js";
 
+  const adminRoute = location.pathname === "/_admin";
   const repoRoute = repoFromPath(location.pathname);
   const initialRoute = dashboardRoute(location.pathname, location.search);
   type InitialPageData =
@@ -88,7 +93,7 @@
   const hiddenReposKey = `releasedeck:${routeScope}:hidden-repos`;
 
   let data: DashboardPayload | null =
-    !repoRoute && embedded?.route === "dashboard" ? embedded.payload : null;
+    !adminRoute && !repoRoute && embedded?.route === "dashboard" ? embedded.payload : null;
   let repoDetail: RepoDetailPayload | null =
     repoRoute && embedded?.route === "repo" ? embedded.payload : null;
   let auth: AuthPayload | null = null;
@@ -138,6 +143,10 @@
   let audienceBackfillMessage = "";
   let audienceRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let ownerTab: "overview" | "trust" = initialOwnerTab;
+  let admin: SchedulerAdminPayload | null = null;
+  let adminLoading = false;
+  let adminError = "";
+  let adminActionMessage = "";
 
   const numberFormat = new Intl.NumberFormat("en", { notation: "compact" });
   const dateFormat = new Intl.DateTimeFormat("en", {
@@ -171,10 +180,18 @@
   $: repoSummaryRanges = repoDetail?.project.releaseDate
     ? [...activityRanges, { value: "release" as RepoActivityRange, label: "since release" }]
     : activityRanges;
-  $: label = repoRoute ? (repoDetail?.fullName ?? repoRoute.fullName) : data ? ownerLabel(data) : initialRoute.label;
+  $: label = adminRoute
+    ? "ReleaseBar Admin"
+    : repoRoute
+      ? (repoDetail?.fullName ?? repoRoute.fullName)
+      : data
+        ? ownerLabel(data)
+        : initialRoute.label;
   $: heroOwner = ownerHero(data);
   $: heroExtraCount = initialRoute.extraOwners.length + initialRoute.repos.length;
-  $: subtitle = repoRoute
+  $: subtitle = adminRoute
+    ? "Scheduler, refresh jobs, and cache health."
+    : repoRoute
     ? (repoDetail?.project.description ?? "Repository release and activity detail.")
     : data?.subtitle ?? "Release debt across recently requested public dashboards.";
   $: repoActionUrl = repoRoute
@@ -1409,6 +1426,80 @@
     }
   }
 
+  async function loadAdmin(): Promise<void> {
+    if (!adminRoute) return;
+    adminLoading = !admin;
+    adminError = "";
+    try {
+      const response = await fetch("/api/admin/scheduler", { cache: "no-store" });
+      const body = (await response.json().catch(() => null)) as
+        | SchedulerAdminPayload
+        | { error?: string }
+        | null;
+      if (response.ok && body && "status" in body) {
+        admin = body;
+        generatedLabel = `scheduler · ${numberFormat.format(body.status.targets)} targets`;
+        generatedDetail = [
+          `${numberFormat.format(body.status.dueTargets)} due`,
+          `${numberFormat.format(body.status.runningJobs)} running`,
+          body.status.queueConfigured ? "queue configured" : "direct fallback",
+        ].join(" · ");
+        return;
+      }
+      throw new Error(
+        body && "error" in body ? (body.error ?? "") : `admin fetch failed: ${response.status}`,
+      );
+    } catch (error) {
+      adminError = error instanceof Error ? error.message : String(error);
+      generatedLabel = "admin unavailable";
+      generatedDetail = adminError;
+    } finally {
+      adminLoading = false;
+    }
+  }
+
+  async function runScheduler(): Promise<void> {
+    if (!adminRoute) return;
+    adminActionMessage = "scheduler running";
+    try {
+      const response = await fetch("/api/admin/scheduler/run", {
+        method: "POST",
+        cache: "no-store",
+      });
+      const body = (await response.json().catch(() => null)) as
+        | { ok?: boolean; enqueued?: number; due?: number; considered?: number; error?: string }
+        | null;
+      if (!response.ok || !body?.ok) {
+        throw new Error(body?.error ?? `scheduler failed: ${response.status}`);
+      }
+      adminActionMessage = `${numberFormat.format(body.enqueued ?? 0)} jobs enqueued · ${numberFormat.format(body.due ?? 0)} due`;
+      await loadAdmin();
+    } catch (error) {
+      adminActionMessage = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  function adminAge(value: string | null): string {
+    return value ? relativeDate(value) : "never";
+  }
+
+  function adminTargetSources(target: RefreshTarget): string {
+    const owners = target.owners.map((owner) => `@${owner}`);
+    return [...owners, ...target.repos].join(", ") || target.owner;
+  }
+
+  function adminJobLabel(job: RefreshJob): string {
+    return [job.status, job.reason, job.durationMs === null ? "" : `${numberFormat.format(job.durationMs)}ms`]
+      .filter(Boolean)
+      .join(" · ");
+  }
+
+  function adminEventLabel(event: SchedulerAuditEvent): string {
+    return [event.status, event.reason, event.account ? `@${event.account}` : "", event.detail]
+      .filter(Boolean)
+      .join(" · ");
+  }
+
   async function loadDashboard(attempt = 0): Promise<void> {
     const forceRefresh = new URLSearchParams(location.search).has("rdRefresh");
     const bypassCache = attempt > 0 || forceRefresh;
@@ -1868,6 +1959,9 @@
       paletteText = value.textInput;
     });
     const routeTask = (() => {
+      if (adminRoute) {
+        return loadAdmin();
+      }
       if (repoRoute && repoDetail) {
         if (!repoDetail.project.releaseDate && repoSummaryRange === "release") {
           repoSummaryRange = "month";
@@ -1902,9 +1996,9 @@
     void Promise.all([
       loadAuth(),
       routeTask,
-      showTrustProfile ? loadTrustProfile() : Promise.resolve(),
-      repoRoute ? loadRepoAudience() : Promise.resolve(),
-      showOwnerActivity ? loadOwnerActivity() : Promise.resolve(),
+      !adminRoute && showTrustProfile ? loadTrustProfile() : Promise.resolve(),
+      !adminRoute && repoRoute ? loadRepoAudience() : Promise.resolve(),
+      !adminRoute && showOwnerActivity ? loadOwnerActivity() : Promise.resolve(),
     ]).catch((error) => {
       generatedLabel = "failed";
       generatedDetail = error instanceof Error ? error.message : String(error);
@@ -2050,6 +2144,9 @@
           <DropdownMenu.Content class="account-dropdown" align="end" sideOffset={8} loop>
             <DropdownMenu.Item class="menu-action" onSelect={openSignedInUserDashboard}>
               My Dashboard
+            </DropdownMenu.Item>
+            <DropdownMenu.Item class="menu-action" onSelect={() => location.assign("/_admin")}>
+              Admin
             </DropdownMenu.Item>
             {#if !repoRoute}
               <DropdownMenu.Item class="menu-action" onSelect={() => (settingsOpen = !settingsOpen)}>
@@ -2198,7 +2295,154 @@
     </div>
   {/if}
 
-  {#if repoRoute}
+  {#if adminRoute}
+    <section class="admin-console" aria-label="Scheduler admin">
+      {#if adminError}
+        <div class="error-state">
+          <span class="loading-kicker">admin unavailable</span>
+          <strong>{adminError}</strong>
+          <small>Admin access requires a signed-in account listed in RELEASEBAR_ADMIN_LOGINS.</small>
+          {#if auth?.configured && !auth.user}
+            <button type="button" onclick={login}>Connect GitHub</button>
+          {/if}
+        </div>
+      {:else if adminLoading && !admin}
+        <div class="loading-state" aria-live="polite">
+          <span class="loading-kicker">scheduler</span>
+          <strong>loading status</strong>
+          <small>Reading refresh targets, recent jobs, and audit events.</small>
+          <div class="loading-bars" aria-hidden="true">
+            <span></span>
+            <span></span>
+            <span></span>
+          </div>
+        </div>
+      {:else if admin}
+        <div class="admin-toolbar">
+          <div>
+            <span class="panel-kicker">scheduler</span>
+            <strong>{admin.status.queueConfigured ? "queue backed" : "direct fallback"}</strong>
+            <small>
+              last tick {adminAge(admin.status.lastTickAt)} · next due {adminAge(admin.status.nextDueAt)}
+            </small>
+          </div>
+          <div class="admin-actions">
+            <button type="button" disabled={adminLoading} onclick={loadAdmin}>refresh</button>
+            <button type="button" disabled={adminLoading} onclick={runScheduler}>run now</button>
+          </div>
+        </div>
+        {#if adminActionMessage}
+          <p class="admin-message">{adminActionMessage}</p>
+        {/if}
+        <div class="admin-metrics">
+          <div>
+            <span>targets</span>
+            <strong>{numberFormat.format(admin.status.targets)}</strong>
+          </div>
+          <div>
+            <span>due</span>
+            <strong>{numberFormat.format(admin.status.dueTargets)}</strong>
+          </div>
+          <div>
+            <span>queued</span>
+            <strong>{numberFormat.format(admin.status.queuedJobs)}</strong>
+          </div>
+          <div>
+            <span>running</span>
+            <strong>{numberFormat.format(admin.status.runningJobs)}</strong>
+          </div>
+          <div>
+            <span>failed</span>
+            <strong>{numberFormat.format(admin.status.failedJobs)}</strong>
+          </div>
+        </div>
+        <div class="admin-grid">
+          <section class="admin-panel admin-wide">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-kicker">refresh targets</span>
+                <h2>stale first</h2>
+              </div>
+              <strong>{numberFormat.format(admin.targets.length)}</strong>
+            </div>
+            <div class="admin-list">
+              {#each admin.targets as target}
+                <div class="admin-row">
+                  <span>
+                    <strong>{adminTargetSources(target)}</strong>
+                    <small>
+                      {target.includeReleaseData ? "release data" : "metadata"} · seen {adminAge(target.lastSeenAt)}
+                    </small>
+                  </span>
+                  <span>
+                    <strong>due {adminAge(target.nextDueAt)}</strong>
+                    <small>
+                      success {adminAge(target.lastSuccessAt)} · failures {numberFormat.format(target.failureCount)}
+                    </small>
+                  </span>
+                </div>
+              {/each}
+              {#if admin.targets.length === 0}
+                <p class="detail-empty">No refresh targets recorded yet. Open an owner dashboard to seed one.</p>
+              {/if}
+            </div>
+          </section>
+
+          <section class="admin-panel">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-kicker">jobs</span>
+                <h2>recent</h2>
+              </div>
+            </div>
+            <div class="admin-list compact">
+              {#each admin.jobs as job}
+                <div class={`admin-row status-${job.status}`}>
+                  <span>
+                    <strong>{job.targetKey.replace(/^dashboard:v\d+:/, "")}</strong>
+                    <small>{adminJobLabel(job)}</small>
+                  </span>
+                  <span>
+                    <strong>{adminAge(job.updatedAt)}</strong>
+                    <small>{job.error ?? `attempts ${numberFormat.format(job.attempts)}`}</small>
+                  </span>
+                </div>
+              {/each}
+              {#if admin.jobs.length === 0}
+                <p class="detail-empty">No refresh jobs yet.</p>
+              {/if}
+            </div>
+          </section>
+
+          <section class="admin-panel">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-kicker">audit</span>
+                <h2>events</h2>
+              </div>
+            </div>
+            <div class="admin-list compact">
+              {#each admin.events as event}
+                <div class="admin-row">
+                  <span>
+                    <strong>{event.event}</strong>
+                    <small>{adminEventLabel(event) || event.targetKey || event.jobId || "scheduler"}</small>
+                  </span>
+                  <span>
+                    <strong>{adminAge(event.at)}</strong>
+                    <small>{event.jobId ?? event.targetKey ?? event.id}</small>
+                  </span>
+                </div>
+              {/each}
+              {#if admin.events.length === 0}
+                <p class="detail-empty">No audit events yet.</p>
+              {/if}
+            </div>
+          </section>
+        </div>
+      {/if}
+    </section>
+  {:else if repoRoute}
     <section class="repo-detail" aria-label="Repository detail">
       {#if errorMessage}
         <div class="error-state">

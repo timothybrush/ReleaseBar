@@ -42,6 +42,9 @@ import type {
   RepoAudiencePayload,
   RepoDetailActivityPayload,
   RepoDetailPayload,
+  RefreshJob,
+  RefreshTarget,
+  SchedulerAdminPayload,
   TrustProfilePayload,
 } from "../../src/types.js";
 import worker, { DashboardBuildLock, dashboardStreamSignature } from "../../worker/index.js";
@@ -5847,6 +5850,327 @@ test("worker login returns 503 when GitHub App is not configured", async () => {
     { waitUntil: () => undefined },
   );
   assert.equal(response.status, 503);
+});
+
+test("worker admin scheduler requires an admin session and reports refresh targets", async () => {
+  const sessionId = "session-admin";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const target: RefreshTarget = {
+    key: "dashboard:v5:owner=openclaw",
+    kind: "dashboard",
+    owner: "openclaw",
+    owners: ["openclaw"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/openclaw",
+    priority: 100,
+    lastSeenAt: "2026-05-15T12:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-05-15T13:00:00Z",
+    failureCount: 0,
+  };
+  const activeJob: RefreshJob = {
+    id: "job-active",
+    targetKey: target.key,
+    kind: "dashboard",
+    status: "queued",
+    reason: "scheduled",
+    createdAt: "2026-05-15T12:59:00Z",
+    updatedAt: "2026-05-15T12:59:00Z",
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+    [`refresh:job:v1:${activeJob.id}`]: JSON.stringify(activeJob),
+    "refresh:jobs:index:v1": JSON.stringify([activeJob.id]),
+  });
+  const sentJobs: RefreshJob[] = [];
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: cache,
+    RELEASEBAR_ADMIN_LOGINS: "steipete",
+    REFRESH_QUEUE: {
+      async send(job: RefreshJob) {
+        sentJobs.push(job);
+      },
+    },
+  };
+
+  const anonymous = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler"),
+    env,
+    { waitUntil: () => undefined },
+  );
+  assert.equal(anonymous.status, 401);
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler", {
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    env,
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as SchedulerAdminPayload;
+  assert.equal(body.status.targets, 1);
+  assert.equal(body.status.dueTargets, 0);
+  assert.equal(body.status.queuedJobs, 1);
+  assert.equal(body.targets[0]?.owner, "openclaw");
+
+  const run = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler/run", {
+      method: "POST",
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    env,
+    { waitUntil: () => undefined },
+  );
+  assert.equal(run.status, 200);
+  const runBody = (await run.json()) as { enqueued: number; due: number };
+  assert.equal(runBody.enqueued, 0);
+  assert.equal(runBody.due, 0);
+  assert.deepEqual(sentJobs, []);
+});
+
+test("worker admin scheduler counts missing caches as due even before nextDueAt", async () => {
+  const sessionId = "session-admin-due";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const target: RefreshTarget = {
+    key: "dashboard:v5:owner=openclaw",
+    kind: "dashboard",
+    owner: "openclaw",
+    owners: ["openclaw"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/openclaw",
+    priority: 100,
+    lastSeenAt: "2026-05-15T12:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler", {
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    {
+      AUTH_COOKIE_SECRET: "test-secret",
+      DASHBOARD_CACHE: cache,
+      RELEASEBAR_ADMIN_LOGINS: "steipete",
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as SchedulerAdminPayload;
+  assert.equal(body.status.dueTargets, 1);
+});
+
+test("worker scheduler marks jobs failed when queue delivery fails", async () => {
+  const sessionId = "session-admin-queue-failure";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const target: RefreshTarget = {
+    key: "dashboard:v5:owner=openclaw",
+    kind: "dashboard",
+    owner: "openclaw",
+    owners: ["openclaw"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/openclaw",
+    priority: 100,
+    lastSeenAt: "2026-05-15T12:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-05-15T13:00:00Z",
+    failureCount: 0,
+  };
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+  });
+
+  await assert.rejects(
+    worker.fetch(
+      new Request("https://release.bar/api/admin/scheduler/run", {
+        method: "POST",
+        headers: { cookie: `rd_session=${authCookie}` },
+      }),
+      {
+        AUTH_COOKIE_SECRET: "test-secret",
+        DASHBOARD_CACHE: cache,
+        RELEASEBAR_ADMIN_LOGINS: "steipete",
+        REFRESH_QUEUE: {
+          async send() {
+            throw new Error("queue unavailable");
+          },
+        },
+      },
+      { waitUntil: () => undefined },
+    ),
+    /queue unavailable/,
+  );
+
+  const ids = JSON.parse((await cache.get("refresh:jobs:index:v1")) ?? "[]") as string[];
+  assert.equal(ids.length, 1);
+  const stored = JSON.parse((await cache.get(`refresh:job:v1:${ids[0]}`)) ?? "{}") as RefreshJob;
+  assert.equal(stored.status, "failed");
+  assert.match(stored.error ?? "", /queue unavailable/);
+});
+
+test("worker refresh jobs can use shared quota when no source app token exists", async () => {
+  const key = dashboardCacheKey({
+    owner: "openclaw",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 5,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "openclaw",
+    owners: ["openclaw"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/openclaw",
+    priority: 100,
+    lastSeenAt: "2026-05-15T12:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-05-15T13:00:00Z",
+    failureCount: 0,
+  };
+  const job: RefreshJob = {
+    id: "job-shared",
+    targetKey: key,
+    kind: "dashboard",
+    status: "queued",
+    reason: "scheduled",
+    createdAt: "2026-05-15T13:00:00Z",
+    updatedAt: "2026-05-15T13:00:00Z",
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const cache = kvStore({
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+    [`refresh:job:v1:${job.id}`]: JSON.stringify(job),
+  });
+  const originalFetch = globalThis.fetch;
+  const paths: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    paths.push(url.pathname);
+    assert.equal(new Headers(init?.headers).get("authorization"), "Bearer shared-token");
+    if (url.pathname === "/users/openclaw") {
+      return Response.json({ login: "openclaw", type: "Organization" });
+    }
+    if (url.pathname === "/graphql") {
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "Organization",
+            repositories: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [],
+            },
+          },
+        },
+      });
+    }
+    if (url.pathname === "/orgs/openclaw/repos") {
+      return Response.json([]);
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  let acked = false;
+  try {
+    await (
+      worker as unknown as {
+        queue(
+          batch: {
+            messages: Array<{
+              body: RefreshJob;
+              ack(): void;
+              retry(options?: { delaySeconds?: number }): void;
+            }>;
+          },
+          env: unknown,
+          context: unknown,
+        ): Promise<void>;
+      }
+    ).queue(
+      {
+        messages: [
+          {
+            body: job,
+            ack() {
+              acked = true;
+            },
+            retry() {
+              throw new Error("job should not retry");
+            },
+          },
+        ],
+      },
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(acked, true);
+  const updated = JSON.parse((await cache.get(`refresh:job:v1:${job.id}`)) ?? "{}") as RefreshJob;
+  assert.equal(updated.status, "succeeded");
+  assert.deepEqual(paths, ["/users/openclaw", "/graphql"]);
 });
 
 test("safeReturnTo accepts the current request origin, including workers.dev", async () => {

@@ -72,6 +72,10 @@ import type {
   RepoDetailPayload,
   RepoDetailReleaseSummary,
   RepoDetailWorkTrend,
+  RefreshJob,
+  RefreshTarget,
+  SchedulerAdminPayload,
+  SchedulerAuditEvent,
   AudienceScoreFactor,
   TrustProfilePayload,
 } from "../src/types.js";
@@ -98,6 +102,14 @@ type DurableObjectNamespace = {
   get(id: DurableObjectId): DurableObjectStub;
 };
 
+type Queue<Message = unknown> = {
+  send(message: Message, options?: { delaySeconds?: number }): Promise<void>;
+};
+
+type MessageBatch<Message = unknown> = {
+  messages: Array<{ body: Message; ack(): void; retry(options?: { delaySeconds?: number }): void }>;
+};
+
 type DurableObjectState = {
   storage: {
     get<T>(key: string): Promise<T | undefined>;
@@ -120,10 +132,17 @@ type Env = {
   OPENAI_API_KEY?: string;
   OPENAI_SUMMARY_MODEL?: string;
   RELEASEDECK_CANONICAL_DOMAIN?: string;
+  RELEASEBAR_ADMIN_LOGINS?: string;
+  REFRESH_QUEUE?: Queue<RefreshJob>;
 };
 
 type ExecutionContext = {
   waitUntil(promise: Promise<unknown>): void;
+};
+
+type ScheduledEvent = {
+  cron: string;
+  scheduledTime: number;
 };
 
 type UserTrustSignal = {
@@ -177,6 +196,19 @@ const dashboardCachePrefixes = [dashboardCachePrefix, previousDashboardCachePref
 const hotCacheKey = `hot:v${auxiliaryCacheSchemaVersion}`;
 const hotIndexKey = `hot:index:v${auxiliaryCacheSchemaVersion}`;
 const socialRepoCachePrefix = `social-repo:v${auxiliaryCacheSchemaVersion}:`;
+const refreshTargetPrefix = `refresh:target:v1:`;
+const refreshJobPrefix = `refresh:job:v1:`;
+const refreshJobIndexKey = `refresh:jobs:index:v1`;
+const refreshAuditIndexKey = `refresh:audit:index:v1`;
+const refreshStateKey = `refresh:state:v1`;
+const refreshTargetListLimit = 5000;
+const refreshJobListLimit = 80;
+const refreshAuditListLimit = 80;
+const schedulerBatchLimit = 20;
+const schedulerRecentViewMs = 7 * 24 * 60 * 60 * 1000;
+const schedulerActiveRefreshMs = 6 * 60 * 60 * 1000;
+const schedulerDormantRefreshMs = 24 * 60 * 60 * 1000;
+const schedulerRetryBaseMs = 30 * 60 * 1000;
 const sessionCookie = "rd_session";
 const installReturnCookie = "rd_install_return";
 const sessionMaxAgeSeconds = 30 * 24 * 60 * 60;
@@ -389,15 +421,37 @@ async function writeInstallationRegistry(
   installations: AuthInstallation[],
 ): Promise<void> {
   if (!env.DASHBOARD_CACHE) return;
+  const normalized = installations.map(normalizedInstallation);
   await Promise.all(
-    installations.map((installation) => {
-      const normalized = normalizedInstallation(installation);
+    normalized.map((installation) => {
       return env.DASHBOARD_CACHE!.put(
-        installationRegistryKey(normalized.accountLogin),
-        JSON.stringify(normalized),
+        installationRegistryKey(installation.accountLogin),
+        JSON.stringify(installation),
         { expirationTtl: dashboardStorageTtlSeconds },
       );
     }),
+  );
+  await Promise.all(
+    normalized
+      .filter((installation) => installation.repositorySelection === "all")
+      .map((installation) =>
+        rememberRefreshTarget(env, {
+          key: dashboardCacheKey({
+            owner: installation.accountLogin,
+            includeForks: false,
+            includeArchived: false,
+            includeUnreleased: true,
+            includeReleaseData: true,
+            schemaVersion: dashboardSchemaVersion,
+          }),
+          owner: installation.accountLogin,
+          owners: [installation.accountLogin],
+          repos: [],
+          includeReleaseData: true,
+          path: `/${installation.accountLogin}`,
+          priority: 80,
+        }),
+      ),
   );
 }
 
@@ -742,6 +796,7 @@ async function initialPageData(
   url: URL,
   env: Env,
 ): Promise<InitialPageData | null> {
+  if (url.pathname === "/_admin") return null;
   const repo = repoFullNameFromPath(url.pathname);
   if (repo) return cachedRepoInitialData(env, repo);
 
@@ -821,6 +876,7 @@ async function assetResponse(request: Request, env: Env): Promise<Response> {
 }
 
 function socialLabel(url: URL): string {
+  if (url.pathname === "/_admin") return "ReleaseBar Admin";
   const repo = repoFullNameFromPath(url.pathname);
   if (repo) return repo;
   const owner = slugOwner(url.pathname.split("/").filter(Boolean)[0] ?? "");
@@ -1865,6 +1921,26 @@ function authDependentAppShellHeaders(request: Request, env: Env): Record<string
     : { "cache-control": "public, max-age=300" };
 }
 
+function adminLoginSet(env: Env): Set<string> {
+  return new Set(
+    (env.RELEASEBAR_ADMIN_LOGINS || "steipete")
+      .split(",")
+      .map((login) => login.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+async function requireAdmin(request: Request, env: Env): Promise<StoredAuthSession | Response> {
+  const session = await currentSession(request, env);
+  if (!session) {
+    return jsonResponse({ error: "login required" }, 401, { "cache-control": "no-store" });
+  }
+  if (!adminLoginSet(env).has(session.user.login.toLowerCase())) {
+    return jsonResponse({ error: "admin required" }, 403, { "cache-control": "no-store" });
+  }
+  return session;
+}
+
 function normalizePrivateKey(value: string): string {
   return value.includes("\\n") ? value.replaceAll("\\n", "\n") : value;
 }
@@ -2451,6 +2527,495 @@ async function writeCached(
   await env.DASHBOARD_CACHE?.put(key, JSON.stringify(payload), {
     expirationTtl: ttlSeconds,
   });
+}
+
+function safeIso(value: string | null | undefined): number {
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function refreshTargetStorageKey(key: string): string {
+  return `${refreshTargetPrefix}${key}`;
+}
+
+function refreshJobStorageKey(id: string): string {
+  return `${refreshJobPrefix}${id}`;
+}
+
+function jitterMs(seed: string, windowMs: number): number {
+  let hash = 0;
+  for (const char of seed) {
+    hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  }
+  return hash % Math.max(1, windowMs);
+}
+
+function nextRefreshAt(target: RefreshTarget, success: boolean): string {
+  const now = Date.now();
+  if (!success) {
+    const failureDelay = schedulerRetryBaseMs * Math.max(1, Math.min(target.failureCount + 1, 8));
+    return new Date(now + failureDelay + jitterMs(target.key, 15 * 60 * 1000)).toISOString();
+  }
+  const recentlyViewed = now - safeIso(target.lastSeenAt) < schedulerRecentViewMs;
+  const base = recentlyViewed ? schedulerActiveRefreshMs : schedulerDormantRefreshMs;
+  return new Date(now + base + jitterMs(target.key, Math.floor(base / 3))).toISOString();
+}
+
+function isRefreshTarget(value: unknown): value is RefreshTarget {
+  const target = value as RefreshTarget | null;
+  return Boolean(
+    target &&
+    target.kind === "dashboard" &&
+    typeof target.key === "string" &&
+    typeof target.owner === "string" &&
+    Array.isArray(target.owners) &&
+    Array.isArray(target.repos) &&
+    typeof target.path === "string" &&
+    typeof target.nextDueAt === "string",
+  );
+}
+
+function isRefreshJob(value: unknown): value is RefreshJob {
+  const job = value as RefreshJob | null;
+  return Boolean(
+    job &&
+    job.kind === "dashboard" &&
+    typeof job.id === "string" &&
+    typeof job.targetKey === "string" &&
+    typeof job.status === "string",
+  );
+}
+
+function isAuditEvent(value: unknown): value is SchedulerAuditEvent {
+  const event = value as SchedulerAuditEvent | null;
+  return Boolean(event && typeof event.id === "string" && typeof event.event === "string");
+}
+
+async function readRefreshTarget(env: Env, key: string): Promise<RefreshTarget | null> {
+  const raw = await env.DASHBOARD_CACHE?.get(refreshTargetStorageKey(key));
+  if (!raw) return null;
+  const parsed = tryJsonParse<RefreshTarget>(raw, `refresh target ${key}`);
+  return isRefreshTarget(parsed) ? parsed : null;
+}
+
+async function writeRefreshTarget(env: Env, target: RefreshTarget): Promise<void> {
+  await env.DASHBOARD_CACHE?.put(refreshTargetStorageKey(target.key), JSON.stringify(target), {
+    expirationTtl: dashboardStorageTtlSeconds,
+  });
+}
+
+async function rememberRefreshTarget(
+  env: Env,
+  input: Pick<
+    RefreshTarget,
+    "key" | "owner" | "owners" | "repos" | "includeReleaseData" | "path" | "priority"
+  >,
+): Promise<void> {
+  if (!env.DASHBOARD_CACHE) return;
+  const now = new Date().toISOString();
+  const existing = await readRefreshTarget(env, input.key);
+  await writeRefreshTarget(env, {
+    ...input,
+    kind: "dashboard",
+    lastSeenAt: now,
+    lastAttemptAt: existing?.lastAttemptAt ?? null,
+    lastSuccessAt: existing?.lastSuccessAt ?? null,
+    nextDueAt:
+      existing?.nextDueAt ??
+      new Date(Date.now() + jitterMs(input.key, 60 * 60 * 1000)).toISOString(),
+    failureCount: existing?.failureCount ?? 0,
+    message: existing?.message,
+  });
+}
+
+async function listRefreshTargets(
+  env: Env,
+  limit = refreshTargetListLimit,
+): Promise<RefreshTarget[]> {
+  if (!env.DASHBOARD_CACHE?.list) return [];
+  const targets: RefreshTarget[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await env.DASHBOARD_CACHE.list({
+      prefix: refreshTargetPrefix,
+      limit: Math.min(1000, limit - targets.length),
+      ...(cursor ? { cursor } : {}),
+    });
+    for (const key of page.keys) {
+      const raw = await env.DASHBOARD_CACHE.get(key.name);
+      if (!raw) continue;
+      const target = tryJsonParse<RefreshTarget>(raw, `refresh target ${key.name}`);
+      if (isRefreshTarget(target)) targets.push(target);
+      if (targets.length >= limit) break;
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor && targets.length < limit);
+  return targets;
+}
+
+async function readStringList(env: Env, key: string): Promise<string[]> {
+  const raw = await env.DASHBOARD_CACHE?.get(key);
+  if (!raw) return [];
+  const parsed = tryJsonParse<string[]>(raw, key);
+  return Array.isArray(parsed)
+    ? parsed.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+async function writeStringList(
+  env: Env,
+  key: string,
+  values: string[],
+  limit: number,
+): Promise<void> {
+  await env.DASHBOARD_CACHE?.put(key, JSON.stringify([...new Set(values)].slice(0, limit)), {
+    expirationTtl: dashboardStorageTtlSeconds,
+  });
+}
+
+async function writeRefreshJob(env: Env, job: RefreshJob): Promise<void> {
+  await env.DASHBOARD_CACHE?.put(refreshJobStorageKey(job.id), JSON.stringify(job), {
+    expirationTtl: 14 * 24 * 60 * 60,
+  });
+  const ids = await readStringList(env, refreshJobIndexKey);
+  await writeStringList(
+    env,
+    refreshJobIndexKey,
+    [job.id, ...ids.filter((id) => id !== job.id)],
+    refreshJobListLimit,
+  );
+}
+
+async function readRefreshJob(env: Env, id: string): Promise<RefreshJob | null> {
+  const raw = await env.DASHBOARD_CACHE?.get(refreshJobStorageKey(id));
+  if (!raw) return null;
+  const parsed = tryJsonParse<RefreshJob>(raw, `refresh job ${id}`);
+  return isRefreshJob(parsed) ? parsed : null;
+}
+
+async function listRefreshJobs(env: Env): Promise<RefreshJob[]> {
+  const ids = await readStringList(env, refreshJobIndexKey);
+  const jobs = (await Promise.all(ids.map((id) => readRefreshJob(env, id)))).filter(
+    (job): job is RefreshJob => Boolean(job),
+  );
+  return jobs.sort((a, b) => safeIso(b.updatedAt) - safeIso(a.updatedAt));
+}
+
+async function auditScheduler(
+  env: Env,
+  event: Omit<SchedulerAuditEvent, "id" | "at">,
+): Promise<void> {
+  const item: SchedulerAuditEvent = {
+    id: randomNonce(),
+    at: new Date().toISOString(),
+    ...event,
+  };
+  console.log(JSON.stringify({ area: "scheduler", ...item }));
+  await env.DASHBOARD_CACHE?.put(`refresh:audit:v1:${item.id}`, JSON.stringify(item), {
+    expirationTtl: 14 * 24 * 60 * 60,
+  });
+  const ids = await readStringList(env, refreshAuditIndexKey);
+  await writeStringList(
+    env,
+    refreshAuditIndexKey,
+    [item.id, ...ids.filter((id) => id !== item.id)],
+    refreshAuditListLimit,
+  );
+}
+
+async function listAuditEvents(env: Env): Promise<SchedulerAuditEvent[]> {
+  const ids = await readStringList(env, refreshAuditIndexKey);
+  const events = await Promise.all(
+    ids.map(async (id) => {
+      const raw = await env.DASHBOARD_CACHE?.get(`refresh:audit:v1:${id}`);
+      if (!raw) return null;
+      const parsed = tryJsonParse<SchedulerAuditEvent>(raw, `refresh audit ${id}`);
+      return isAuditEvent(parsed) ? parsed : null;
+    }),
+  );
+  return events
+    .filter((event): event is SchedulerAuditEvent => Boolean(event))
+    .sort((a, b) => safeIso(b.at) - safeIso(a.at));
+}
+
+function refreshJob(target: RefreshTarget, reason: string): RefreshJob {
+  const now = new Date().toISOString();
+  return {
+    id: randomNonce(),
+    targetKey: target.key,
+    kind: target.kind,
+    status: "queued",
+    reason,
+    createdAt: now,
+    updatedAt: now,
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+}
+
+async function enqueueRefreshJob(
+  env: Env,
+  context: ExecutionContext,
+  target: RefreshTarget,
+  reason: string,
+): Promise<RefreshJob> {
+  const job = refreshJob(target, reason);
+  await writeRefreshJob(env, job);
+  try {
+    await auditScheduler(env, {
+      event: "job_enqueue",
+      targetKey: target.key,
+      jobId: job.id,
+      reason,
+    });
+    if (env.REFRESH_QUEUE) {
+      await env.REFRESH_QUEUE.send(job);
+    } else {
+      context.waitUntil(processRefreshJob(job, env));
+    }
+  } catch (error) {
+    const now = new Date().toISOString();
+    await writeRefreshJob(env, {
+      ...job,
+      status: "failed",
+      finishedAt: now,
+      updatedAt: now,
+      error: errorMessage(error),
+    }).catch(() => undefined);
+    throw error;
+  }
+  return job;
+}
+
+function refreshTargetDue(target: RefreshTarget, cached: DashboardPayload | null): boolean {
+  if (!cached || !canDisplayCached(cached)) return true;
+  if (cached.cache?.state === "error" || cached.cache?.progress?.done === false) return true;
+  return Date.now() >= safeIso(target.nextDueAt);
+}
+
+function refreshReason(target: RefreshTarget, cached: DashboardPayload | null): string {
+  if (!cached) return "missing-cache";
+  if (!canDisplayCached(cached)) return "expired-cache";
+  if (cached.cache?.state === "error") return "error-cache";
+  if (cached.cache?.progress?.done === false) return "partial-cache";
+  return Date.now() >= safeIso(target.nextDueAt) ? "scheduled" : "not-due";
+}
+
+async function schedulerTick(
+  env: Env,
+  context: ExecutionContext,
+  cause: string,
+  limit = schedulerBatchLimit,
+): Promise<{ enqueued: number; considered: number; due: number }> {
+  const [targets, jobs] = await Promise.all([listRefreshTargets(env), listRefreshJobs(env)]);
+  const activeTargetKeys = new Set(
+    jobs
+      .filter((job) => job.status === "queued" || job.status === "running")
+      .map((job) => job.targetKey),
+  );
+  const pairs = await Promise.all(
+    targets.map(async (target) => ({ target, cached: await readCached(env, target.key) })),
+  );
+  const due = pairs
+    .filter(({ target, cached }) => refreshTargetDue(target, cached))
+    .filter(({ target }) => !activeTargetKeys.has(target.key))
+    .sort(
+      (a, b) =>
+        b.target.priority - a.target.priority ||
+        safeIso(a.target.nextDueAt) - safeIso(b.target.nextDueAt),
+    );
+  const picked = due.slice(0, limit);
+  for (const { target, cached } of picked) {
+    await enqueueRefreshJob(env, context, target, refreshReason(target, cached));
+  }
+  await env.DASHBOARD_CACHE?.put(
+    refreshStateKey,
+    JSON.stringify({
+      lastTickAt: new Date().toISOString(),
+      cause,
+      considered: targets.length,
+      due: due.length,
+      enqueued: picked.length,
+    }),
+    { expirationTtl: dashboardStorageTtlSeconds },
+  );
+  await auditScheduler(env, {
+    event: "scheduler_tick",
+    status: "ok",
+    reason: cause,
+    detail: `considered=${targets.length} active=${activeTargetKeys.size} due=${due.length} enqueued=${picked.length}`,
+  });
+  return { enqueued: picked.length, considered: targets.length, due: due.length };
+}
+
+async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJob> {
+  const startedAt = Date.now();
+  let job = (await readRefreshJob(env, input.id)) ?? input;
+  job = {
+    ...job,
+    status: "running",
+    startedAt: new Date(startedAt).toISOString(),
+    updatedAt: new Date(startedAt).toISOString(),
+    attempts: job.attempts + 1,
+  };
+  await writeRefreshJob(env, job);
+
+  const target = await readRefreshTarget(env, job.targetKey);
+  if (!target) {
+    const skipped = {
+      ...job,
+      status: "skipped" as const,
+      finishedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      durationMs: Date.now() - startedAt,
+      error: "target missing",
+    };
+    await writeRefreshJob(env, skipped);
+    return skipped;
+  }
+
+  try {
+    const sources = { owners: target.owners, repos: target.repos };
+    const token = await sourceInstallationToken(env, sources);
+
+    const cached = await readCached(env, target.key);
+    const owners =
+      cached?.owners ??
+      (await resolveOwners(
+        target.owners,
+        env,
+        token?.token ?? env.GITHUB_TOKEN,
+        token?.quotaSource ?? (env.GITHUB_TOKEN ? "shared" : "anonymous"),
+        token?.quotaAccount ?? null,
+      ));
+    if (!owners) {
+      throw new Error("owner not found");
+    }
+    const url = new URL(
+      target.path,
+      `https://${env.RELEASEDECK_CANONICAL_DOMAIN ?? "release.bar"}`,
+    );
+    const dashboard = dashboardRequest(
+      owners,
+      target.repos,
+      cached?.profile ?? null,
+      target.key,
+      url,
+      target.includeReleaseData,
+      token,
+    );
+    const payload = await rebuildWithBuildLock(dashboard, env);
+    const now = new Date().toISOString();
+    if (!payload) {
+      const skipped = {
+        ...job,
+        status: "skipped" as const,
+        finishedAt: now,
+        updatedAt: now,
+        durationMs: Date.now() - startedAt,
+        error: "dashboard locked",
+      };
+      await writeRefreshJob(env, skipped);
+      return skipped;
+    }
+    await writeRefreshTarget(env, {
+      ...target,
+      lastAttemptAt: now,
+      lastSuccessAt: payload.cache?.progress?.done === false ? target.lastSuccessAt : now,
+      nextDueAt: nextRefreshAt(target, payload.cache?.progress?.done !== false),
+      failureCount: payload.cache?.progress?.done === false ? target.failureCount : 0,
+      message: payload.cache?.message,
+    });
+    const done = {
+      ...job,
+      status: "succeeded" as const,
+      finishedAt: now,
+      updatedAt: now,
+      durationMs: Date.now() - startedAt,
+    };
+    await writeRefreshJob(env, done);
+    await auditScheduler(env, {
+      event: "job_done",
+      targetKey: target.key,
+      jobId: job.id,
+      status: "succeeded",
+      account: token?.quotaAccount ?? null,
+      detail: `projects=${payload.projects.length}`,
+    });
+    return done;
+  } catch (error) {
+    const message = errorMessage(error);
+    const now = new Date().toISOString();
+    await writeRefreshTarget(env, {
+      ...target,
+      lastAttemptAt: now,
+      nextDueAt: nextRefreshAt(target, false),
+      failureCount: target.failureCount + 1,
+      message,
+    });
+    const failed = {
+      ...job,
+      status: "failed" as const,
+      finishedAt: now,
+      updatedAt: now,
+      durationMs: Date.now() - startedAt,
+      error: message,
+    };
+    await writeRefreshJob(env, failed);
+    await auditScheduler(env, {
+      event: "job_failed",
+      targetKey: target.key,
+      jobId: job.id,
+      status: "failed",
+      reason: message,
+    });
+    return failed;
+  }
+}
+
+async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
+  const [targets, jobs, events, stateRaw] = await Promise.all([
+    listRefreshTargets(env, refreshTargetListLimit),
+    listRefreshJobs(env),
+    listAuditEvents(env),
+    env.DASHBOARD_CACHE?.get(refreshStateKey),
+  ]);
+  const state = stateRaw ? tryJsonParse<{ lastTickAt?: string }>(stateRaw, "refresh state") : null;
+  const activeTargetKeys = new Set(
+    jobs
+      .filter((job) => job.status === "queued" || job.status === "running")
+      .map((job) => job.targetKey),
+  );
+  const targetStates = await Promise.all(
+    targets.map(async (target) => ({ target, cached: await readCached(env, target.key) })),
+  );
+  const dueTargets = targetStates.filter(
+    ({ target, cached }) => refreshTargetDue(target, cached) && !activeTargetKeys.has(target.key),
+  ).length;
+  return {
+    generatedAt: new Date().toISOString(),
+    authorized: true,
+    status: {
+      targets: targets.length,
+      dueTargets,
+      queuedJobs: jobs.filter((job) => job.status === "queued").length,
+      runningJobs: jobs.filter((job) => job.status === "running").length,
+      failedJobs: jobs.filter((job) => job.status === "failed").length,
+      lastTickAt: state?.lastTickAt ?? null,
+      nextDueAt:
+        targets
+          .map((target) => target.nextDueAt)
+          .filter((value) => safeIso(value) > 0)
+          .sort()[0] ?? null,
+      queueConfigured: Boolean(env.REFRESH_QUEUE),
+    },
+    targets: targets.sort((a, b) => safeIso(a.nextDueAt) - safeIso(b.nextDueAt)).slice(0, 120),
+    jobs,
+    events,
+  };
 }
 
 function progressKey(key: string): string {
@@ -7111,6 +7676,29 @@ async function profileResponse(request: Request, env: Env): Promise<Response> {
   }
 }
 
+async function adminResponse(
+  request: Request,
+  env: Env,
+  context: ExecutionContext,
+): Promise<Response> {
+  const admin = await requireAdmin(request, env);
+  if (admin instanceof Response) return admin;
+  const url = new URL(request.url);
+  if (url.pathname === "/api/admin/scheduler" && request.method === "GET") {
+    return jsonResponse(await schedulerAdminPayload(env), 200, { "cache-control": "no-store" });
+  }
+  if (url.pathname === "/api/admin/scheduler/run" && request.method === "POST") {
+    const result = await schedulerTick(
+      env,
+      context,
+      `manual:${admin.user.login}`,
+      schedulerBatchLimit,
+    );
+    return jsonResponse({ ok: true, ...result }, 200, { "cache-control": "no-store" });
+  }
+  return jsonResponse({ error: "not found" }, 404, { "cache-control": "no-store" });
+}
+
 async function ownerResponse(
   request: Request,
   env: Env,
@@ -7161,6 +7749,15 @@ async function ownerResponse(
     ...options,
     includeReleaseData,
     schemaVersion: dashboardSchemaVersion,
+  });
+  await rememberRefreshTarget(env, {
+    key,
+    owner: primaryOwner ?? "custom",
+    owners: ownerSlugs,
+    repos: includeRepos,
+    includeReleaseData,
+    path: `${url.pathname}${url.search}`,
+    priority: primaryOwner ? 100 : 60,
   });
   const cached = await readCached(env, key);
   const ageMs = cacheAgeMs(cached);
@@ -7401,7 +7998,14 @@ export default {
       (request.method === "POST" || request.method === "DELETE");
     const audienceBackfillWrite =
       isRepoAudienceBackfillApiPath(url.pathname) && request.method === "POST";
-    if (request.method !== "GET" && !isHead && !profileWrite && !audienceBackfillWrite) {
+    const adminWrite = url.pathname === "/api/admin/scheduler/run" && request.method === "POST";
+    if (
+      request.method !== "GET" &&
+      !isHead &&
+      !profileWrite &&
+      !audienceBackfillWrite &&
+      !adminWrite
+    ) {
       return jsonResponse({ error: "method not allowed" }, 405, { allow: "GET" });
     }
     const response = await routeRequest(request, env, context, url);
@@ -7413,6 +8017,23 @@ export default {
       statusText: response.statusText,
       headers: response.headers,
     });
+  },
+  async scheduled(event: ScheduledEvent, env: Env, context: ExecutionContext): Promise<void> {
+    context.waitUntil(schedulerTick(env, context, `cron:${event.cron}`, schedulerBatchLimit));
+  },
+  async queue(
+    batch: MessageBatch<RefreshJob>,
+    env: Env,
+    _context: ExecutionContext,
+  ): Promise<void> {
+    for (const message of batch.messages) {
+      try {
+        await processRefreshJob(message.body, env);
+        message.ack();
+      } catch {
+        message.retry({ delaySeconds: 300 });
+      }
+    }
   },
 };
 
@@ -7436,6 +8057,9 @@ async function routeRequest(
   }
   if (url.pathname === "/api/me") {
     return meResponse(request, env);
+  }
+  if (url.pathname.startsWith("/api/admin/")) {
+    return adminResponse(request, env, context);
   }
   if (url.pathname.startsWith("/api/profile/")) {
     return profileResponse(request, env);

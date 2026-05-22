@@ -486,3 +486,65 @@ export type RepoDetailPayload = {
   languages: RepoDetailLanguage[];
   workTrend: RepoDetailWorkTrend | null;
 };
+
+export type RefreshTarget = {
+  key: string;
+  kind: "dashboard";
+  owner: string;
+  owners: string[];
+  repos: string[];
+  includeReleaseData: boolean;
+  path: string;
+  priority: number;
+  lastSeenAt: string;
+  lastAttemptAt: string | null;
+  lastSuccessAt: string | null;
+  nextDueAt: string;
+  failureCount: number;
+  message?: string;
+};
+
+export type RefreshJob = {
+  id: string;
+  targetKey: string;
+  kind: "dashboard";
+  status: "queued" | "running" | "succeeded" | "failed" | "skipped";
+  reason: string;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  attempts: number;
+  durationMs: number | null;
+  error?: string;
+};
+
+export type SchedulerAuditEvent = {
+  id: string;
+  event: string;
+  at: string;
+  targetKey?: string;
+  jobId?: string;
+  status?: string;
+  reason?: string;
+  account?: string | null;
+  detail?: string;
+};
+
+export type SchedulerAdminPayload = {
+  generatedAt: string;
+  authorized: boolean;
+  status: {
+    targets: number;
+    dueTargets: number;
+    queuedJobs: number;
+    runningJobs: number;
+    failedJobs: number;
+    lastTickAt: string | null;
+    nextDueAt: string | null;
+    queueConfigured: boolean;
+  };
+  targets: RefreshTarget[];
+  jobs: RefreshJob[];
+  events: SchedulerAuditEvent[];
+};

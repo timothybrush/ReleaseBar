@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added a quota-aware background refresh scheduler with Cloudflare Queue wiring, cron ticks, audit logs, and an admin console for inspecting refresh targets and jobs.
 - Refreshed live owner dashboard streams when issue or PR totals change so active dev sorting can reorder rows during background updates.
 - Prioritized owner dashboard repository counts so issue and PR totals render before release and CI hydration finishes.
 - Loosened repository evidence spacing between names and language labels.

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Logged dashboard sync, progressive refresh, stream delivery, and discover hydration phases so fast visible data and slower GitHub scans can be studied separately.
 - Documented the refresh scheduler's target, queue, quota, retry, and admin audit behavior.
 - Hardcoded admin access to @steipete and moved the admin console link into dashboard settings.
 - Added a quota-aware background refresh scheduler with Cloudflare Queue wiring, cron ticks, audit logs, and an admin console for inspecting refresh targets and jobs.

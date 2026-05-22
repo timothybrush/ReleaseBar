@@ -31,7 +31,12 @@ export type DashboardBuildOptions = {
   projectCache?: ProjectCache;
   onProgress?: (
     payload: DashboardPayload,
-    progress: { scannedRepo: string; scanned: number; done: boolean },
+    progress: {
+      scannedRepo: string;
+      scanned: number;
+      done: boolean;
+      phase: "metadata" | "hydrate" | "complete";
+    },
   ) => Promise<void> | void;
   log?: (message: string) => void;
 };
@@ -1196,6 +1201,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             scannedRepo: "",
             scanned: skippedRepos.size + scannedThisRun,
             done: false,
+            phase: "metadata",
           });
         }
         for (const repo of hydrateQueue) {
@@ -1210,6 +1216,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             scannedRepo: repo.full_name,
             scanned: skippedRepos.size + scannedThisRun,
             done: false,
+            phase: "hydrate",
           });
         }
         continue;
@@ -1277,6 +1284,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             scannedRepo: repo.full_name,
             scanned: skippedRepos.size + scannedThisRun,
             done: false,
+            phase: "hydrate",
           });
           if (exhaustedPage) {
             break;
@@ -1322,6 +1330,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
     scannedRepo: "",
     scanned: skippedRepos.size + scannedThisRun,
     done: !scanIncomplete,
+    phase: "complete",
   });
   return payload(scanIncomplete ? "partial" : "fresh");
 }

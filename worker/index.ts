@@ -199,6 +199,7 @@ const refreshTargetPrefix = `refresh:target:v1:`;
 const refreshJobPrefix = `refresh:job:v1:`;
 const refreshJobIndexKey = `refresh:jobs:index:v1`;
 const refreshAuditIndexKey = `refresh:audit:index:v1`;
+const refreshAuditPrefix = `refresh:audit:v2:`;
 const refreshStateKey = `refresh:state:v1`;
 const refreshTargetListLimit = 5000;
 const refreshJobListLimit = 80;
@@ -2706,19 +2707,69 @@ async function auditScheduler(
     ...event,
   };
   console.log(JSON.stringify({ area: "scheduler", ...item }));
-  await env.DASHBOARD_CACHE?.put(`refresh:audit:v1:${item.id}`, JSON.stringify(item), {
+  await env.DASHBOARD_CACHE?.put(refreshAuditStorageKey(item), JSON.stringify(item), {
     expirationTtl: 14 * 24 * 60 * 60,
   });
-  const ids = await readStringList(env, refreshAuditIndexKey);
-  await writeStringList(
-    env,
-    refreshAuditIndexKey,
-    [item.id, ...ids.filter((id) => id !== item.id)],
-    refreshAuditListLimit,
-  );
 }
 
-async function listAuditEvents(env: Env): Promise<SchedulerAuditEvent[]> {
+function dashboardSyncDetail(payload: DashboardPayload | null, extra = ""): string {
+  const cache = payload?.cache;
+  const progress = cache?.progress;
+  return [
+    cache?.state ? `state=${cache.state}` : "state=missing",
+    `projects=${payload?.projects.length ?? 0}`,
+    progress ? `scanned=${progress.scanned}/${progress.limit}` : "",
+    progress ? `done=${progress.done}` : "",
+    extra,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function auditDashboardSync(
+  context: ExecutionContext,
+  env: Env,
+  event: Omit<SchedulerAuditEvent, "id" | "at">,
+): void {
+  context.waitUntil(auditSyncEvent(env, event));
+}
+
+async function auditSyncEvent(
+  env: Env,
+  event: Omit<SchedulerAuditEvent, "id" | "at">,
+): Promise<void> {
+  await auditScheduler(env, event).catch(() => undefined);
+}
+
+function refreshAuditStorageKey(event: Pick<SchedulerAuditEvent, "id" | "at">): string {
+  const timestamp = safeIso(event.at) || Date.now();
+  const reverseTimestamp = String(Number.MAX_SAFE_INTEGER - timestamp).padStart(16, "0");
+  return `${refreshAuditPrefix}${reverseTimestamp}:${event.id}`;
+}
+
+async function listCurrentAuditEvents(env: Env): Promise<SchedulerAuditEvent[]> {
+  if (!env.DASHBOARD_CACHE?.list) return [];
+  const events: SchedulerAuditEvent[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await env.DASHBOARD_CACHE.list({
+      prefix: refreshAuditPrefix,
+      limit: Math.min(1000, refreshAuditListLimit - events.length),
+      ...(cursor ? { cursor } : {}),
+    });
+    for (const key of page.keys) {
+      const raw = await env.DASHBOARD_CACHE.get(key.name);
+      if (!raw) continue;
+      const parsed = tryJsonParse<SchedulerAuditEvent>(raw, `refresh audit ${key.name}`);
+      if (isAuditEvent(parsed)) events.push(parsed);
+      if (events.length >= refreshAuditListLimit) break;
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor && events.length < refreshAuditListLimit);
+  return events;
+}
+
+async function listLegacyAuditEvents(env: Env): Promise<SchedulerAuditEvent[]> {
   const ids = await readStringList(env, refreshAuditIndexKey);
   const events = await Promise.all(
     ids.map(async (id) => {
@@ -2728,9 +2779,16 @@ async function listAuditEvents(env: Env): Promise<SchedulerAuditEvent[]> {
       return isAuditEvent(parsed) ? parsed : null;
     }),
   );
-  return events
+  return events.filter((event): event is SchedulerAuditEvent => Boolean(event));
+}
+
+async function listAuditEvents(env: Env): Promise<SchedulerAuditEvent[]> {
+  const listed = await listCurrentAuditEvents(env);
+  const legacy = await listLegacyAuditEvents(env);
+  return [...listed, ...legacy]
     .filter((event): event is SchedulerAuditEvent => Boolean(event))
-    .sort((a, b) => safeIso(b.at) - safeIso(a.at));
+    .sort((a, b) => safeIso(b.at) - safeIso(a.at))
+    .slice(0, refreshAuditListLimit);
 }
 
 function refreshJob(target: RefreshTarget, reason: string): RefreshJob {
@@ -2856,6 +2914,13 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
     attempts: job.attempts + 1,
   };
   await writeRefreshJob(env, job);
+  await auditSyncEvent(env, {
+    event: "job_start",
+    targetKey: job.targetKey,
+    jobId: job.id,
+    status: "running",
+    reason: job.reason,
+  });
 
   const target = await readRefreshTarget(env, job.targetKey);
   if (!target) {
@@ -2868,6 +2933,13 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
       error: "target missing",
     };
     await writeRefreshJob(env, skipped);
+    await auditSyncEvent(env, {
+      event: "job_skipped",
+      targetKey: job.targetKey,
+      jobId: job.id,
+      status: "skipped",
+      reason: "target missing",
+    });
     return skipped;
   }
 
@@ -2913,6 +2985,13 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
         error: "dashboard locked",
       };
       await writeRefreshJob(env, skipped);
+      await auditSyncEvent(env, {
+        event: "job_skipped",
+        targetKey: target.key,
+        jobId: job.id,
+        status: "skipped",
+        reason: "dashboard locked",
+      });
       return skipped;
     }
     await writeRefreshTarget(env, {
@@ -2937,6 +3016,11 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
       jobId: job.id,
       status: "succeeded",
       account: token?.quotaAccount ?? null,
+      durationMs: done.durationMs ?? undefined,
+      projects: payload.projects.length,
+      scanned: payload.cache?.progress?.scanned,
+      limit: payload.cache?.progress?.limit,
+      done: payload.cache?.progress?.done,
       detail: `projects=${payload.projects.length}`,
     });
     return done;
@@ -2965,6 +3049,7 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
       jobId: job.id,
       status: "failed",
       reason: message,
+      durationMs: failed.durationMs ?? undefined,
     });
     return failed;
   }
@@ -7058,13 +7143,47 @@ async function hydrateDiscoverCache(
 ): Promise<void> {
   if (!discoverNeedsHydration(payload)) return;
   const lock = await acquireBuildLock(env, `hydrate:${key}`);
-  if (!lock) return;
+  if (!lock) {
+    await auditSyncEvent(env, {
+      event: "discover_hydrate_skip",
+      targetKey: key,
+      status: "locked",
+      reason: "build-lock",
+      projects: payload.projects.length,
+      scanned: payload.cache?.progress?.scanned,
+      limit: payload.cache?.progress?.limit,
+      done: payload.cache?.progress?.done,
+    });
+    return;
+  }
   const refresh = globalThis.setInterval(() => {
     void lock.refresh();
   }, buildLockRefreshMs);
+  const startedAt = Date.now();
+  await auditSyncEvent(env, {
+    event: "discover_hydrate_start",
+    targetKey: key,
+    status: "running",
+    projects: payload.projects.length,
+    scanned: payload.cache?.progress?.scanned,
+    limit: payload.cache?.progress?.limit,
+    done: payload.cache?.progress?.done,
+    detail: dashboardSyncDetail(payload),
+  });
   try {
     const hydrated = await hydrateDiscoverPayload(payload, env);
     await writeCached(env, key, hydrated);
+    await auditSyncEvent(env, {
+      event: "discover_hydrate_done",
+      targetKey: key,
+      status: hydrated.cache?.progress?.done === false ? "partial" : "fresh",
+      durationMs: Date.now() - startedAt,
+      projects: hydrated.projects.length,
+      scanned: hydrated.cache?.progress?.scanned,
+      limit: hydrated.cache?.progress?.limit,
+      done: hydrated.cache?.progress?.done,
+      detail: dashboardSyncDetail(hydrated),
+    });
   } catch (error) {
     await writeCached(env, key, {
       ...payload,
@@ -7084,6 +7203,13 @@ async function hydrateDiscoverCache(
         message: `release scan skipped: ${dashboardErrorMessage(error)}`,
       },
     });
+    await auditSyncEvent(env, {
+      event: "discover_hydrate_failed",
+      targetKey: key,
+      status: "failed",
+      durationMs: Date.now() - startedAt,
+      reason: dashboardErrorMessage(error),
+    });
   } finally {
     globalThis.clearInterval(refresh);
     await lock.release();
@@ -7099,6 +7225,17 @@ async function discoverResponse(env: Env, url: URL, context: ExecutionContext): 
   if (cached && canDisplayCached(cached) && ageMs < discoverCacheTtlMs) {
     if (discoverNeedsHydration(cached)) {
       context.waitUntil(hydrateDiscoverCache(key, cached, env).catch(() => undefined));
+      auditDashboardSync(context, env, {
+        event: "discover_hydrate_schedule",
+        targetKey: key,
+        status: "queued",
+        reason: "partial-cache",
+        projects: cached.projects.length,
+        scanned: cached.cache?.progress?.scanned,
+        limit: cached.cache?.progress?.limit,
+        done: cached.cache?.progress?.done,
+        detail: dashboardSyncDetail(cached),
+      });
       return jsonResponse(
         withCacheState(cached, "partial", "scanning release data for all visible repositories"),
         200,
@@ -7112,6 +7249,17 @@ async function discoverResponse(env: Env, url: URL, context: ExecutionContext): 
     const payload = await discoverPayload(period, language, env);
     await writeCached(env, key, payload);
     context.waitUntil(hydrateDiscoverCache(key, payload, env).catch(() => undefined));
+    auditDashboardSync(context, env, {
+      event: "discover_hydrate_schedule",
+      targetKey: key,
+      status: "queued",
+      reason: "fresh-search",
+      projects: payload.projects.length,
+      scanned: payload.cache?.progress?.scanned,
+      limit: payload.cache?.progress?.limit,
+      done: payload.cache?.progress?.done,
+      detail: dashboardSyncDetail(payload),
+    });
     return jsonResponse(payload, 200, { "cache-control": "no-store" });
   } catch (error) {
     if (canDisplayCached(cached)) {
@@ -7310,11 +7458,18 @@ async function ownerEventsResponse(request: Request, env: Env): Promise<Response
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      const startedAt = Date.now();
+      await auditSyncEvent(env, {
+        event: "dashboard_stream_start",
+        targetKey: parts.key,
+        status: "running",
+      });
       const send = (event: string, data: unknown) => {
         controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
       };
       controller.enqueue(encoder.encode("retry: 5000\n\n"));
       let lastSignature = "";
+      let sent = 0;
       for (let attempt = 0; attempt < 60; attempt += 1) {
         const payload = await readCached(env, parts.key);
         if (canDisplayCached(payload)) {
@@ -7324,6 +7479,17 @@ async function ownerEventsResponse(request: Request, env: Env): Promise<Response
           if (signature !== lastSignature) {
             lastSignature = signature;
             send("dashboard", next);
+            sent += 1;
+            await auditSyncEvent(env, {
+              event: "dashboard_stream_send",
+              targetKey: parts.key,
+              status: state,
+              projects: next.projects.length,
+              scanned: next.cache?.progress?.scanned,
+              limit: next.cache?.progress?.limit,
+              done: next.cache?.progress?.done,
+              detail: dashboardSyncDetail(next),
+            });
           }
           if (state === "fresh") break;
         } else {
@@ -7331,6 +7497,14 @@ async function ownerEventsResponse(request: Request, env: Env): Promise<Response
         }
         await sleep(5000);
       }
+      await auditSyncEvent(env, {
+        event: "dashboard_stream_done",
+        targetKey: parts.key,
+        status: "closed",
+        durationMs: Date.now() - startedAt,
+        events: sent,
+        detail: `events=${sent}`,
+      });
       controller.close();
     },
   });
@@ -7398,15 +7572,43 @@ async function acquireBuildLock(env: Env, key: string): Promise<BuildLock | null
 async function rebuild(dashboard: DashboardRequest, env: Env): Promise<DashboardPayload> {
   const existing = locks.get(dashboard.key);
   if (existing) {
+    await auditSyncEvent(env, {
+      event: "dashboard_build_join",
+      targetKey: dashboard.key,
+      status: "running",
+      source: "in-memory-lock",
+    });
     return existing;
   }
 
   const promise = (async () => {
+    const startedAt = Date.now();
     const storedProgress = await readProgress(env, dashboard.key);
+    await auditSyncEvent(env, {
+      event: "dashboard_build_start",
+      targetKey: dashboard.key,
+      status: "running",
+      source:
+        dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
+      projects: storedProgress?.projects.length ?? 0,
+      scanned: storedProgress?.scannedRepos.length ?? 0,
+      detail: storedProgress
+        ? `resume scanned=${storedProgress.scannedRepos.length} projects=${storedProgress.projects.length}`
+        : "fresh build",
+    });
     const scannedRepos = new Set(storedProgress?.scannedRepos ?? []);
     const progressProjects = storedProgress?.projects ?? [];
     let lastProgressWriteAt = 0;
-    const saveProgress = async (payload: DashboardPayload, scannedRepo: string) => {
+    const saveProgress = async (
+      payload: DashboardPayload,
+      progress: {
+        scannedRepo: string;
+        scanned: number;
+        done: boolean;
+        phase: "metadata" | "hydrate" | "complete";
+      },
+    ) => {
+      const scannedRepo = progress.scannedRepo;
       if (scannedRepo) {
         scannedRepos.add(scannedRepo.toLowerCase());
       }
@@ -7423,46 +7625,79 @@ async function rebuild(dashboard: DashboardRequest, env: Env): Promise<Dashboard
         projects: profiled.projects,
         updatedAt: profiled.generatedAt,
       });
-    };
-    const payload = await buildDashboard({
-      title: "ReleaseBar",
-      subtitle: dashboard.subtitle,
-      canonicalDomain: env.RELEASEDECK_CANONICAL_DOMAIN ?? "release.bar",
-      owners: dashboard.owners,
-      includeRepos: dashboard.includeRepos,
-      excludeRepos: dashboard.profile?.hiddenRepos,
-      ...optionsFromUrl(dashboard.url),
-      repoLimit,
-      repoScanLimit: repoScanBatchSize,
-      repoScanTarget: repoLimit,
-      initialProjects: progressProjects,
-      skipRepos: [...scannedRepos],
-      token: dashboard.token ?? env.GITHUB_TOKEN,
-      includeReleaseData: dashboard.includeReleaseData,
-      quotaSource:
-        dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
-      quotaAccount: dashboard.quotaAccount ?? null,
-      fetch: auditGitHubFetch(
-        "dashboard",
-        dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
-        dashboard.quotaAccount ?? null,
-      ),
-      projectCache: env.DASHBOARD_CACHE,
-      onProgress: (partial, progress) => saveProgress(partial, progress.scannedRepo),
-    });
-    const profiled = withProfile(payload, dashboard.profile);
-    await writeCached(env, dashboard.key, profiled);
-    if (profiled.cache?.progress?.done === false) {
-      await writeProgress(env, dashboard.key, {
-        scannedRepos: [...scannedRepos],
-        projects: profiled.projects,
-        updatedAt: profiled.generatedAt,
+      await auditSyncEvent(env, {
+        event: "dashboard_progress_write",
+        targetKey: dashboard.key,
+        status: done ? "fresh" : "partial",
+        phase: progress.phase,
+        projects: profiled.projects.length,
+        scanned: payload.cache?.progress?.scanned ?? progress.scanned,
+        limit: payload.cache?.progress?.limit,
+        done,
+        detail: dashboardSyncDetail(profiled, scannedRepo ? `repo=${scannedRepo}` : ""),
       });
-    } else {
-      await deleteProgress(env, dashboard.key);
-      await rememberHotDashboard(env, dashboard.key, profiled);
+    };
+    try {
+      const payload = await buildDashboard({
+        title: "ReleaseBar",
+        subtitle: dashboard.subtitle,
+        canonicalDomain: env.RELEASEDECK_CANONICAL_DOMAIN ?? "release.bar",
+        owners: dashboard.owners,
+        includeRepos: dashboard.includeRepos,
+        excludeRepos: dashboard.profile?.hiddenRepos,
+        ...optionsFromUrl(dashboard.url),
+        repoLimit,
+        repoScanLimit: repoScanBatchSize,
+        repoScanTarget: repoLimit,
+        initialProjects: progressProjects,
+        skipRepos: [...scannedRepos],
+        token: dashboard.token ?? env.GITHUB_TOKEN,
+        includeReleaseData: dashboard.includeReleaseData,
+        quotaSource:
+          dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
+        quotaAccount: dashboard.quotaAccount ?? null,
+        fetch: auditGitHubFetch(
+          "dashboard",
+          dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
+          dashboard.quotaAccount ?? null,
+        ),
+        projectCache: env.DASHBOARD_CACHE,
+        onProgress: (partial, progress) => saveProgress(partial, progress),
+      });
+      const profiled = withProfile(payload, dashboard.profile);
+      await writeCached(env, dashboard.key, profiled);
+      if (profiled.cache?.progress?.done === false) {
+        await writeProgress(env, dashboard.key, {
+          scannedRepos: [...scannedRepos],
+          projects: profiled.projects,
+          updatedAt: profiled.generatedAt,
+        });
+      } else {
+        await deleteProgress(env, dashboard.key);
+        await rememberHotDashboard(env, dashboard.key, profiled);
+      }
+      await auditSyncEvent(env, {
+        event: "dashboard_build_done",
+        targetKey: dashboard.key,
+        status: profiled.cache?.progress?.done === false ? "partial" : "fresh",
+        durationMs: Date.now() - startedAt,
+        projects: profiled.projects.length,
+        scanned: profiled.cache?.progress?.scanned,
+        limit: profiled.cache?.progress?.limit,
+        done: profiled.cache?.progress?.done,
+        detail: dashboardSyncDetail(profiled),
+      });
+      return profiled;
+    } catch (error) {
+      await auditSyncEvent(env, {
+        event: "dashboard_build_failed",
+        targetKey: dashboard.key,
+        status: "failed",
+        durationMs: Date.now() - startedAt,
+        reason: dashboardErrorMessage(error),
+      });
+      throw error;
     }
-    return profiled;
   })();
 
   locks.set(dashboard.key, promise);
@@ -7479,6 +7714,12 @@ async function rebuildWithBuildLock(
 ): Promise<DashboardPayload | null> {
   const lock = await acquireBuildLock(env, dashboard.key);
   if (!lock) {
+    await auditSyncEvent(env, {
+      event: "dashboard_build_skip",
+      targetKey: dashboard.key,
+      status: "locked",
+      reason: "build-lock",
+    });
     return null;
   }
 
@@ -7495,6 +7736,12 @@ async function rebuildWithBuildLock(
 
 async function continueProgressiveBuild(dashboard: DashboardRequest, env: Env): Promise<void> {
   const startedAt = Date.now();
+  await auditSyncEvent(env, {
+    event: "dashboard_progressive_start",
+    targetKey: dashboard.key,
+    status: "running",
+    detail: `budgetMs=${progressiveBuildBudgetMs}`,
+  });
   let payload = await rebuildWithBuildLock(dashboard, env);
   while (
     payload?.cache?.progress?.done === false &&
@@ -7502,6 +7749,18 @@ async function continueProgressiveBuild(dashboard: DashboardRequest, env: Env): 
   ) {
     payload = await rebuildWithBuildLock(dashboard, env);
   }
+  await auditSyncEvent(env, {
+    event: "dashboard_progressive_done",
+    targetKey: dashboard.key,
+    status:
+      payload?.cache?.progress?.done === false ? "partial" : (payload?.cache?.state ?? "done"),
+    durationMs: Date.now() - startedAt,
+    projects: payload?.projects.length ?? 0,
+    scanned: payload?.cache?.progress?.scanned,
+    limit: payload?.cache?.progress?.limit,
+    done: payload?.cache?.progress?.done,
+    detail: dashboardSyncDetail(payload),
+  });
 }
 
 function errorPayload(dashboard: DashboardRequest, env: Env, message: string): DashboardPayload {
@@ -7756,6 +8015,17 @@ async function ownerResponse(
   const cached = await readCached(env, key);
   const ageMs = cacheAgeMs(cached);
   const displayCached = canDisplayCached(cached);
+  auditDashboardSync(context, env, {
+    event: "dashboard_request",
+    targetKey: key,
+    status: displayCached ? (cached.cache?.state ?? "cached") : "miss",
+    source: primaryOwner ? "owner" : "custom",
+    projects: cached?.projects.length ?? 0,
+    scanned: cached?.cache?.progress?.scanned,
+    limit: cached?.cache?.progress?.limit,
+    done: cached?.cache?.progress?.done,
+    detail: `ageMs=${ageMs} owners=${ownerSlugs.length} repos=${includeRepos.length} includeReleaseData=${includeReleaseData}`,
+  });
 
   if (displayCached && cached.cache?.state === "error") {
     const dashboard = cachedDashboardRequest(
@@ -7769,6 +8039,14 @@ async function ownerResponse(
     context.waitUntil(
       rebuildWithBuildLock(dashboard, env).catch((error) => cacheBuildError(dashboard, env, error)),
     );
+    auditDashboardSync(context, env, {
+      event: "dashboard_refresh_schedule",
+      targetKey: key,
+      status: "queued",
+      reason: "error-cache",
+      projects: cached.projects.length,
+      detail: dashboardSyncDetail(cached),
+    });
     return jsonResponse(cached, errorStatus(cached.cache.message ?? ""), {
       "cache-control": "no-store",
     });
@@ -7789,6 +8067,17 @@ async function ownerResponse(
     );
     context.waitUntil(continueProgressiveBuild(dashboard, env).catch(() => undefined));
     const state = cached.cache?.progress?.done === false ? "partial" : "stale";
+    auditDashboardSync(context, env, {
+      event: "dashboard_refresh_schedule",
+      targetKey: key,
+      status: "queued",
+      reason: state === "partial" ? "partial-cache" : "stale-cache",
+      projects: cached.projects.length,
+      scanned: cached.cache?.progress?.scanned,
+      limit: cached.cache?.progress?.limit,
+      done: cached.cache?.progress?.done,
+      detail: dashboardSyncDetail(cached),
+    });
     return jsonResponse(withCacheState(cached, state), 200, {
       "cache-control": "no-store",
     });
@@ -7841,6 +8130,13 @@ async function ownerResponse(
       }),
     ]);
     if (payload === buildPending || payload === null) {
+      auditDashboardSync(context, env, {
+        event: "dashboard_cold_wait_timeout",
+        targetKey: key,
+        status: payload === null ? "locked" : "queued",
+        reason: "cold-build",
+        detail: `waitMs=${coldBuildWaitMs}`,
+      });
       context.waitUntil(
         build
           .then((built) =>
@@ -7852,22 +8148,60 @@ async function ownerResponse(
       );
       const progressive = await readCached(env, key);
       if (canDisplayCached(progressive) && progressive.projects.length) {
+        auditDashboardSync(context, env, {
+          event: "dashboard_response",
+          targetKey: key,
+          status: "partial-cache",
+          projects: progressive.projects.length,
+          scanned: progressive.cache?.progress?.scanned,
+          limit: progressive.cache?.progress?.limit,
+          done: progressive.cache?.progress?.done,
+          detail: dashboardSyncDetail(progressive, "source=progress-cache"),
+        });
         return jsonResponse(withCacheState(progressive, "partial"), 200, {
           "cache-control": "no-store",
         });
       }
       const partial = await partialDashboardPayload(dashboard, env, ownerSlugs);
       if (partial) {
+        auditDashboardSync(context, env, {
+          event: "dashboard_response",
+          targetKey: key,
+          status: "partial-seed",
+          projects: partial.projects.length,
+          scanned: partial.cache?.progress?.scanned,
+          limit: partial.cache?.progress?.limit,
+          done: partial.cache?.progress?.done,
+          detail: dashboardSyncDetail(partial, "source=seed-cache"),
+        });
         return jsonResponse(partial, 200, {
           "cache-control": "no-store",
         });
       }
+      auditDashboardSync(context, env, {
+        event: "dashboard_response",
+        targetKey: key,
+        status: "rebuilding",
+        projects: 0,
+        detail: "source=status-payload",
+      });
       return jsonResponse(rebuildingPayload(dashboard, env), 202, {
         "cache-control": "no-store",
       });
     }
     if (payload.cache?.progress?.done === false) {
       context.waitUntil(continueProgressiveBuild(dashboard, env).catch(() => undefined));
+      auditDashboardSync(context, env, {
+        event: "dashboard_refresh_schedule",
+        targetKey: key,
+        status: "queued",
+        reason: "partial-build",
+        projects: payload.projects.length,
+        scanned: payload.cache?.progress?.scanned,
+        limit: payload.cache?.progress?.limit,
+        done: payload.cache?.progress?.done,
+        detail: dashboardSyncDetail(payload),
+      });
       return jsonResponse(payload, 200, {
         "cache-control": "no-store",
       });

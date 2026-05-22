@@ -45,6 +45,7 @@ import type {
   RefreshJob,
   RefreshTarget,
   SchedulerAdminPayload,
+  SchedulerAuditEvent,
   TrustProfilePayload,
 } from "../../src/types.js";
 import worker, { DashboardBuildLock, dashboardStreamSignature } from "../../worker/index.js";
@@ -73,6 +74,29 @@ function kvStore(initial: Record<string, string> = {}) {
       };
     },
   };
+}
+
+async function refreshAuditEvents(
+  cache: ReturnType<typeof kvStore>,
+): Promise<SchedulerAuditEvent[]> {
+  const current = await cache.list({ prefix: "refresh:audit:v2:" });
+  const currentEvents = (
+    await Promise.all(
+      current.keys.map(
+        async (key) => JSON.parse((await cache.get(key.name)) ?? "{}") as SchedulerAuditEvent,
+      ),
+    )
+  ).filter((event) => event.event);
+  const ids = JSON.parse((await cache.get("refresh:audit:index:v1")) ?? "[]") as string[];
+  const legacyEvents = (
+    await Promise.all(
+      ids.map(
+        async (id) =>
+          JSON.parse((await cache.get(`refresh:audit:v1:${id}`)) ?? "{}") as SchedulerAuditEvent,
+      ),
+    )
+  ).filter((event) => event.event);
+  return [...currentEvents, ...legacyEvents].sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
 }
 
 function base64Url(bytes: Uint8Array): string {
@@ -4173,6 +4197,35 @@ test("worker streams cached dashboard snapshots over owner events", async () => 
   assert.match(text, /owner\/repo/);
 });
 
+test("worker records dashboard stream sync audits", async () => {
+  const key = dashboardCacheKey({ owner: "owner", includeUnreleased: true, schemaVersion: 5 });
+  const dashboard = testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]);
+  dashboard.generatedAt = new Date().toISOString();
+  if (dashboard.cache) {
+    dashboard.cache.generatedAt = dashboard.generatedAt;
+  }
+  const cache = kvStore({ [key]: JSON.stringify(dashboard) });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/owner/events"),
+    { DASHBOARD_CACHE: cache },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  await response.text();
+  const events = await refreshAuditEvents(cache);
+  assert.equal(
+    events.some((event) => event.event === "dashboard_stream_start"),
+    true,
+  );
+  const send = events.find((event) => event.event === "dashboard_stream_send");
+  assert.equal(send?.status, "fresh");
+  assert.equal(send?.projects, 1);
+  const done = events.find((event) => event.event === "dashboard_stream_done");
+  assert.equal(done?.events, 1);
+});
+
 test("worker keeps owner events working for the repos owner slug", async () => {
   const key = dashboardCacheKey({ owner: "repos", includeUnreleased: true, schemaVersion: 5 });
   const dashboard = testDashboard("repos", [testProject({ owner: "repos", name: "repo" })]);
@@ -6190,6 +6243,18 @@ test("worker refresh jobs can use shared quota when no source app token exists",
   assert.equal(acked, true);
   const updated = JSON.parse((await cache.get(`refresh:job:v1:${job.id}`)) ?? "{}") as RefreshJob;
   assert.equal(updated.status, "succeeded");
+  const auditEvents = await refreshAuditEvents(cache);
+  assert.equal(
+    auditEvents.some((event) => event.event === "job_start"),
+    true,
+  );
+  assert.equal(
+    auditEvents.some((event) => event.event === "dashboard_build_start"),
+    true,
+  );
+  const buildDone = auditEvents.find((event) => event.event === "dashboard_build_done");
+  assert.equal(buildDone?.status, "fresh");
+  assert.equal(buildDone?.projects, 0);
   assert.deepEqual(paths, ["/users/openclaw", "/graphql"]);
 });
 

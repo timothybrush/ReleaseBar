@@ -529,6 +529,14 @@ export type SchedulerAuditEvent = {
   reason?: string;
   account?: string | null;
   detail?: string;
+  phase?: string;
+  source?: string;
+  durationMs?: number;
+  scanned?: number | null;
+  limit?: number | null;
+  projects?: number;
+  events?: number;
+  done?: boolean;
 };
 
 export type SchedulerAdminPayload = {

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Reduced GitHub dashboard hydration work by using owner GraphQL commit/status data, prioritizing issue/PR-sorted rows, caching owner identity, and storing hourly GitHub access counters in KV.
 - Placed dashboard cache status before the manual refresh button so the refresh action no longer interrupts the status text.
 - Improved the mobile dashboard layout with scrollable filter/sort rails, compact repository cards, and tighter header/search controls.
 - Added a manual dashboard refresh button that refreshes cheap issue and PR counts first, then continues release hydration in the background.

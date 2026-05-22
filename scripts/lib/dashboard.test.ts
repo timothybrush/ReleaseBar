@@ -138,6 +138,76 @@ test("worker records client dashboard timing beacons in audit log", async () => 
   assert.match(event?.detail ?? "", /navTtfbMs=91/);
 });
 
+test("worker stores GitHub access counters and cached owner identity", async () => {
+  const cache = kvStore();
+  const originalFetch = globalThis.fetch;
+  const waits: Array<Promise<unknown>> = [];
+  try {
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/users/owner") {
+        return Response.json(
+          {
+            login: "owner",
+            type: "User",
+            avatar_url: "https://github.com/owner.png",
+            html_url: "https://github.com/owner",
+          },
+          {
+            headers: {
+              "x-ratelimit-remaining": "4999",
+              "x-ratelimit-resource": "core",
+            },
+          },
+        );
+      }
+      if (url.pathname === "/graphql") {
+        return Response.json(
+          {
+            data: {
+              repositoryOwner: {
+                __typename: "User",
+                repositories: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [],
+                },
+              },
+            },
+          },
+          {
+            headers: {
+              "x-ratelimit-remaining": "4998",
+              "x-ratelimit-resource": "graphql",
+            },
+          },
+        );
+      }
+      throw new Error(`unexpected ${url.pathname}`);
+    };
+
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/owner"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "token" },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+
+    assert.equal(response.status, 200);
+    await Promise.all(waits);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const owner = JSON.parse((await cache.get("owner:v1:owner")) ?? "{}") as {
+      login?: string;
+    };
+    assert.equal(owner.login, "owner");
+    const counters = await cache.list({ prefix: "github:access:v1:" });
+    const counterKeys = counters.keys.map((key) => key.name).join("\n");
+    assert.match(counterKeys, /dashboard:shared:_:/);
+    assert.match(counterKeys, /users~:owner/);
+    assert.match(counterKeys, /graphql/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 function base64Url(bytes: Uint8Array): string {
   let binary = "";
   for (const byte of bytes) {
@@ -4388,16 +4458,20 @@ test("worker returns dashboard-shaped rate-limit errors without raw GitHub JSON"
         { status: 403 },
       );
     }
-    throw new Error(`unexpected fetch ${url.pathname}`);
+    return Response.json({ message: "API rate limit exceeded" }, { status: 403 });
   };
   const env = {
     DASHBOARD_CACHE: kvStore(),
     GITHUB_TOKEN: "shared-token",
   };
+  const waits: Array<Promise<unknown>> = [];
+  const context = { waitUntil: (promise: Promise<unknown>) => waits.push(promise) };
   try {
-    const response = await worker.fetch(new Request("https://release.bar/api/vincentkoc"), env, {
-      waitUntil: () => undefined,
-    });
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/vincentkoc"),
+      env,
+      context,
+    );
     assert.equal(response.status, 429);
     const body = (await response.json()) as DashboardPayload;
     assert.equal(body.cache?.state, "error");
@@ -4406,10 +4480,14 @@ test("worker returns dashboard-shaped rate-limit errors without raw GitHub JSON"
     assert.match(body.cache?.message ?? "", /shared API quota is exhausted/);
     assert.doesNotMatch(body.cache?.message ?? "", /58493|documentation_url|request ID/i);
 
-    const cached = await worker.fetch(new Request("https://release.bar/api/vincentkoc"), env, {
-      waitUntil: () => undefined,
-    });
+    const cached = await worker.fetch(
+      new Request("https://release.bar/api/vincentkoc"),
+      env,
+      context,
+    );
     assert.equal(cached.status, 429);
+    await cached.arrayBuffer();
+    await Promise.all(waits);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -6613,13 +6691,9 @@ test("safeReturnTo accepts the current request origin, including workers.dev", a
   assert.equal(evilOriginLogout.headers.get("location"), "/");
 });
 
-test("worker reuses cached installation tokens across requests", async () => {
-  const { privateKey } = generateKeyPairSync("rsa", {
-    modulusLength: 2048,
-    privateKeyEncoding: { type: "pkcs1", format: "pem" },
-    publicKeyEncoding: { type: "spki", format: "pem" },
-  });
+test("worker reuses cached installation tokens", async () => {
   const sessionId = "session-token-cache";
+  const accountLogin = "cacheorg";
   const exp = Math.floor(Date.now() / 1000) + 600;
   const authCookie = await signedJson("test-secret", { id: sessionId, exp });
   const env = {
@@ -6637,15 +6711,16 @@ test("worker reuses cached installation tokens across requests", async () => {
         iat: exp - 600,
         exp,
       }),
+      "auth:installation-token:1": "installation-token",
     }),
     GITHUB_APP_CLIENT_ID: "Iv123",
     GITHUB_APP_CLIENT_SECRET: "client-secret",
     GITHUB_APP_ID: "123",
-    GITHUB_APP_PRIVATE_KEY: privateKey,
+    GITHUB_APP_PRIVATE_KEY: "unused",
     GITHUB_APP_SLUG: "releasebar-app",
   };
   const originalFetch = globalThis.fetch;
-  let tokenMintCount = 0;
+  let tokenMintCalled = false;
   globalThis.fetch = async (input) => {
     const url = new URL(String(input));
     if (url.pathname === "/user/installations") {
@@ -6654,12 +6729,12 @@ test("worker reuses cached installation tokens across requests", async () => {
           {
             id: 1,
             account: {
-              login: "openclaw",
+              login: accountLogin,
               type: "Organization",
               avatar_url: "https://avatars.githubusercontent.com/u/2",
-              html_url: "https://github.com/openclaw",
+              html_url: `https://github.com/${accountLogin}`,
             },
-            html_url: "https://github.com/organizations/openclaw/settings/installations/1",
+            html_url: `https://github.com/organizations/${accountLogin}/settings/installations/1`,
             repository_selection: "all",
             target_type: "Organization",
           },
@@ -6667,28 +6742,43 @@ test("worker reuses cached installation tokens across requests", async () => {
       });
     }
     if (url.pathname === "/app/installations/1/access_tokens") {
-      tokenMintCount += 1;
-      return Response.json({ token: "installation-token" });
+      tokenMintCalled = true;
+      throw new Error("cached installation token should be reused");
     }
-    if (url.pathname === "/users/openclaw") {
-      return Response.json({ login: "openclaw", type: "Organization" });
+    if (url.pathname === `/users/${accountLogin}`) {
+      return Response.json({ login: accountLogin, type: "Organization" });
     }
-    if (url.pathname === "/orgs/openclaw/repos") {
+    if (url.pathname === "/graphql") {
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "Organization",
+            repositories: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [],
+            },
+          },
+        },
+      });
+    }
+    if (url.pathname === `/orgs/${accountLogin}/repos`) {
       return Response.json([]);
     }
     throw new Error(`unexpected fetch ${url.pathname}`);
   };
   try {
     const headers = { cookie: `rd_session=${authCookie}` };
-    await worker.fetch(new Request("https://release.bar/api/openclaw", { headers }), env, {
-      waitUntil: () => undefined,
-    });
-    await worker.fetch(
-      new Request("https://release.bar/api/openclaw?archived=true", { headers }),
+    const waits: Array<Promise<unknown>> = [];
+    const context = { waitUntil: (promise: Promise<unknown>) => waits.push(promise) };
+    const first = await worker.fetch(
+      new Request(`https://release.bar/api/${accountLogin}`, { headers }),
       env,
-      { waitUntil: () => undefined },
+      context,
     );
-    assert.equal(tokenMintCount, 1);
+    assert.equal(first.status, 200);
+    await first.arrayBuffer();
+    await Promise.all(waits);
+    assert.equal(tokenMintCalled, false);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -7055,7 +7145,37 @@ test("dashboard build uses GraphQL owner metadata when token is available", asyn
                     nameWithOwner: "owner/repo",
                     description: "GraphQL repo",
                     url: "https://github.com/owner/repo",
-                    defaultBranchRef: { name: "main" },
+                    defaultBranchRef: {
+                      name: "main",
+                      target: {
+                        oid: "abcdef123456",
+                        committedDate: "2026-01-03T00:00:00Z",
+                        statusCheckRollup: {
+                          state: "SUCCESS",
+                          contexts: {
+                            totalCount: 2,
+                            nodes: [
+                              {
+                                __typename: "CheckRun",
+                                name: "test",
+                                status: "COMPLETED",
+                                conclusion: "SUCCESS",
+                                detailsUrl: "https://github.com/owner/repo/actions/runs/1",
+                                completedAt: "2026-01-03T00:10:00Z",
+                              },
+                              {
+                                __typename: "CheckRun",
+                                name: "lint",
+                                status: "COMPLETED",
+                                conclusion: "SUCCESS",
+                                detailsUrl: "https://github.com/owner/repo/actions/runs/2",
+                                completedAt: "2026-01-03T00:11:00Z",
+                              },
+                            ],
+                          },
+                        },
+                      },
+                    },
                     primaryLanguage: { name: "TypeScript" },
                     stargazerCount: 42,
                     forkCount: 2,
@@ -7091,20 +7211,11 @@ test("dashboard build uses GraphQL owner metadata when token is available", asyn
           },
         });
       }
-      if (path === "/repos/owner/repo/commits/main") {
-        return Response.json({
-          sha: "abcdef123456",
-          commit: { committer: { date: "2026-01-03T00:00:00Z" } },
-        });
-      }
       if (path === "/repos/owner/repo/compare/v2.0.0-alpha.1...main") {
         return Response.json({
           total_commits: 4,
           html_url: "https://github.com/owner/repo/compare/v2.0.0-alpha.1...main",
         });
-      }
-      if (path === "/repos/owner/repo/commits/abcdef123456/check-runs") {
-        return Response.json({ check_runs: [] });
       }
       throw new Error(`unexpected ${path}`);
     },
@@ -7114,6 +7225,17 @@ test("dashboard build uses GraphQL owner metadata when token is available", asyn
   assert.equal(payload.projects[0]?.openIssues, 7);
   assert.equal(payload.projects[0]?.openPullRequests, 3);
   assert.equal(payload.projects[0]?.version, "v2.0.0-alpha.1");
+  assert.equal(payload.projects[0]?.latestCommitSha, "abcdef1");
+  assert.equal(payload.projects[0]?.ciState, "success");
+  assert.equal(payload.projects[0]?.ciWorkflow, "2/2 checks");
+  assert.equal(
+    requested.some((path) => path.includes("/commits/main")),
+    false,
+  );
+  assert.equal(
+    requested.some((path) => path.includes("/check-runs")),
+    false,
+  );
   assert.equal(
     requested.some((path) => path.includes("/releases")),
     false,
@@ -7126,6 +7248,7 @@ test("dashboard build uses GraphQL owner metadata when token is available", asyn
 
 test("dashboard build emits owner metadata before release hydration", async () => {
   const progress: Awaited<ReturnType<typeof buildDashboard>>[] = [];
+  const requested: string[] = [];
   const repoNode = (name: string, issues: number, pullRequests: number) => ({
     owner: { login: "owner", __typename: "User" },
     name,
@@ -7158,9 +7281,12 @@ test("dashboard build emits owner metadata before release hydration", async () =
     repoLimit: 3,
     repoScanLimit: 1,
     repoScanTarget: 3,
+    hydrateSort: "prs",
+    hydrateDirection: "desc",
     token: "token",
     fetch: async (url) => {
       const path = new URL(String(url)).pathname;
+      requested.push(path);
       if (path === "/graphql") {
         return Response.json({
           data: {
@@ -7168,7 +7294,7 @@ test("dashboard build emits owner metadata before release hydration", async () =
               __typename: "User",
               repositories: {
                 pageInfo: { hasNextPage: false, endCursor: null },
-                nodes: [repoNode("one", 5, 2), repoNode("two", 4, 1), repoNode("three", 3, 0)],
+                nodes: [repoNode("three", 3, 0), repoNode("one", 5, 2), repoNode("two", 4, 1)],
               },
             },
           },
@@ -7205,6 +7331,8 @@ test("dashboard build emits owner metadata before release hydration", async () =
     ],
   );
   assert.equal(progress[0]?.cache?.progress?.scanned, 0);
+  assert.equal(requested.includes("/repos/owner/one/commits/main"), true);
+  assert.equal(requested.includes("/repos/owner/three/commits/main"), false);
   assert.equal(payload.cache?.state, "partial");
   assert.deepEqual(
     payload.projects.map((project) => project.name),

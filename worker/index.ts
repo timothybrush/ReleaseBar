@@ -195,6 +195,10 @@ const dashboardCachePrefixes = [dashboardCachePrefix, previousDashboardCachePref
 const hotCacheKey = `hot:v${auxiliaryCacheSchemaVersion}`;
 const hotIndexKey = `hot:index:v${auxiliaryCacheSchemaVersion}`;
 const socialRepoCachePrefix = `social-repo:v${auxiliaryCacheSchemaVersion}:`;
+const ownerCachePrefix = `owner:v1:`;
+const ownerCacheTtlSeconds = 7 * 24 * 60 * 60;
+const githubAccessPrefix = `github:access:v1:`;
+const githubAccessTtlSeconds = 14 * 24 * 60 * 60;
 const refreshTargetPrefix = `refresh:target:v1:`;
 const refreshJobPrefix = `refresh:job:v1:`;
 const refreshJobIndexKey = `refresh:jobs:index:v1`;
@@ -287,6 +291,8 @@ type DashboardRequest = {
   key: string;
   url: URL;
   includeReleaseData: boolean;
+  hydrateSort?: "issues" | "prs" | null;
+  hydrateDirection?: "asc" | "desc";
   token?: string;
   quotaSource?: ApiQuota["source"];
   quotaAccount?: string | null;
@@ -497,20 +503,87 @@ function auditGitHubTokenUse(
   );
 }
 
+function githubPathBucket(path: string): string {
+  const url = new URL(path, "https://api.github.com");
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (url.pathname === "/graphql") return "graphql";
+  if (parts[0] === "users" && parts[2] === "repos") return "users/:owner/repos";
+  if (parts[0] === "orgs" && parts[2] === "repos") return "orgs/:owner/repos";
+  if (parts[0] === "users" && parts.length === 2) return "users/:owner";
+  if (parts[0] === "repos" && parts.length >= 3) {
+    const suffix = parts.slice(3);
+    if (suffix[0] === "releases") return "repos/:owner/:repo/releases";
+    if (suffix[0] === "compare") return "repos/:owner/:repo/compare";
+    if (suffix[0] === "commits" && suffix[2] === "check-runs") {
+      return "repos/:owner/:repo/commits/:ref/check-runs";
+    }
+    if (suffix[0] === "commits") return "repos/:owner/:repo/commits/:ref";
+    if (suffix[0] === "pulls") return "repos/:owner/:repo/pulls";
+    if (suffix[0] === "stats") return `repos/:owner/:repo/stats/${suffix[1] ?? ""}`;
+    if (suffix[0]) return `repos/:owner/:repo/${suffix[0]}`;
+    return "repos/:owner/:repo";
+  }
+  if (parts[0] === "search") return `search/${parts[1] ?? ""}`;
+  return url.pathname;
+}
+
+function githubAccessCounterKey(
+  area: GitHubAuditArea,
+  path: string,
+  status: number,
+  quota: ApiQuota,
+): string {
+  const hour = new Date().toISOString().slice(0, 13);
+  const source = quota.source;
+  const account = quota.account ?? "_";
+  const resource = quota.resource ?? "_";
+  const route = githubPathBucket(path).replaceAll("/", "~");
+  return `${githubAccessPrefix}${hour}:${area}:${source}:${account}:${resource}:${status}:${route}`;
+}
+
+async function recordGitHubAccessCounter(
+  env: Env | undefined,
+  area: GitHubAuditArea,
+  path: string,
+  status: number,
+  quota: ApiQuota,
+): Promise<void> {
+  if (!env?.DASHBOARD_CACHE) return;
+  const key = githubAccessCounterKey(area, path, status, quota);
+  const raw = await env.DASHBOARD_CACHE.get(key);
+  const current = raw ? tryJsonParse<{ count?: number }>(raw, `github access ${key}`) : null;
+  await env.DASHBOARD_CACHE.put(
+    key,
+    JSON.stringify({
+      area,
+      route: githubPathBucket(path),
+      status,
+      source: quota.source,
+      account: quota.account,
+      resource: quota.resource,
+      count: (current?.count ?? 0) + 1,
+      lastPath: path.slice(0, 240),
+      lastAt: new Date().toISOString(),
+    }),
+    { expirationTtl: githubAccessTtlSeconds },
+  );
+}
+
 function auditGitHubFetch(
   area: GitHubAuditArea,
   quotaSource: ApiQuota["source"],
   quotaAccount: string | null,
+  env?: Env,
 ): typeof fetch {
   return async (input, init) => {
     const response = await workerFetch(input, init);
     const url = new URL(String(input));
     if (url.hostname === "api.github.com") {
-      auditGitHubTokenUse(
-        area,
-        `${url.pathname}${url.search}`,
-        response.status,
-        quotaFromGitHubResponse(response, quotaSource, quotaAccount),
+      const path = `${url.pathname}${url.search}`;
+      const quota = quotaFromGitHubResponse(response, quotaSource, quotaAccount);
+      auditGitHubTokenUse(area, path, response.status, quota);
+      void recordGitHubAccessCounter(env, area, path, response.status, quota).catch(
+        () => undefined,
       );
     }
     return response;
@@ -743,6 +816,33 @@ function repoListFromUrl(url: URL): string[] {
   ];
 }
 
+function ownerCacheKey(login: string): string {
+  return `${ownerCachePrefix}${slugOwner(login)}`;
+}
+
+function isCachedOwner(value: unknown): value is Owner {
+  if (!value || typeof value !== "object") return false;
+  const owner = value as Partial<Owner>;
+  return (
+    (owner.type === "user" || owner.type === "org") &&
+    typeof owner.login === "string" &&
+    validOwnerSlug(owner.login)
+  );
+}
+
+async function readCachedOwner(env: Env, login: string): Promise<Owner | null> {
+  const raw = await env.DASHBOARD_CACHE?.get(ownerCacheKey(login));
+  if (!raw) return null;
+  const parsed = tryJsonParse<Owner>(raw, `owner ${login}`);
+  return isCachedOwner(parsed) ? parsed : null;
+}
+
+async function writeCachedOwner(env: Env, owner: Owner): Promise<void> {
+  await env.DASHBOARD_CACHE?.put(ownerCacheKey(owner.login), JSON.stringify(owner), {
+    expirationTtl: ownerCacheTtlSeconds,
+  });
+}
+
 function repoFullNameFromPath(pathname: string): string | null {
   const parts = pathname
     .split("/")
@@ -786,13 +886,19 @@ async function resolveOwners(
 ): Promise<Owner[] | null> {
   const owners: Owner[] = [];
   for (const owner of ownerSlugs) {
+    const cached = await readCachedOwner(env, owner);
+    if (cached) {
+      owners.push(cached);
+      continue;
+    }
     const resolved = await resolveOwnerType(owner, {
-      fetch: auditGitHubFetch("dashboard", quotaSource, quotaAccount),
+      fetch: auditGitHubFetch("dashboard", quotaSource, quotaAccount, env),
       token: token ?? env.GITHUB_TOKEN,
     });
     if (!resolved) {
       return null;
     }
+    await writeCachedOwner(env, resolved).catch(() => undefined);
     owners.push(resolved);
   }
   return owners;
@@ -2441,6 +2547,16 @@ function optionsFromUrl(url: URL) {
     includeForks: url.searchParams.get("forks") === "true",
     includeArchived: url.searchParams.get("archived") === "true",
     includeUnreleased: url.searchParams.get("unreleased") !== "false",
+  };
+}
+
+function hydrationOptionsFromUrl(
+  url: URL,
+): Pick<DashboardRequest, "hydrateSort" | "hydrateDirection"> {
+  const sort = url.searchParams.get("sort");
+  return {
+    hydrateSort: sort === "issues" || sort === "prs" ? sort : null,
+    hydrateDirection: url.searchParams.get("dir") === "asc" ? "asc" : "desc",
   };
 }
 
@@ -4395,7 +4511,7 @@ async function buildOwnerActivity(
   };
   const owner = await resolveOwnerType(ownerSlug, {
     token: token ?? undefined,
-    fetch: auditGitHubFetch("owner-activity", quotaSource, quotaAccount),
+    fetch: auditGitHubFetch("owner-activity", quotaSource, quotaAccount, env),
   });
   if (!owner) {
     throw new Error(`owner not found: ${ownerSlug}`);
@@ -7200,7 +7316,7 @@ async function hydrateDiscoverPayload(
     includeUnreleased: true,
     token: env.GITHUB_TOKEN,
     quotaSource: env.GITHUB_TOKEN ? "shared" : "anonymous",
-    fetch: auditGitHubFetch("discover", env.GITHUB_TOKEN ? "shared" : "anonymous", null),
+    fetch: auditGitHubFetch("discover", env.GITHUB_TOKEN ? "shared" : "anonymous", null, env),
     projectCache: env.DASHBOARD_CACHE,
   });
   const hydratedProjects = new Map(
@@ -7756,6 +7872,8 @@ async function rebuild(dashboard: DashboardRequest, env: Env): Promise<Dashboard
         skipRepos: [...scannedRepos],
         token: dashboard.token ?? env.GITHUB_TOKEN,
         includeReleaseData: dashboard.includeReleaseData,
+        hydrateSort: dashboard.hydrateSort,
+        hydrateDirection: dashboard.hydrateDirection,
         quotaSource:
           dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
         quotaAccount: dashboard.quotaAccount ?? null,
@@ -7763,6 +7881,7 @@ async function rebuild(dashboard: DashboardRequest, env: Env): Promise<Dashboard
           "dashboard",
           dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
           dashboard.quotaAccount ?? null,
+          env,
         ),
         projectCache: env.DASHBOARD_CACHE,
         onProgress: (partial, progress) => saveProgress(partial, progress),
@@ -7906,6 +8025,8 @@ async function refreshDashboardMetadataFirst(
       repoScanTarget: repoLimit,
       token: dashboard.token ?? env.GITHUB_TOKEN,
       includeReleaseData: false,
+      hydrateSort: dashboard.hydrateSort,
+      hydrateDirection: dashboard.hydrateDirection,
       quotaSource:
         dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
       quotaAccount: dashboard.quotaAccount ?? null,
@@ -7913,6 +8034,7 @@ async function refreshDashboardMetadataFirst(
         "dashboard",
         dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
         dashboard.quotaAccount ?? null,
+        env,
       ),
       projectCache: env.DASHBOARD_CACHE,
     });
@@ -8435,13 +8557,17 @@ async function ownerResponse(
     token,
   );
   const build = rebuildWithBuildLock(dashboard, env);
+  let coldWaitTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     const payload = await Promise.race([
       build,
       new Promise<typeof buildPending>((resolve) => {
-        setTimeout(() => resolve(buildPending), coldBuildWaitMs);
+        coldWaitTimer = setTimeout(() => resolve(buildPending), coldBuildWaitMs);
       }),
     ]);
+    if (coldWaitTimer) {
+      clearTimeout(coldWaitTimer);
+    }
     if (payload === buildPending || payload === null) {
       auditDashboardSync(context, env, {
         event: "dashboard_cold_wait_timeout",
@@ -8521,6 +8647,9 @@ async function ownerResponse(
     }
     return jsonResponse(payload, 200, authDependentDashboardHeaders(env));
   } catch (error) {
+    if (coldWaitTimer) {
+      clearTimeout(coldWaitTimer);
+    }
     const payload = errorPayload(dashboard, env, dashboardErrorMessage(error));
     await writeCached(env, key, payload, 5 * 60);
     return jsonResponse(payload, errorStatus(error), retryAfterHeaders(error));
@@ -8563,6 +8692,7 @@ function dashboardRequest(
     key,
     url,
     includeReleaseData,
+    ...hydrationOptionsFromUrl(url),
     ...(token
       ? {
           token: token.token,

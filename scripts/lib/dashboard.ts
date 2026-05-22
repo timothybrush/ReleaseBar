@@ -24,6 +24,8 @@ export type DashboardBuildOptions = {
   repoLimit?: number;
   repoScanLimit?: number;
   repoScanTarget?: number;
+  hydrateSort?: "issues" | "prs" | null;
+  hydrateDirection?: "asc" | "desc";
   token?: string;
   quotaSource?: ApiQuota["source"];
   quotaAccount?: string | null;
@@ -71,6 +73,8 @@ type GitHubRepo = {
   fork: boolean;
   private: boolean;
   latest_release?: GitHubRelease | null;
+  latest_commit?: GitHubCommit | null;
+  status_check_rollup?: GitHubStatusCheckRollup | null;
   open_issues_total?: number;
   open_pull_requests_total?: number;
 };
@@ -110,6 +114,26 @@ type GitHubCheckRuns = {
   check_runs?: GitHubCheckRun[];
 };
 
+type GitHubStatusCheckRollup = {
+  state: string | null;
+  contexts?: {
+    totalCount: number;
+    nodes: Array<{
+      __typename?: string;
+      name?: string | null;
+      context?: string | null;
+      status?: string | null;
+      conclusion?: string | null;
+      state?: string | null;
+      detailsUrl?: string | null;
+      targetUrl?: string | null;
+      completedAt?: string | null;
+      startedAt?: string | null;
+      createdAt?: string | null;
+    } | null>;
+  } | null;
+};
+
 type CiDetails = {
   state: CiState;
   status: string | null;
@@ -137,6 +161,11 @@ type GraphQLRepoNode = {
   url: string;
   defaultBranchRef: null | {
     name: string;
+    target?: {
+      oid: string;
+      committedDate: string | null;
+      statusCheckRollup?: GitHubStatusCheckRollup | null;
+    } | null;
   };
   primaryLanguage: null | {
     name: string;
@@ -574,9 +603,6 @@ const ownerReposQuery = /* GraphQL */ `
           nameWithOwner
           description
           url
-          defaultBranchRef {
-            name
-          }
           primaryLanguage {
             name
           }
@@ -608,6 +634,38 @@ const ownerReposQuery = /* GraphQL */ `
               url
               isDraft
               publishedAt
+            }
+          }
+          defaultBranchRef {
+            name
+            target {
+              ... on Commit {
+                oid
+                committedDate
+                statusCheckRollup {
+                  state
+                  contexts(first: 100) {
+                    totalCount
+                    nodes {
+                      __typename
+                      ... on CheckRun {
+                        name
+                        status
+                        conclusion
+                        detailsUrl
+                        completedAt
+                        startedAt
+                      }
+                      ... on StatusContext {
+                        context
+                        state
+                        targetUrl
+                        createdAt
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -652,6 +710,21 @@ function graphQlRepo(node: GraphQLRepoNode): GitHubRepo {
           published_at: latestRelease.publishedAt,
         }
       : null,
+    latest_commit:
+      node.defaultBranchRef?.target && "oid" in node.defaultBranchRef.target
+        ? {
+            sha: node.defaultBranchRef.target.oid,
+            commit: {
+              committer: {
+                date: node.defaultBranchRef.target.committedDate ?? undefined,
+              },
+            },
+          }
+        : null,
+    status_check_rollup:
+      node.defaultBranchRef?.target && "statusCheckRollup" in node.defaultBranchRef.target
+        ? (node.defaultBranchRef.target.statusCheckRollup ?? null)
+        : null,
     open_issues_total: node.issues.totalCount,
     open_pull_requests_total: node.pullRequests.totalCount,
   };
@@ -813,6 +886,72 @@ function ciDetails(runs: GitHubCheckRun[]): CiDetails {
   };
 }
 
+function normalizeGraphqlState(value: string | null | undefined): string {
+  return (value ?? "").toLowerCase();
+}
+
+function ciDetailsFromRollup(rollup: GitHubStatusCheckRollup | null | undefined): CiDetails | null {
+  if (!rollup) return null;
+  const contexts =
+    rollup.contexts?.nodes.filter((node): node is NonNullable<typeof node> => Boolean(node)) ?? [];
+  const total = rollup.contexts?.totalCount ?? contexts.length;
+  if (total === 0 && !rollup.state) return null;
+
+  const failure = contexts.find((context) =>
+    ["failure", "timed_out", "action_required", "error"].includes(
+      normalizeGraphqlState(context.conclusion ?? context.state),
+    ),
+  );
+  const active = contexts.find((context) =>
+    ["queued", "in_progress", "requested", "waiting", "pending", "expected"].includes(
+      normalizeGraphqlState(context.status ?? context.state),
+    ),
+  );
+  const cancelled = contexts.find(
+    (context) => normalizeGraphqlState(context.conclusion) === "cancelled",
+  );
+  const successCount = contexts.filter((context) =>
+    ["success", "successful"].includes(normalizeGraphqlState(context.conclusion ?? context.state)),
+  ).length;
+  const neutralCount = contexts.filter(
+    (context) => normalizeGraphqlState(context.conclusion ?? context.state) === "neutral",
+  ).length;
+  const skippedCount = contexts.filter(
+    (context) => normalizeGraphqlState(context.conclusion ?? context.state) === "skipped",
+  ).length;
+  const selected = failure ?? active ?? cancelled ?? contexts[0] ?? null;
+  const rollupState = normalizeGraphqlState(rollup.state);
+
+  let state: CiState = "unknown";
+  if (failure || ["failure", "error"].includes(rollupState)) {
+    state = "failure";
+  } else if (active || ["pending", "expected"].includes(rollupState)) {
+    state =
+      normalizeGraphqlState(active?.status ?? active?.state) === "in_progress"
+        ? "running"
+        : "pending";
+  } else if (cancelled) {
+    state = "cancelled";
+  } else if (successCount > 0 || rollupState === "success") {
+    state = "success";
+  } else if (neutralCount > 0) {
+    state = "neutral";
+  } else if (skippedCount > 0) {
+    state = "skipped";
+  }
+
+  const selectedName = selected?.name ?? selected?.context ?? null;
+  return {
+    state,
+    status: selected?.status ?? selected?.state ?? rollup.state,
+    conclusion: selected?.conclusion ?? selected?.state ?? rollup.state,
+    workflow:
+      state === "success" && total > 0 ? `${successCount || total}/${total} checks` : selectedName,
+    url: selected?.detailsUrl ?? selected?.targetUrl ?? null,
+    runDate: selected?.completedAt ?? selected?.startedAt ?? selected?.createdAt ?? null,
+  };
+}
+
 async function repoSummary(
   client: GitHubClient,
   repo: GitHubRepo,
@@ -827,11 +966,13 @@ async function repoSummary(
 
   let commitsSinceRelease: number | null = null;
   let compareUrl: string | null = null;
-  const latestCommit = await github<GitHubCommit>(
-    client,
-    `/repos/${repo.full_name}/commits/${repo.default_branch}`,
-    [404, 409],
-  );
+  const latestCommit =
+    repo.latest_commit ??
+    (await github<GitHubCommit>(
+      client,
+      `/repos/${repo.full_name}/commits/${repo.default_branch}`,
+      [404, 409],
+    ));
   const latestRef = latestCommit?.sha ?? repo.default_branch;
   const [compare, openPullRequests, checks] = await Promise.all([
     release?.tag_name
@@ -842,11 +983,11 @@ async function repoSummary(
       : Promise.resolve(null),
     repo.open_pull_requests_total ??
       githubCount(client, `/repos/${repo.full_name}/pulls?state=open`),
-    checkRuns(client, repo, latestRef),
+    repo.status_check_rollup ? Promise.resolve([]) : checkRuns(client, repo, latestRef),
   ]);
   commitsSinceRelease = compare?.total_commits ?? null;
   compareUrl = compare?.html_url ?? null;
-  const ci = ciDetails(checks);
+  const ci = ciDetailsFromRollup(repo.status_check_rollup) ?? ciDetails(checks);
 
   return {
     owner: repo.owner.login,
@@ -899,7 +1040,53 @@ function projectCacheSignature(repo: GitHubRepo): string {
     (repo.topics ?? []).join(","),
     repo.latest_release?.tag_name ?? "",
     repo.latest_release?.published_at ?? "",
+    repo.latest_commit?.sha ?? "",
+    repo.latest_commit?.commit?.committer?.date ?? "",
+    repo.status_check_rollup?.state ?? "",
+    repo.status_check_rollup?.contexts?.totalCount ?? "",
+    repo.status_check_rollup?.contexts?.nodes
+      .map((context) =>
+        [
+          context?.name ?? context?.context ?? "",
+          context?.status ?? "",
+          context?.conclusion ?? "",
+          context?.state ?? "",
+        ].join(":"),
+      )
+      .join(",") ?? "",
   ].join("|");
+}
+
+function hydrationPriorityValue(
+  repo: GitHubRepo,
+  sort: DashboardBuildOptions["hydrateSort"],
+): number {
+  if (sort === "prs") return repo.open_pull_requests_total ?? 0;
+  if (sort === "issues") {
+    const pullRequests = repo.open_pull_requests_total ?? 0;
+    return repo.open_issues_total ?? Math.max(repo.open_issues_count - pullRequests, 0);
+  }
+  return 0;
+}
+
+function prioritizedHydrationQueue(
+  repos: GitHubRepo[],
+  options: Pick<DashboardBuildOptions, "hydrateSort" | "hydrateDirection">,
+): GitHubRepo[] {
+  if (options.hydrateSort !== "prs" && options.hydrateSort !== "issues") return repos;
+  const direction = options.hydrateDirection === "asc" ? 1 : -1;
+  return repos
+    .map((repo, index) => ({ repo, index }))
+    .sort((a, b) => {
+      const value = hydrationPriorityValue(a.repo, options.hydrateSort);
+      const other = hydrationPriorityValue(b.repo, options.hydrateSort);
+      if (value !== other) return (value - other) * direction;
+      const pushed = Date.parse(a.repo.pushed_at ?? "") || 0;
+      const otherPushed = Date.parse(b.repo.pushed_at ?? "") || 0;
+      if (pushed !== otherPushed) return otherPushed - pushed;
+      return a.index - b.index;
+    })
+    .map(({ repo }) => repo);
 }
 
 async function readProjectCache(
@@ -1156,22 +1343,15 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
               }
             }
             if (visibleForHydration && !skippedRepos.has(fullName)) {
-              if (!hasScanLimit || hydrateQueue.length < scanLimit) {
-                hydrateQueue.push(repo);
-              } else {
-                capped = true;
-                if (options.repoScanTarget) {
-                  scanIncomplete = true;
-                }
-              }
+              hydrateQueue.push(repo);
             }
-            if (
-              ownerVisible >= options.repoLimit &&
-              (!hasScanLimit || hydrateQueue.length >= scanLimit)
-            ) {
+            if (ownerVisible >= options.repoLimit) {
               if (index < repos.length - 1 || repos.length === 100) {
                 capped = true;
-                if (options.repoScanTarget) {
+                if (
+                  options.repoScanTarget &&
+                  skippedRepos.size + scannedThisRun + hydrateQueue.length < options.repoScanTarget
+                ) {
                   scanIncomplete = true;
                 }
               }
@@ -1202,7 +1382,18 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             phase: "metadata",
           });
         }
-        for (const repo of hydrateQueue) {
+        const prioritized = prioritizedHydrationQueue(hydrateQueue, options);
+        const hydrationBatch = hasScanLimit ? prioritized.slice(0, scanLimit) : prioritized;
+        if (hydrationBatch.length < prioritized.length) {
+          capped = true;
+          if (
+            options.repoScanTarget &&
+            skippedRepos.size + scannedThisRun + hydrationBatch.length < options.repoScanTarget
+          ) {
+            scanIncomplete = true;
+          }
+        }
+        for (const repo of hydrationBatch) {
           hydratedThisOwner += 1;
           scannedThisRun += 1;
           await addRepo(repo, `${owner.login} ${ownerVisible}/${options.repoLimit}`);

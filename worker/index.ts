@@ -198,7 +198,6 @@ const socialRepoCachePrefix = `social-repo:v${auxiliaryCacheSchemaVersion}:`;
 const refreshTargetPrefix = `refresh:target:v1:`;
 const refreshJobPrefix = `refresh:job:v1:`;
 const refreshJobIndexKey = `refresh:jobs:index:v1`;
-const refreshAuditIndexKey = `refresh:audit:index:v1`;
 const refreshAuditPrefix = `refresh:audit:v2:`;
 const refreshStateKey = `refresh:state:v1`;
 const refreshTargetListLimit = 5000;
@@ -2769,23 +2768,8 @@ async function listCurrentAuditEvents(env: Env): Promise<SchedulerAuditEvent[]> 
   return events;
 }
 
-async function listLegacyAuditEvents(env: Env): Promise<SchedulerAuditEvent[]> {
-  const ids = await readStringList(env, refreshAuditIndexKey);
-  const events = await Promise.all(
-    ids.map(async (id) => {
-      const raw = await env.DASHBOARD_CACHE?.get(`refresh:audit:v1:${id}`);
-      if (!raw) return null;
-      const parsed = tryJsonParse<SchedulerAuditEvent>(raw, `refresh audit ${id}`);
-      return isAuditEvent(parsed) ? parsed : null;
-    }),
-  );
-  return events.filter((event): event is SchedulerAuditEvent => Boolean(event));
-}
-
 async function listAuditEvents(env: Env): Promise<SchedulerAuditEvent[]> {
-  const listed = await listCurrentAuditEvents(env);
-  const legacy = await listLegacyAuditEvents(env);
-  return [...listed, ...legacy]
+  return (await listCurrentAuditEvents(env))
     .filter((event): event is SchedulerAuditEvent => Boolean(event))
     .sort((a, b) => safeIso(b.at) - safeIso(a.at))
     .slice(0, refreshAuditListLimit);

@@ -80,23 +80,15 @@ async function refreshAuditEvents(
   cache: ReturnType<typeof kvStore>,
 ): Promise<SchedulerAuditEvent[]> {
   const current = await cache.list({ prefix: "refresh:audit:v2:" });
-  const currentEvents = (
+  return (
     await Promise.all(
       current.keys.map(
         async (key) => JSON.parse((await cache.get(key.name)) ?? "{}") as SchedulerAuditEvent,
       ),
     )
-  ).filter((event) => event.event);
-  const ids = JSON.parse((await cache.get("refresh:audit:index:v1")) ?? "[]") as string[];
-  const legacyEvents = (
-    await Promise.all(
-      ids.map(
-        async (id) =>
-          JSON.parse((await cache.get(`refresh:audit:v1:${id}`)) ?? "{}") as SchedulerAuditEvent,
-      ),
-    )
-  ).filter((event) => event.event);
-  return [...currentEvents, ...legacyEvents].sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  )
+    .filter((event) => event.event)
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
 }
 
 function base64Url(bytes: Uint8Array): string {

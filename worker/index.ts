@@ -7221,12 +7221,15 @@ async function discoverPayload(
       "x-github-api-version": "2022-11-28",
     },
   });
-  auditGitHubTokenUse(
+  const quota = quotaFromResponse(response, env);
+  auditGitHubTokenUse("discover", `${search.pathname}${search.search}`, response.status, quota);
+  await recordGitHubAccessCounter(
+    env,
     "discover",
     `${search.pathname}${search.search}`,
     response.status,
-    quotaFromResponse(response, env),
-  );
+    quota,
+  ).catch(() => undefined);
   const body = parseGitHubResponse(
     gitHubSearchRepositoryListSchema,
     await response.json(),
@@ -7265,7 +7268,7 @@ async function discoverPayload(
       capped: total > projects.length,
       repoLimit: discoverLimit,
       generatedAt,
-      quota: quotaFromResponse(response, env),
+      quota,
       progress: {
         scanned: 0,
         limit: Math.min(discoverHydrateLimit, projects.length),
@@ -7275,6 +7278,72 @@ async function discoverPayload(
     },
     totals: dashboardTotals(projects),
     projects,
+  };
+}
+
+type DiscoverHydratedProject = {
+  project: Project;
+  quota: ApiQuota | null;
+};
+
+async function hydrateDiscoverProject(
+  project: Project,
+  env: Env,
+): Promise<DiscoverHydratedProject> {
+  const [owner, repo] = project.fullName.split("/");
+  if (!owner || !repo) return { project, quota: null };
+  const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases?per_page=5`;
+  const response = await workerFetch(`https://api.github.com${path}`, {
+    headers: {
+      accept: "application/vnd.github+json",
+      ...(env.GITHUB_TOKEN ? { authorization: `Bearer ${env.GITHUB_TOKEN}` } : {}),
+      "user-agent": "ReleaseBar",
+      "x-github-api-version": "2022-11-28",
+    },
+  });
+  const quota = quotaFromResponse(response, env);
+  auditGitHubTokenUse("discover", path, response.status, quota);
+  await recordGitHubAccessCounter(env, "discover", path, response.status, quota).catch(
+    () => undefined,
+  );
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message =
+      body && typeof body === "object" && "message" in body
+        ? String((body as { message?: unknown }).message)
+        : `GitHub API ${response.status}`;
+    if (isRateLimitResponse(response, message)) {
+      throw new GitHubRateLimitError(message, parseHeaderInt(response.headers.get("retry-after")));
+    }
+    return { project, quota };
+  }
+  const releases = parseGitHubResponse(
+    v.array(gitHubReleaseSchema),
+    body,
+    "discover repository releases",
+  );
+  const release =
+    releases.find((item) => item.tag_name && !item.draft && item.published_at) ?? null;
+  if (!release) {
+    return {
+      project: {
+        ...project,
+        version: "unreleased",
+        releaseName: null,
+        releaseDate: null,
+      },
+      quota,
+    };
+  }
+  return {
+    project: {
+      ...project,
+      version: release.tag_name,
+      releaseName: release.name,
+      releaseUrl: release.html_url,
+      releaseDate: release.published_at,
+    },
+    quota,
   };
 }
 
@@ -7305,22 +7374,13 @@ async function hydrateDiscoverPayload(
       },
     };
   }
-  const hydrated = await buildDashboard({
-    title: payload.title,
-    subtitle: payload.subtitle,
-    canonicalDomain: payload.canonicalDomain,
-    owners: [],
-    includeRepos: repos,
-    includeForks: false,
-    includeArchived: false,
-    includeUnreleased: true,
-    token: env.GITHUB_TOKEN,
-    quotaSource: env.GITHUB_TOKEN ? "shared" : "anonymous",
-    fetch: auditGitHubFetch("discover", env.GITHUB_TOKEN ? "shared" : "anonymous", null, env),
-    projectCache: env.DASHBOARD_CACHE,
-  });
+  const hydrated: DiscoverHydratedProject[] = [];
+  for (const project of payload.projects.filter((item) => repos.includes(item.fullName))) {
+    hydrated.push(await hydrateDiscoverProject(project, env));
+  }
+  const quota = hydrated.findLast((item) => item.quota)?.quota ?? payload.cache?.quota;
   const hydratedProjects = new Map(
-    hydrated.projects.map((project) => [project.fullName.toLowerCase(), project]),
+    hydrated.map(({ project }) => [project.fullName.toLowerCase(), project]),
   );
   const projects = payload.projects.map(
     (project) => hydratedProjects.get(project.fullName.toLowerCase()) ?? project,
@@ -7338,17 +7398,15 @@ async function hydrateDiscoverPayload(
       state: done ? "fresh" : "partial",
       stale: !done,
       generatedAt: now,
-      ...((hydrated.cache?.quota ?? payload.cache?.quota)
-        ? { quota: hydrated.cache?.quota ?? payload.cache?.quota }
-        : {}),
+      ...(quota ? { quota } : {}),
       progress: {
         scanned,
         limit,
         done,
       },
       message: done
-        ? `release data scanned for ${scanned} repositories`
-        : `release data scanned for ${scanned}/${limit} repositories`,
+        ? `release metadata scanned for ${scanned} repositories`
+        : `release metadata scanned for ${scanned}/${limit} repositories`,
     },
     totals: dashboardTotals(projects),
     projects,

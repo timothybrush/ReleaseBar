@@ -1326,7 +1326,7 @@ test("worker serves cached GitHub discovery dashboards from repository search", 
     };
   });
   let searchCalls = 0;
-  let repoCalls = 0;
+  const hydratedPaths: string[] = [];
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
     if (url.pathname === "/search/repositories") {
@@ -1351,30 +1351,11 @@ test("worker serves cached GitHub discovery dashboards from repository search", 
         },
       );
     }
-    repoCalls += 1;
-    const repoMatch = url.pathname.match(/^\/repos\/acme\/([^/]+)$/);
-    if (repoMatch) {
-      const repoName = repoMatch[1] ?? "releasebar";
-      return Response.json({
-        owner: { login: "acme" },
-        name: repoName,
-        full_name: `acme/${repoName}`,
-        description: "Release dashboard",
-        html_url: `https://github.com/acme/${repoName}`,
-        default_branch: "main",
-        language: "TypeScript",
-        topics: ["releases", "dashboard"],
-        stargazers_count: 1200,
-        forks_count: 42,
-        open_issues_count: 9,
-        archived: false,
-        pushed_at: "2026-05-16T12:00:00Z",
-        updated_at: "2026-05-16T12:00:00Z",
-        fork: false,
-        private: false,
-      });
-    }
+    hydratedPaths.push(url.pathname);
     if (url.pathname.match(/^\/repos\/acme\/[^/]+\/releases$/)) {
+      if (url.pathname === "/repos/acme/releasebar-13/releases") {
+        return Response.json([]);
+      }
       return Response.json([
         {
           tag_name: "v1.2.3",
@@ -1384,24 +1365,6 @@ test("worker serves cached GitHub discovery dashboards from repository search", 
           published_at: "2026-05-15T00:00:00Z",
         },
       ]);
-    }
-    if (url.pathname.match(/^\/repos\/acme\/[^/]+\/commits\/main$/)) {
-      return Response.json({
-        sha: "abcdef123456",
-        commit: { committer: { date: "2026-05-16T12:00:00Z" } },
-      });
-    }
-    if (url.pathname.match(/^\/repos\/acme\/[^/]+\/compare\/v1\.2\.3\.\.\.main$/)) {
-      return Response.json({
-        total_commits: 5,
-        html_url: "https://github.com/acme/releasebar/compare/v1.2.3...main",
-      });
-    }
-    if (url.pathname.match(/^\/repos\/acme\/[^/]+\/pulls$/)) {
-      return Response.json([{}]);
-    }
-    if (url.pathname.match(/^\/repos\/acme\/[^/]+\/commits\/abcdef123456\/check-runs$/)) {
-      return Response.json({ check_runs: [] });
     }
     throw new Error(`unexpected fetch ${url.pathname}`);
   };
@@ -1469,10 +1432,16 @@ test("worker serves cached GitHub discovery dashboards from repository search", 
       0,
     );
     assert.equal(hydrated.projects[0]?.version, "v1.2.3");
-    assert.equal(hydrated.projects[0]?.commitsSinceRelease, 5);
-    assert.equal(hydrated.projects[0]?.openPullRequests, 1);
+    assert.equal(hydrated.projects[0]?.commitsSinceRelease, null);
+    assert.equal(hydrated.projects[0]?.openPullRequests, 0);
+    assert.equal(hydrated.projects[12]?.version, "unreleased");
+    assert.equal(hydrated.projects[12]?.releaseDate, null);
     assert.equal(searchCalls, 1);
-    assert.equal(repoCalls > 0, true);
+    assert.equal(hydratedPaths.length, searchItems.length);
+    assert.equal(
+      hydratedPaths.every((path) => /^\/repos\/acme\/[^/]+\/releases$/.test(path)),
+      true,
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

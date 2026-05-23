@@ -575,6 +575,9 @@ async function githubGraphql<T>(
     body: JSON.stringify({ query, variables }),
   });
   recordRateLimit(client, response);
+  if (response.headers.get("x-releasebar-github-backoff") === "graphql") {
+    throw new GitHubRateLimitError("GitHub GraphQL temporarily paused after upstream errors", null);
+  }
   const rateLimit = rateLimitFromResponse(response, "/graphql");
   if (rateLimit) throw rateLimit;
   if (!response.ok) {
@@ -1249,6 +1252,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
     options.quotaAccount ?? null,
   );
   const projects: Project[] = [...(options.initialProjects ?? [])];
+  const effectiveQuotaSource = client.quota.source;
   let capped = false;
   let scanIncomplete = false;
   let scannedThisRun = 0;
@@ -1393,6 +1397,8 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
       let hydratedThisOwner = 0;
       let page = 1;
       const scanLimit = options.repoScanLimit ?? Number.POSITIVE_INFINITY;
+      const ownerPageLimit =
+        effectiveQuotaSource === "shared" && includeReleaseData ? 3 : Number.POSITIVE_INFINITY;
       if (includeReleaseData && options.includeUnreleased) {
         const hydrateQueue: GitHubRepo[] = [];
         let metadataChanged = false;
@@ -1460,6 +1466,10 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             }
           }
           if (repos.length < 100 || exhaustedPage) {
+            break;
+          }
+          if (page >= ownerPageLimit) {
+            capped = true;
             break;
           }
           if (hasScanLimit && hydrateQueue.length >= scanLimit && visibleAddedThisPage === 0) {
@@ -1599,6 +1609,10 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
           break;
         }
         if (exhaustedPage) {
+          break;
+        }
+        if (page >= ownerPageLimit) {
+          capped = true;
           break;
         }
         if (hydratedThisOwner >= scanLimit && visibleAddedThisPage === 0) {

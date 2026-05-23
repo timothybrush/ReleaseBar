@@ -555,4 +555,37 @@ export type SchedulerAdminPayload = {
   targets: RefreshTarget[];
   jobs: RefreshJob[];
   events: SchedulerAuditEvent[];
+  githubAccess: GitHubAccessSummary;
+};
+
+export type GitHubAccessRouteSummary = {
+  key: string;
+  area: string;
+  route: string;
+  status: number;
+  source: ApiQuota["source"];
+  account: string | null;
+  resource: string | null;
+  count: number;
+  lastAt: string | null;
+  lastPath: string | null;
+};
+
+export type GitHubAccessSummary = {
+  generatedAt: string;
+  hours: number;
+  buckets: number;
+  total: number;
+  cooldown: {
+    active: boolean;
+    resource: string | null;
+    remaining: number | null;
+    limit: number | null;
+    resetAt: string | null;
+    reason: string | null;
+  };
+  byArea: Array<{ key: string; count: number }>;
+  bySource: Array<{ key: string; count: number }>;
+  byStatus: Array<{ key: string; count: number }>;
+  topRoutes: GitHubAccessRouteSummary[];
 };

@@ -73,6 +73,7 @@ This means popular or installed accounts can refresh without burning the shared 
 - queued, running, and failed job counts
 - last scheduler tick and next due target
 - queue-backed vs direct fallback mode
+- sharded GitHub token-use counters from the last 24 hours, also available at `/api/admin/github-access`
 - recent targets, jobs, and audit events
 
 Audit events are stored in KV and logged to Worker logs with `area: "scheduler"`. Keep audit detail short and structured so production logs remain searchable.
@@ -81,6 +82,7 @@ Audit events are stored in KV and logged to Worker logs with `area: "scheduler"`
 
 - Missing or invalid cached payloads are due immediately.
 - Partial dashboards are due until completed.
+- Shared quota cooldowns pause shared-token background refreshes until reset while app-token refreshes can continue.
 - Queue delivery failures mark the job failed.
 - Job records and audit events are retained for 14 days.
 - Target records use the dashboard cache TTL.

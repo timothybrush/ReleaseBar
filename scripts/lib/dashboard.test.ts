@@ -110,6 +110,24 @@ async function refreshAuditEvents(
     .sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
 }
 
+async function githubAccessRouteRecords(cache: ReturnType<typeof kvStore>): Promise<
+  Array<{
+    area?: string;
+    route?: string;
+    source?: string;
+    resource?: string | null;
+    status?: number;
+  }>
+> {
+  const accessKeys = await cache.list({ prefix: "github:access:v1:" });
+  const records = await Promise.all(
+    accessKeys.keys.map(async (key) => JSON.parse((await cache.get(key.name)) ?? "{}")),
+  );
+  return records.flatMap((record) =>
+    record.routes && typeof record.routes === "object" ? Object.values(record.routes) : [record],
+  );
+}
+
 test("worker records client dashboard timing beacons in audit log", async () => {
   const cache = kvStore();
   const waits: Array<Promise<unknown>> = [];
@@ -217,11 +235,21 @@ test("worker stores GitHub access counters and cached owner identity", async () 
       login?: string;
     };
     assert.equal(owner.login, "owner");
-    const counters = await cache.list({ prefix: "github:access:v1:" });
-    const counterKeys = counters.keys.map((key) => key.name).join("\n");
-    assert.match(counterKeys, /dashboard:shared:_:/);
-    assert.match(counterKeys, /users~:owner/);
-    assert.match(counterKeys, /graphql/);
+    const records = await githubAccessRouteRecords(cache);
+    assert.ok(
+      records.some(
+        (record) =>
+          record.area === "dashboard" &&
+          record.source === "shared" &&
+          record.route === "users/:owner",
+      ),
+    );
+    assert.ok(
+      records.some(
+        (record) =>
+          record.area === "dashboard" && record.source === "shared" && record.route === "graphql",
+      ),
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1501,10 +1529,10 @@ test("worker serves cached GitHub discovery dashboards from repository search", 
     const firstBatch = (await second.json()) as DashboardPayload;
     assert.equal(firstBatch.cache?.state, "partial");
     assert.equal(firstBatch.cache?.progress?.done, false);
-    assert.equal(firstBatch.cache?.progress?.scanned, 12);
+    assert.equal(firstBatch.cache?.progress?.scanned, 8);
     assert.equal(
       firstBatch.projects.filter((project) => project.version === "repo search").length,
-      1,
+      5,
     );
 
     await Promise.all(waitUntil.splice(0));
@@ -1597,24 +1625,34 @@ test("worker builds cached repository detail with releases and stats", async () 
     const url = new URL(String(input));
     const path = url.pathname;
     if (path === "/repos/acme/releasebar") {
-      return Response.json({
-        owner: { login: "acme" },
-        name: "releasebar",
-        full_name: "acme/releasebar",
-        private: false,
-        fork: false,
-        archived: false,
-        html_url: "https://github.com/acme/releasebar",
-        description: "Release dashboard",
-        default_branch: "main",
-        language: "TypeScript",
-        topics: ["release-health"],
-        stargazers_count: 1234,
-        forks_count: 45,
-        open_issues_count: 9,
-        pushed_at: "2026-05-16T12:00:00Z",
-        updated_at: "2026-05-16T12:00:00Z",
-      });
+      return Response.json(
+        {
+          owner: { login: "acme" },
+          name: "releasebar",
+          full_name: "acme/releasebar",
+          private: false,
+          fork: false,
+          archived: false,
+          html_url: "https://github.com/acme/releasebar",
+          description: "Release dashboard",
+          default_branch: "main",
+          language: "TypeScript",
+          topics: ["release-health"],
+          stargazers_count: 1234,
+          forks_count: 45,
+          open_issues_count: 9,
+          pushed_at: "2026-05-16T12:00:00Z",
+          updated_at: "2026-05-16T12:00:00Z",
+        },
+        {
+          headers: {
+            "x-ratelimit-resource": "core",
+            "x-ratelimit-remaining": "100",
+            "x-ratelimit-limit": "5000",
+            "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 3600),
+          },
+        },
+      );
     }
     if (path === "/repos/acme/releasebar/releases") {
       assert.equal(url.searchParams.get("per_page"), "100");
@@ -1755,6 +1793,17 @@ test("worker builds cached repository detail with releases and stats", async () 
       body.languages.map((language) => language.name),
       ["TypeScript", "CSS"],
     );
+    const accessRecords = await githubAccessRouteRecords(env.DASHBOARD_CACHE);
+    assert.ok(
+      accessRecords.some(
+        (record) =>
+          record.area === "repo-detail" &&
+          record.source === "shared" &&
+          record.resource === "core" &&
+          record.status === 200,
+      ),
+    );
+    assert.ok(await env.DASHBOARD_CACHE.get("github:budget:v1:shared:core"));
 
     await env.DASHBOARD_CACHE.put(
       "trust-profile:v4:octo",
@@ -4290,6 +4339,94 @@ test("worker manual dashboard refresh returns structured GitHub errors", async (
   }
 });
 
+test("worker GraphQL backoff does not fall through to shared REST scans", async () => {
+  const originalFetch = globalThis.fetch;
+  const paths: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    paths.push(url.pathname);
+    if (url.pathname === "/users/owner") {
+      return Response.json({
+        login: "owner",
+        type: "User",
+        avatar_url: "https://avatars.githubusercontent.com/u/1",
+        html_url: "https://github.com/owner",
+      });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const cache = kvStore({
+    "github:backoff:v1:graphql:shared:_": JSON.stringify({
+      active: true,
+      status: 502,
+      source: "shared",
+      account: null,
+      at: new Date().toISOString(),
+    }),
+  });
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/owner"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 429);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.cache?.state, "error");
+    assert.deepEqual(paths, ["/users/owner"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker GraphQL upstream failure does not fall through to shared REST scans", async () => {
+  const originalFetch = globalThis.fetch;
+  const paths: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    paths.push(url.pathname);
+    if (url.pathname === "/users/owner") {
+      return Response.json({
+        login: "owner",
+        type: "User",
+        avatar_url: "https://avatars.githubusercontent.com/u/1",
+        html_url: "https://github.com/owner",
+      });
+    }
+    if (url.pathname === "/graphql") {
+      return Response.json(
+        { message: "upstream unavailable" },
+        {
+          status: 503,
+          headers: {
+            "x-ratelimit-resource": "graphql",
+            "x-ratelimit-remaining": "800",
+            "x-ratelimit-limit": "5000",
+            "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 3600),
+          },
+        },
+      );
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const cache = kvStore();
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/owner"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 429);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.cache?.state, "error");
+    assert.deepEqual(paths, ["/users/owner", "/graphql"]);
+    assert.ok(await cache.get("github:backoff:v1:graphql:shared:_"));
+    assert.ok(await cache.get("github:budget:v1:shared:graphql"));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("worker manual dashboard refresh preserves released-only cache while rebuilding", async () => {
   const originalFetch = globalThis.fetch;
   const waits: Array<Promise<unknown>> = [];
@@ -4457,6 +4594,43 @@ test("worker marks GitHub discovery hydration complete when release scan is rate
     assert.equal(body.cache?.progress?.done, true);
     assert.equal(body.projects[0]?.version, "repo search");
     assert.match(body.cache?.message ?? "", /release scan skipped/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker pauses shared quota after discovery secondary rate limits", async () => {
+  const cache = kvStore();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    Response.json(
+      { message: "You have exceeded a secondary rate limit" },
+      {
+        status: 403,
+        headers: {
+          "x-ratelimit-remaining": "4999",
+          "x-ratelimit-limit": "5000",
+          "x-ratelimit-resource": "search",
+        },
+      },
+    );
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/_discover?period=week"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 429);
+    const cooldown = JSON.parse((await cache.get("github:budget:v1:shared:search")) ?? "{}") as {
+      active?: boolean;
+      resource?: string;
+      reason?: string;
+      resetAt?: string | null;
+    };
+    assert.equal(cooldown.active, true);
+    assert.equal(cooldown.resource, "search");
+    assert.equal(cooldown.reason, "rate limited status 403");
+    assert.equal(typeof cooldown.resetAt, "string");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -6400,6 +6574,7 @@ test("worker admin scheduler requires an admin session and reports refresh targe
     attempts: 0,
     durationMs: null,
   };
+  const accessHour = new Date().toISOString().slice(0, 13);
   const cache = kvStore({
     [`auth:session:${sessionId}`]: JSON.stringify({
       user: {
@@ -6428,6 +6603,17 @@ test("worker admin scheduler requires an admin session and reports refresh targe
     [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
     [`refresh:job:v1:${activeJob.id}`]: JSON.stringify(activeJob),
     "refresh:jobs:index:v1": JSON.stringify([activeJob.id]),
+    [`github:access:v1:${accessHour}:dashboard:shared:_:graphql:200:graphql`]: JSON.stringify({
+      area: "dashboard",
+      route: "graphql",
+      status: 200,
+      source: "shared",
+      account: null,
+      resource: "graphql",
+      count: 3,
+      lastPath: "/graphql",
+      lastAt: `${accessHour}:00:00.000Z`,
+    }),
   });
   const sentJobs: RefreshJob[] = [];
   const env = {
@@ -6470,6 +6656,19 @@ test("worker admin scheduler requires an admin session and reports refresh targe
   assert.equal(body.status.dueTargets, 0);
   assert.equal(body.status.queuedJobs, 1);
   assert.equal(body.targets[0]?.owner, "openclaw");
+  assert.equal(body.githubAccess.total, 3);
+  assert.equal(body.githubAccess.topRoutes[0]?.route, "graphql");
+
+  const access = await worker.fetch(
+    new Request("https://release.bar/api/admin/github-access?hours=1", {
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    env,
+    { waitUntil: () => undefined },
+  );
+  assert.equal(access.status, 200);
+  const accessBody = (await access.json()) as { total?: number };
+  assert.equal(accessBody.total, 3);
 
   const run = await worker.fetch(
     new Request("https://release.bar/api/admin/scheduler/run", {
@@ -6535,6 +6734,399 @@ test("worker admin scheduler counts missing caches as due even before nextDueAt"
   assert.equal(response.status, 200);
   const body = (await response.json()) as SchedulerAdminPayload;
   assert.equal(body.status.dueTargets, 1);
+});
+
+test("worker admin GitHub access ignores expired shared quota cooldowns", async () => {
+  const sessionId = "session-admin-expired-cooldown";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    "github:budget:v1:shared:graphql": JSON.stringify({
+      active: true,
+      resource: "graphql",
+      remaining: 0,
+      limit: 5000,
+      resetAt: "2000-01-01T00:00:00.000Z",
+      reason: "expired",
+    }),
+    "github:budget:v1:shared:_": JSON.stringify({
+      active: true,
+      resource: "graphql",
+      remaining: 0,
+      limit: 5000,
+      resetAt: "2000-01-01T00:00:00.000Z",
+      reason: "expired",
+    }),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/github-access?hours=1", {
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    {
+      AUTH_COOKIE_SECRET: "test-secret",
+      DASHBOARD_CACHE: cache,
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { cooldown?: { active?: boolean } };
+  assert.equal(body.cooldown?.active, false);
+  assert.equal(await cache.get("github:budget:v1:shared:_"), null);
+});
+
+test("worker admin GitHub access keeps longest active shared quota cooldown", async () => {
+  const sessionId = "session-admin-longest-cooldown";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    "github:budget:v1:shared:_": JSON.stringify({
+      active: true,
+      resource: "core",
+      remaining: 10,
+      limit: 5000,
+      resetAt: "2999-01-01T00:00:00.000Z",
+      reason: "shorter",
+    }),
+    "github:budget:v1:shared:graphql": JSON.stringify({
+      active: true,
+      resource: "graphql",
+      remaining: 0,
+      limit: 5000,
+      resetAt: "3000-01-01T00:00:00.000Z",
+      reason: "longer",
+    }),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/github-access?hours=1", {
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    {
+      AUTH_COOKIE_SECRET: "test-secret",
+      DASHBOARD_CACHE: cache,
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { cooldown?: { resource?: string | null } };
+  assert.equal(body.cooldown?.resource, "graphql");
+});
+
+test("worker admin scheduler defers shared quota paused targets even with missing cache", async () => {
+  const sessionId = "session-admin-shared-quota-defer";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const target: RefreshTarget = {
+    key: "dashboard:v5:owner=openclaw",
+    kind: "dashboard",
+    owner: "openclaw",
+    owners: ["openclaw"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/openclaw",
+    priority: 100,
+    lastSeenAt: "2026-05-15T12:00:00Z",
+    lastAttemptAt: "2026-05-15T13:00:00Z",
+    lastSuccessAt: null,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+    message: "shared GitHub quota paused until 2999-01-01T00:00:00Z",
+  };
+  const sentJobs: RefreshJob[] = [];
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler/run", {
+      method: "POST",
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    {
+      AUTH_COOKIE_SECRET: "test-secret",
+      DASHBOARD_CACHE: cache,
+      REFRESH_QUEUE: {
+        async send(job: RefreshJob) {
+          sentJobs.push(job);
+        },
+      },
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { due: number; enqueued: number };
+  assert.equal(body.due, 0);
+  assert.equal(body.enqueued, 0);
+  assert.deepEqual(sentJobs, []);
+});
+
+test("worker admin scheduler lets app-token targets bypass shared quota pauses", async () => {
+  const sessionId = "session-admin-shared-quota-app-bypass";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const target: RefreshTarget = {
+    key: "dashboard:v5:owner=openclaw",
+    kind: "dashboard",
+    owner: "openclaw",
+    owners: ["openclaw"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/openclaw",
+    priority: 100,
+    lastSeenAt: "2026-05-15T12:00:00Z",
+    lastAttemptAt: "2026-05-15T13:00:00Z",
+    lastSuccessAt: null,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+    message: "shared GitHub quota paused until 2999-01-01T00:00:00Z",
+  };
+  const sentJobs: RefreshJob[] = [];
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    "auth:installation:v1:openclaw": JSON.stringify({
+      id: 42,
+      accountLogin: "openclaw",
+      accountType: "org",
+      accountUrl: "https://github.com/openclaw",
+      avatarUrl: "https://avatars.githubusercontent.com/u/2",
+      repositorySelection: "all",
+      repositories: [],
+      updatedAt: new Date().toISOString(),
+    }),
+    "auth:installation-token:42": "installation-token",
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler/run", {
+      method: "POST",
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    {
+      AUTH_COOKIE_SECRET: "test-secret",
+      DASHBOARD_CACHE: cache,
+      GITHUB_APP_ID: "123",
+      GITHUB_APP_PRIVATE_KEY: "private-key",
+      REFRESH_QUEUE: {
+        async send(job: RefreshJob) {
+          sentJobs.push(job);
+        },
+      },
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { due: number; enqueued: number };
+  assert.equal(body.due, 1);
+  assert.equal(body.enqueued, 1);
+  assert.equal(sentJobs[0]?.reason, "app-quota");
+});
+
+test("worker admin scheduler uses app registry coverage without minting tokens", async () => {
+  const sessionId = "session-admin-shared-quota-app-registry";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const target: RefreshTarget = {
+    key: "dashboard:v5:owner=openclaw",
+    kind: "dashboard",
+    owner: "openclaw",
+    owners: ["openclaw"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/openclaw",
+    priority: 100,
+    lastSeenAt: "2026-05-15T12:00:00Z",
+    lastAttemptAt: "2026-05-15T13:00:00Z",
+    lastSuccessAt: null,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+    message: "shared GitHub quota paused until 2999-01-01T00:00:00Z",
+  };
+  const sentJobs: RefreshJob[] = [];
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    "auth:installation:v1:openclaw": JSON.stringify({
+      id: 42,
+      accountLogin: "openclaw",
+      accountType: "org",
+      accountUrl: "https://github.com/openclaw",
+      avatarUrl: "https://avatars.githubusercontent.com/u/2",
+      repositorySelection: "all",
+      repositories: [],
+      updatedAt: new Date().toISOString(),
+    }),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler/run", {
+      method: "POST",
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    {
+      AUTH_COOKIE_SECRET: "test-secret",
+      DASHBOARD_CACHE: cache,
+      GITHUB_APP_ID: "123",
+      GITHUB_APP_PRIVATE_KEY: "not-a-private-key",
+      REFRESH_QUEUE: {
+        async send(job: RefreshJob) {
+          sentJobs.push(job);
+        },
+      },
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { due: number; enqueued: number };
+  assert.equal(body.due, 1);
+  assert.equal(body.enqueued, 1);
+  assert.equal(sentJobs[0]?.reason, "app-quota");
+});
+
+test("worker admin scheduler bypasses shared quota defer time with app coverage", async () => {
+  const sessionId = "session-admin-shared-quota-app-stale";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const key = dashboardCacheKey({
+    owner: "openclaw",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 5,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "openclaw",
+    owners: ["openclaw"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/openclaw",
+    priority: 100,
+    lastSeenAt: "2026-05-15T12:00:00Z",
+    lastAttemptAt: "2026-05-15T13:00:00Z",
+    lastSuccessAt: "2026-05-15T13:00:00Z",
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+    message: "shared GitHub quota paused until 2999-01-01T00:00:00Z",
+  };
+  const sentJobs: RefreshJob[] = [];
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    "auth:installation:v1:openclaw": JSON.stringify({
+      id: 42,
+      accountLogin: "openclaw",
+      accountType: "org",
+      accountUrl: "https://github.com/openclaw",
+      avatarUrl: "https://avatars.githubusercontent.com/u/2",
+      repositorySelection: "all",
+      repositories: [],
+      updatedAt: new Date().toISOString(),
+    }),
+    [key]: JSON.stringify(
+      testDashboard("openclaw", [testProject({ owner: "openclaw", name: "repo" })]),
+    ),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler/run", {
+      method: "POST",
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    {
+      AUTH_COOKIE_SECRET: "test-secret",
+      DASHBOARD_CACHE: cache,
+      GITHUB_APP_ID: "123",
+      GITHUB_APP_PRIVATE_KEY: "not-a-private-key",
+      REFRESH_QUEUE: {
+        async send(job: RefreshJob) {
+          sentJobs.push(job);
+        },
+      },
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { due: number; enqueued: number };
+  assert.equal(body.due, 1);
+  assert.equal(body.enqueued, 1);
+  assert.equal(sentJobs[0]?.reason, "app-quota");
 });
 
 test("worker scheduler marks jobs failed when queue delivery fails", async () => {
@@ -6717,6 +7309,175 @@ test("worker refresh jobs can use shared quota when no source app token exists",
   assert.equal(buildDone?.status, "fresh");
   assert.equal(buildDone?.projects, 0);
   assert.deepEqual(paths, ["/users/openclaw", "/graphql"]);
+});
+
+test("worker refresh jobs defer shared work while shared quota is paused", async () => {
+  const key = dashboardCacheKey({
+    owner: "openclaw",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 5,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "openclaw",
+    owners: ["openclaw"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/openclaw",
+    priority: 100,
+    lastSeenAt: "2026-05-15T12:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-05-15T13:00:00Z",
+    failureCount: 0,
+  };
+  const job: RefreshJob = {
+    id: "job-shared-paused",
+    targetKey: key,
+    kind: "dashboard",
+    status: "queued",
+    reason: "scheduled",
+    createdAt: "2026-05-15T13:00:00Z",
+    updatedAt: "2026-05-15T13:00:00Z",
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const cache = kvStore({
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+    [`refresh:job:v1:${job.id}`]: JSON.stringify(job),
+    "github:budget:v1:shared:_": JSON.stringify({
+      active: true,
+      resource: "core",
+      remaining: 42,
+      limit: 5000,
+      resetAt: "2999-01-01T00:00:00.000Z",
+      reason: "remaining 42 <= 500",
+    }),
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("shared quota pause should skip GitHub fetches");
+  };
+  let acked = false;
+  try {
+    await (
+      worker as unknown as {
+        queue(
+          batch: {
+            messages: Array<{
+              body: RefreshJob;
+              ack(): void;
+              retry(options?: { delaySeconds?: number }): void;
+            }>;
+          },
+          env: unknown,
+          context: unknown,
+        ): Promise<void>;
+      }
+    ).queue(
+      {
+        messages: [
+          {
+            body: job,
+            ack() {
+              acked = true;
+            },
+            retry() {
+              throw new Error("job should not retry");
+            },
+          },
+        ],
+      },
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(acked, true);
+  const updated = JSON.parse((await cache.get(`refresh:job:v1:${job.id}`)) ?? "{}") as RefreshJob;
+  assert.equal(updated.status, "skipped");
+  assert.match(updated.error ?? "", /remaining 42/);
+  const storedTarget = JSON.parse(
+    (await cache.get(`refresh:target:v1:${key}`)) ?? "{}",
+  ) as RefreshTarget;
+  assert.match(storedTarget.message ?? "", /shared GitHub quota paused/);
+});
+
+test("worker skips request-triggered progressive rebuilds while shared quota is paused", async () => {
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 5,
+  });
+  const dashboard = testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]);
+  const cache = kvStore({
+    [key]: JSON.stringify(dashboard),
+    "github:budget:v1:shared:_": JSON.stringify({
+      active: true,
+      resource: "core",
+      remaining: 42,
+      limit: 5000,
+      resetAt: "2999-01-01T00:00:00.000Z",
+      reason: "remaining 42 <= 500",
+    }),
+  });
+  const waits: Array<Promise<unknown>> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("shared quota pause should skip progressive GitHub fetches");
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/owner"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    assert.equal(response.status, 200);
+    assert.equal(waits.length > 0, true);
+    await Promise.all(waits);
+    const events = await refreshAuditEvents(cache);
+    assert.equal(
+      events.some((event) => event.event === "dashboard_progressive_skip"),
+      true,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker does not pause shared quota for ordinary forbidden responses", async () => {
+  const cache = kvStore();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    Response.json(
+      { message: "Resource not accessible by integration" },
+      {
+        status: 403,
+        headers: {
+          "x-ratelimit-remaining": "4999",
+          "x-ratelimit-limit": "5000",
+          "x-ratelimit-resource": "core",
+        },
+      },
+    );
+  try {
+    await worker.fetch(
+      new Request("https://release.bar/api/owner"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(await cache.get("github:budget:v1:shared:_"), null);
+    assert.equal(await cache.get("github:budget:v1:shared:core"), null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("safeReturnTo accepts the current request origin, including workers.dev", async () => {
@@ -8399,6 +9160,57 @@ test("dashboard metadata-only released-only mode keeps released-only semantics",
   assert.equal(payload.totals.repos, 0);
   assert.equal(payload.totals.unreleased, 0);
   assert.match(payload.cache?.message ?? "", /release scan skipped/);
+});
+
+test("dashboard shared owner page cap finishes as fresh capped data", async () => {
+  const repo = (name: string) => ({
+    owner: { login: "owner" },
+    name,
+    full_name: `owner/${name}`,
+    description: null,
+    html_url: `https://github.com/owner/${name}`,
+    default_branch: "main",
+    language: null,
+    stargazers_count: 0,
+    forks_count: 0,
+    open_issues_count: 0,
+    archived: false,
+    pushed_at: "2026-01-02T00:00:00Z",
+    updated_at: "2026-01-02T00:00:00Z",
+    fork: false,
+    private: false,
+  });
+  const pages: string[] = [];
+
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    quotaSource: "shared",
+    repoLimit: 400,
+    repoScanLimit: 0,
+    fetch: async (url) => {
+      const parsed = new URL(String(url));
+      const path = parsed.pathname;
+      if (path === "/users/owner/repos") {
+        const page = parsed.searchParams.get("page") ?? "";
+        pages.push(page);
+        return Response.json(
+          Array.from({ length: 100 }, (_, index) => repo(`page-${page}-${index}`)),
+        );
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+  });
+
+  assert.deepEqual(pages, ["1", "2", "3"]);
+  assert.equal(payload.cache?.state, "fresh");
+  assert.equal(payload.cache?.progress?.done, undefined);
+  assert.equal(payload.cache?.capped, true);
 });
 
 test("dashboard repo scan cap marks full page boundary truncation as capped", async () => {

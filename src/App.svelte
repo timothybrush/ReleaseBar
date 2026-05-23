@@ -1590,6 +1590,14 @@
       .join(" · ");
   }
 
+  function adminAccessLabel(row: { source: string; account: string | null; resource: string | null; status: number }): string {
+    return [
+      `${row.source}${row.account ? `:${row.account}` : ""}`,
+      row.resource ?? "unknown",
+      `HTTP ${row.status}`,
+    ].join(" · ");
+  }
+
   async function loadDashboard(attempt = 0): Promise<void> {
     const forceRefresh = new URLSearchParams(location.search).has("rdRefresh");
     const bypassCache = attempt > 0 || forceRefresh;
@@ -2542,8 +2550,48 @@
             <span>failed</span>
             <strong>{numberFormat.format(admin.status.failedJobs)}</strong>
           </div>
+          <div>
+            <span>GitHub calls</span>
+            <strong>{numberFormat.format(admin.githubAccess.total)}</strong>
+          </div>
+          <div>
+            <span>shared pause</span>
+            <strong>{admin.githubAccess.cooldown.active ? "on" : "off"}</strong>
+          </div>
         </div>
         <div class="admin-grid">
+          <section class="admin-panel admin-wide">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-kicker">GitHub token use</span>
+                <h2>{admin.githubAccess.hours}h window</h2>
+              </div>
+              <strong>{numberFormat.format(admin.githubAccess.buckets)} buckets</strong>
+            </div>
+            {#if admin.githubAccess.cooldown.active}
+              <p class="admin-message inline">
+                shared quota paused · {admin.githubAccess.cooldown.reason ?? "budget guard"} · resets {adminAge(admin.githubAccess.cooldown.resetAt)}
+              </p>
+            {/if}
+            <div class="admin-list compact token-use">
+              {#each admin.githubAccess.topRoutes as route}
+                <div class={`admin-row status-${route.status >= 400 ? "failed" : "succeeded"}`}>
+                  <span>
+                    <strong>{route.area} · {route.route}</strong>
+                    <small>{adminAccessLabel(route)}</small>
+                  </span>
+                  <span>
+                    <strong>{numberFormat.format(route.count)}</strong>
+                    <small>{route.lastAt ? `last ${adminAge(route.lastAt)}` : (route.lastPath ?? route.key)}</small>
+                  </span>
+                </div>
+              {/each}
+              {#if admin.githubAccess.topRoutes.length === 0}
+                <p class="detail-empty">No GitHub token counters in the current window.</p>
+              {/if}
+            </div>
+          </section>
+
           <section class="admin-panel admin-wide">
             <div class="panel-heading">
               <div>

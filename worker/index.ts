@@ -77,6 +77,8 @@ import type {
   RefreshTarget,
   SchedulerAdminPayload,
   SchedulerAuditEvent,
+  GitHubAccessSummary,
+  GitHubAccessRouteSummary,
   AudienceScoreFactor,
   TrustProfilePayload,
 } from "../src/types.js";
@@ -169,8 +171,8 @@ const hotSourceLimit = 24;
 const hotIndexLimit = 100;
 const hotCacheTtlMs = 5 * 60 * 1000;
 const discoverLimit = 40;
-const discoverHydrateLimit = discoverLimit;
-const discoverHydrateBatchSize = 12;
+const discoverHydrateLimit = 24;
+const discoverHydrateBatchSize = 8;
 const discoverCacheTtlMs = 60 * 60 * 1000;
 const repoDetailCacheTtlMs = 6 * 60 * 60 * 1000;
 const repoDetailWarmingRefreshMs = 30 * 1000;
@@ -200,6 +202,19 @@ const ownerCachePrefix = `owner:v1:`;
 const ownerCacheTtlSeconds = 7 * 24 * 60 * 60;
 const githubAccessPrefix = `github:access:v1:`;
 const githubAccessTtlSeconds = 14 * 24 * 60 * 60;
+const githubAccessShardCount = 16;
+const githubSharedBudgetPrefix = `github:budget:v1:shared:`;
+const githubGraphqlBackoffPrefix = `github:backoff:v1:graphql:`;
+const githubAccessAdminHours = 24;
+const githubAccessAdminRouteLimit = 30;
+const sharedQuotaCooldownFallbackSeconds = 30 * 60;
+const sharedQuotaMinimumRemaining: Record<string, number> = {
+  core: 500,
+  graphql: 1000,
+  search: 3,
+  integration_manifest: 20,
+  _: 250,
+};
 const refreshTargetPrefix = `refresh:target:v1:`;
 const refreshJobPrefix = `refresh:job:v1:`;
 const refreshJobIndexKey = `refresh:jobs:index:v1`;
@@ -528,18 +543,148 @@ function githubPathBucket(path: string): string {
   return url.pathname;
 }
 
-function githubAccessCounterKey(
-  area: GitHubAuditArea,
-  path: string,
-  status: number,
-  quota: ApiQuota,
-): string {
+function githubAccessCounterKey(shard: number): string {
   const hour = new Date().toISOString().slice(0, 13);
-  const source = quota.source;
-  const account = quota.account ?? "_";
-  const resource = quota.resource ?? "_";
-  const route = githubPathBucket(path).replaceAll("/", "~");
-  return `${githubAccessPrefix}${hour}:${area}:${source}:${account}:${resource}:${status}:${route}`;
+  return `${githubAccessPrefix}${hour}:${shard}`;
+}
+
+type SharedQuotaCooldown = {
+  active: boolean;
+  resource: string | null;
+  remaining: number | null;
+  limit: number | null;
+  resetAt: string | null;
+  reason: string | null;
+};
+
+function sharedQuotaThreshold(resource: string | null): number {
+  return sharedQuotaMinimumRemaining[resource ?? "_"] ?? sharedQuotaMinimumRemaining._;
+}
+
+function sharedQuotaBudgetKey(resource: string | null): string {
+  return `${githubSharedBudgetPrefix}${resource ?? "_"}`;
+}
+
+function sharedQuotaCooldownTtlSeconds(resetAt: string | null): number {
+  const resetMs = resetAt ? Date.parse(resetAt) - Date.now() : 0;
+  if (Number.isFinite(resetMs) && resetMs > 0) {
+    return Math.max(60, Math.min(2 * 60 * 60, Math.ceil(resetMs / 1000)));
+  }
+  return sharedQuotaCooldownFallbackSeconds;
+}
+
+async function markSharedQuotaCooldown(
+  env: Env | undefined,
+  quota: ApiQuota,
+  reason: string,
+): Promise<void> {
+  if (!env?.DASHBOARD_CACHE || quota.source !== "shared") return;
+  const resetAt =
+    quota.resetAt ?? new Date(Date.now() + sharedQuotaCooldownFallbackSeconds * 1000).toISOString();
+  const item: SharedQuotaCooldown = {
+    active: true,
+    resource: quota.resource,
+    remaining: quota.remaining,
+    limit: quota.limit,
+    resetAt,
+    reason,
+  };
+  const ttl = sharedQuotaCooldownTtlSeconds(resetAt);
+  await Promise.all([
+    env.DASHBOARD_CACHE.put(sharedQuotaBudgetKey(null), JSON.stringify(item), {
+      expirationTtl: ttl,
+    }),
+    env.DASHBOARD_CACHE.put(sharedQuotaBudgetKey(quota.resource), JSON.stringify(item), {
+      expirationTtl: ttl,
+    }),
+  ]);
+}
+
+async function sharedQuotaCooldown(
+  env: Env,
+  resource: string | null = null,
+): Promise<SharedQuotaCooldown> {
+  const empty: SharedQuotaCooldown = {
+    active: false,
+    resource: null,
+    remaining: null,
+    limit: null,
+    resetAt: null,
+    reason: null,
+  };
+  const keys = new Set(
+    resource
+      ? [sharedQuotaBudgetKey(resource), sharedQuotaBudgetKey(null)]
+      : [sharedQuotaBudgetKey(null)],
+  );
+  if (!resource && env.DASHBOARD_CACHE?.list) {
+    let cursor: string | undefined;
+    do {
+      const page = await env.DASHBOARD_CACHE.list({
+        prefix: githubSharedBudgetPrefix,
+        limit: 1000,
+        ...(cursor ? { cursor } : {}),
+      });
+      for (const key of page.keys) keys.add(key.name);
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+  }
+  let selected: SharedQuotaCooldown | null = null;
+  let selectedUntil = 0;
+  for (const key of keys) {
+    const raw = await env.DASHBOARD_CACHE?.get(key);
+    if (!raw) continue;
+    const parsed = tryJsonParse<SharedQuotaCooldown>(raw, `shared quota cooldown ${key}`);
+    if (!parsed?.active) continue;
+    const reset = parsed.resetAt ? Date.parse(parsed.resetAt) : 0;
+    if (Number.isFinite(reset) && reset > 0 && reset <= Date.now()) {
+      await env.DASHBOARD_CACHE?.delete?.(key).catch(() => undefined);
+      continue;
+    }
+    const until = Date.parse(sharedQuotaDeferUntil(parsed));
+    if (!selected || until > selectedUntil) {
+      selected = parsed;
+      selectedUntil = until;
+    }
+  }
+  return selected ?? empty;
+}
+
+function sharedQuotaDeferUntil(cooldown: SharedQuotaCooldown): string {
+  const reset = cooldown.resetAt ? Date.parse(cooldown.resetAt) : 0;
+  const next = Number.isFinite(reset) && reset > Date.now() ? reset : Date.now() + 30 * 60 * 1000;
+  return new Date(next).toISOString();
+}
+
+function githubGraphqlBackoffKey(source: ApiQuota["source"], account: string | null): string {
+  return `${githubGraphqlBackoffPrefix}${source}:${account ?? "_"}`;
+}
+
+async function graphqlBackoffActive(
+  env: Env | undefined,
+  source: ApiQuota["source"],
+  account: string | null,
+): Promise<boolean> {
+  return Boolean(await env?.DASHBOARD_CACHE?.get(githubGraphqlBackoffKey(source, account)));
+}
+
+async function markGraphqlBackoff(
+  env: Env | undefined,
+  source: ApiQuota["source"],
+  account: string | null,
+  status: number,
+): Promise<void> {
+  await env?.DASHBOARD_CACHE?.put(
+    githubGraphqlBackoffKey(source, account),
+    JSON.stringify({
+      active: true,
+      status,
+      source,
+      account,
+      at: new Date().toISOString(),
+    }),
+    { expirationTtl: 15 * 60 },
+  );
 }
 
 async function recordGitHubAccessCounter(
@@ -550,24 +695,92 @@ async function recordGitHubAccessCounter(
   quota: ApiQuota,
 ): Promise<void> {
   if (!env?.DASHBOARD_CACHE) return;
-  const key = githubAccessCounterKey(area, path, status, quota);
+  const route = githubPathBucket(path);
+  const routeKey = `${area}:${status}:${quota.source}:${quota.account ?? "_"}:${quota.resource ?? "_"}:${route}`;
+  const key = githubAccessCounterKey(Math.floor(Math.random() * githubAccessShardCount));
   const raw = await env.DASHBOARD_CACHE.get(key);
-  const current = raw ? tryJsonParse<{ count?: number }>(raw, `github access ${key}`) : null;
+  const current = raw ? tryJsonParse<StoredGitHubAccessShard>(raw, `github access ${key}`) : null;
+  const routes = { ...current?.routes };
+  const existing = routes[routeKey];
+  const lastAt = new Date().toISOString();
+  routes[routeKey] = {
+    key: routeKey,
+    area,
+    route,
+    status,
+    source: quota.source,
+    account: quota.account,
+    resource: quota.resource,
+    count: (existing?.count ?? 0) + 1,
+    lastPath: path.slice(0, 240),
+    lastAt,
+  };
   await env.DASHBOARD_CACHE.put(
     key,
     JSON.stringify({
-      area,
-      route: githubPathBucket(path),
-      status,
-      source: quota.source,
-      account: quota.account,
-      resource: quota.resource,
       count: (current?.count ?? 0) + 1,
-      lastPath: path.slice(0, 240),
-      lastAt: new Date().toISOString(),
+      lastAt,
+      routes,
     }),
     { expirationTtl: githubAccessTtlSeconds },
   );
+  if (sharedQuotaPressure(status, quota, false)) {
+    await markSharedQuotaCooldown(env, quota, sharedQuotaCooldownReason(status, quota, false));
+  }
+}
+
+function sharedQuotaPressure(status: number, quota: ApiQuota, rateLimited = false): boolean {
+  return (
+    quota.source === "shared" &&
+    ((quota.remaining !== null && quota.remaining <= sharedQuotaThreshold(quota.resource)) ||
+      status === 429 ||
+      rateLimited)
+  );
+}
+
+function sharedQuotaCooldownReason(status: number, quota: ApiQuota, rateLimited = false): string {
+  if (rateLimited) return `rate limited status ${status}`;
+  if (quota.remaining !== null && quota.remaining <= sharedQuotaThreshold(quota.resource)) {
+    return `remaining ${quota.remaining} <= ${sharedQuotaThreshold(quota.resource)}`;
+  }
+  return `status ${status}`;
+}
+
+async function recordAuditedGitHubAccess(
+  env: Env | undefined,
+  area: GitHubAuditArea,
+  path: string,
+  status: number,
+  quota: ApiQuota,
+  rateLimited = false,
+  forceWait = false,
+): Promise<void> {
+  auditGitHubTokenUse(area, path, status, quota);
+  const write = recordGitHubAccessCounter(env, area, path, status, quota)
+    .then(() =>
+      sharedQuotaPressure(status, quota, rateLimited)
+        ? markSharedQuotaCooldown(env, quota, sharedQuotaCooldownReason(status, quota, rateLimited))
+        : undefined,
+    )
+    .catch(() => undefined);
+  if (forceWait || sharedQuotaPressure(status, quota, rateLimited)) {
+    await write;
+  } else {
+    void write;
+  }
+}
+
+async function responseRateLimitSignal(response: Response): Promise<boolean> {
+  if (response.status !== 403 && response.status !== 429) return false;
+  if (response.status === 429 || response.headers.get("x-ratelimit-remaining") === "0") {
+    return true;
+  }
+  const body = (await response
+    .clone()
+    .json()
+    .catch(() => null)) as { message?: unknown } | null;
+  const message = body && typeof body.message === "string" ? body.message : "";
+  return isRateLimitResponse(response, message);
 }
 
 function auditGitHubFetch(
@@ -577,15 +790,61 @@ function auditGitHubFetch(
   env?: Env,
 ): typeof fetch {
   return async (input, init) => {
-    const response = await workerFetch(input, init);
     const url = new URL(String(input));
+    if (
+      url.hostname === "api.github.com" &&
+      url.pathname === "/graphql" &&
+      quotaSource === "shared" &&
+      (await graphqlBackoffActive(env, quotaSource, quotaAccount))
+    ) {
+      console.log(
+        JSON.stringify({
+          event: "github_graphql_backoff_skip",
+          area,
+          source: quotaSource,
+          account: quotaAccount,
+        }),
+      );
+      return jsonResponse(
+        { message: "GitHub GraphQL temporarily paused after upstream errors" },
+        503,
+        { "cache-control": "no-store", "x-releasebar-github-backoff": "graphql" },
+      );
+    }
+    const response = await workerFetch(input, init);
     if (url.hostname === "api.github.com") {
       const path = `${url.pathname}${url.search}`;
       const quota = quotaFromGitHubResponse(response, quotaSource, quotaAccount);
-      auditGitHubTokenUse(area, path, response.status, quota);
-      void recordGitHubAccessCounter(env, area, path, response.status, quota).catch(
-        () => undefined,
+      const rateLimited =
+        quota.source === "shared" ? await responseRateLimitSignal(response) : false;
+      const isGraphqlServerError =
+        url.pathname === "/graphql" && response.status >= 500 && response.status < 600;
+      const shouldWaitAccess =
+        sharedQuotaPressure(response.status, quota, rateLimited) ||
+        (quotaSource === "shared" && isGraphqlServerError);
+      const accessRecord = recordAuditedGitHubAccess(
+        env,
+        area,
+        path,
+        response.status,
+        quota,
+        rateLimited,
+        shouldWaitAccess,
       );
+      if (isGraphqlServerError) {
+        const backoffWrite = markGraphqlBackoff(env, quotaSource, quotaAccount, response.status);
+        if (quotaSource === "shared") {
+          await Promise.all([accessRecord, backoffWrite.catch(() => undefined)]);
+          return jsonResponse(
+            { message: "GitHub GraphQL temporarily paused after upstream errors" },
+            503,
+            { "cache-control": "no-store", "x-releasebar-github-backoff": "graphql" },
+          );
+        }
+        void backoffWrite.catch(() => undefined);
+      }
+      if (shouldWaitAccess) await accessRecord;
+      void accessRecord;
     }
     return response;
   };
@@ -1164,6 +1423,8 @@ async function buildSocialRepoProject(
     quotaAccount,
     onQuota,
     "social-card",
+    undefined,
+    env,
   );
   if (repo.private) return null;
   const releases = await detailGitHubJson(
@@ -1175,6 +1436,8 @@ async function buildSocialRepoProject(
     quotaAccount,
     onQuota,
     "social-card",
+    undefined,
+    env,
   );
   const latestRelease = releases.find((release) => !release.draft) ?? null;
   const compare = latestRelease
@@ -1188,6 +1451,8 @@ async function buildSocialRepoProject(
           quotaAccount,
           onQuota,
           "social-card",
+          undefined,
+          env,
         ),
         null,
       )
@@ -2361,6 +2626,14 @@ async function sourceInstallationToken(
     : null;
 }
 
+async function sourceInstallationRegistryCovers(env: Env, sources: TokenSources): Promise<boolean> {
+  if (!appTokenConfigured(env)) return false;
+  const accounts = sourceAccounts(sources);
+  if (accounts.length !== 1) return false;
+  const installation = await readInstallationRegistry(env, accounts[0]!);
+  return Boolean(installation && installationCoversSources(installation, sources));
+}
+
 async function requestInstallationToken(
   request: Request,
   env: Env,
@@ -3126,6 +3399,153 @@ async function listAuditEvents(env: Env): Promise<SchedulerAuditEvent[]> {
     .slice(0, refreshAuditListLimit);
 }
 
+type StoredGitHubAccessCounter = GitHubAccessRouteSummary & {
+  remaining?: number | null;
+  limit?: number | null;
+  resetAt?: string | null;
+};
+
+type StoredGitHubAccessShard = {
+  count?: number;
+  lastAt?: string | null;
+  routes?: Record<string, GitHubAccessRouteSummary>;
+};
+
+function githubAccessHours(hours: number): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (let index = 0; index <= hours; index += 1) {
+    const hour = new Date(Date.now() - index * 60 * 60 * 1000).toISOString().slice(0, 13);
+    if (!seen.has(hour)) {
+      seen.add(hour);
+      result.push(hour);
+    }
+  }
+  return result;
+}
+
+function incrementSummary(map: Map<string, number>, key: string, count: number): void {
+  map.set(key, (map.get(key) ?? 0) + count);
+}
+
+function summaryRows(map: Map<string, number>): Array<{ key: string; count: number }> {
+  return [...map.entries()]
+    .map(([key, count]) => ({ key, count }))
+    .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key));
+}
+
+async function githubAccessSummary(
+  env: Env,
+  hours = githubAccessAdminHours,
+): Promise<GitHubAccessSummary> {
+  const cooldown = await sharedQuotaCooldown(env);
+  if (!env.DASHBOARD_CACHE?.list) {
+    return {
+      generatedAt: new Date().toISOString(),
+      hours,
+      buckets: 0,
+      total: 0,
+      cooldown,
+      byArea: [],
+      bySource: [],
+      byStatus: [],
+      topRoutes: [],
+    };
+  }
+  const keys: string[] = [];
+  for (const hour of githubAccessHours(hours)) {
+    const page = await env.DASHBOARD_CACHE.list({
+      prefix: `${githubAccessPrefix}${hour}:`,
+      limit: 1000,
+    });
+    keys.push(...page.keys.map((key) => key.name));
+  }
+
+  const counters = await Promise.all(
+    keys.map(async (key): Promise<GitHubAccessRouteSummary[]> => {
+      const raw = await env.DASHBOARD_CACHE?.get(key);
+      if (!raw) return [];
+      const parsed = tryJsonParse<StoredGitHubAccessShard | StoredGitHubAccessCounter>(
+        raw,
+        `github access ${key}`,
+      );
+      if (!parsed) return [];
+      if ("routes" in parsed && parsed.routes) {
+        return Object.values(parsed.routes).map((route) => ({
+          ...route,
+          account: route.account ?? null,
+          resource: route.resource ?? null,
+          lastAt: route.lastAt ?? null,
+          lastPath: route.lastPath ?? null,
+        }));
+      }
+      const counter = parsed as StoredGitHubAccessCounter;
+      if (typeof counter.count !== "number" || !counter.route) return [];
+      return [
+        {
+          ...counter,
+          key,
+          account: counter.account ?? null,
+          resource: counter.resource ?? null,
+          lastAt: counter.lastAt ?? null,
+          lastPath: counter.lastPath ?? null,
+        },
+      ];
+    }),
+  );
+
+  const byArea = new Map<string, number>();
+  const bySource = new Map<string, number>();
+  const byStatus = new Map<string, number>();
+  const routeCounts = new Map<string, GitHubAccessRouteSummary>();
+  let total = 0;
+  for (const counter of counters.flat()) {
+    const count = counter.count;
+    total += count;
+    incrementSummary(byArea, counter.area, count);
+    incrementSummary(bySource, `${counter.source}:${counter.account ?? "_"}`, count);
+    incrementSummary(
+      byStatus,
+      `${counter.status}:${counter.resource ?? "_"}:${counter.area}`,
+      count,
+    );
+    const routeKey = `${counter.area}:${counter.status}:${counter.source}:${counter.account ?? "_"}:${counter.resource ?? "_"}:${counter.route}`;
+    const existing = routeCounts.get(routeKey);
+    routeCounts.set(routeKey, {
+      key: routeKey,
+      area: counter.area,
+      route: counter.route,
+      status: counter.status,
+      source: counter.source,
+      account: counter.account ?? null,
+      resource: counter.resource ?? null,
+      count: (existing?.count ?? 0) + count,
+      lastAt:
+        !existing?.lastAt || (counter.lastAt && safeIso(counter.lastAt) > safeIso(existing.lastAt))
+          ? counter.lastAt
+          : existing.lastAt,
+      lastPath:
+        !existing?.lastAt || (counter.lastAt && safeIso(counter.lastAt) > safeIso(existing.lastAt))
+          ? counter.lastPath
+          : existing.lastPath,
+    });
+  }
+
+  return {
+    generatedAt: new Date().toISOString(),
+    hours,
+    buckets: keys.length,
+    total,
+    cooldown,
+    byArea: summaryRows(byArea),
+    bySource: summaryRows(bySource),
+    byStatus: summaryRows(byStatus),
+    topRoutes: [...routeCounts.values()]
+      .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key))
+      .slice(0, githubAccessAdminRouteLimit),
+  };
+}
+
 function refreshJob(target: RefreshTarget, reason: string): RefreshJob {
   const now = new Date().toISOString();
   return {
@@ -3184,11 +3604,33 @@ function refreshTargetDue(target: RefreshTarget, cached: DashboardPayload | null
 }
 
 function refreshReason(target: RefreshTarget, cached: DashboardPayload | null): string {
+  if (sharedQuotaDeferredTarget(target)) return "app-quota";
   if (!cached) return "missing-cache";
   if (!canDisplayCached(cached)) return "expired-cache";
   if (cached.cache?.state === "error") return "error-cache";
   if (cached.cache?.progress?.done === false) return "partial-cache";
   return Date.now() >= safeIso(target.nextDueAt) ? "scheduled" : "not-due";
+}
+
+function sharedQuotaDeferredTarget(target: RefreshTarget): boolean {
+  return (
+    typeof target.message === "string" &&
+    target.message.startsWith("shared GitHub quota paused until ") &&
+    Date.now() < safeIso(target.nextDueAt)
+  );
+}
+
+async function schedulerTargetDue(
+  env: Env,
+  target: RefreshTarget,
+  cached: DashboardPayload | null,
+): Promise<boolean> {
+  if (!sharedQuotaDeferredTarget(target)) return refreshTargetDue(target, cached);
+  const hasAppTokenCoverage = await sourceInstallationRegistryCovers(env, {
+    owners: target.owners,
+    repos: target.repos,
+  }).catch(() => false);
+  return hasAppTokenCoverage;
 }
 
 async function schedulerTick(
@@ -3206,8 +3648,14 @@ async function schedulerTick(
   const pairs = await Promise.all(
     targets.map(async (target) => ({ target, cached: await readCached(env, target.key) })),
   );
-  const due = pairs
-    .filter(({ target, cached }) => refreshTargetDue(target, cached))
+  const duePairs = await Promise.all(
+    pairs.map(async (pair) => ({
+      ...pair,
+      due: await schedulerTargetDue(env, pair.target, pair.cached),
+    })),
+  );
+  const due = duePairs
+    .filter(({ due }) => due)
     .filter(({ target }) => !activeTargetKeys.has(target.key))
     .sort(
       (a, b) =>
@@ -3281,6 +3729,36 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
   try {
     const sources = { owners: target.owners, repos: target.repos };
     const token = await sourceInstallationToken(env, sources);
+    const sharedCooldown = !token && env.GITHUB_TOKEN ? await sharedQuotaCooldown(env) : null;
+    if (sharedCooldown?.active) {
+      const nextDueAt = sharedQuotaDeferUntil(sharedCooldown);
+      const now = new Date().toISOString();
+      await writeRefreshTarget(env, {
+        ...target,
+        lastAttemptAt: now,
+        nextDueAt,
+        failureCount: target.failureCount,
+        message: `shared GitHub quota paused until ${nextDueAt}`,
+      });
+      const skipped = {
+        ...job,
+        status: "skipped" as const,
+        finishedAt: now,
+        updatedAt: now,
+        durationMs: Date.now() - startedAt,
+        error: sharedCooldown.reason ?? "shared GitHub quota paused",
+      };
+      await writeRefreshJob(env, skipped);
+      await auditSyncEvent(env, {
+        event: "job_skipped",
+        targetKey: target.key,
+        jobId: job.id,
+        status: "skipped",
+        reason: "shared-quota",
+        detail: `until=${nextDueAt} remaining=${sharedCooldown.remaining ?? "unknown"} resource=${sharedCooldown.resource ?? "any"}`,
+      });
+      return skipped;
+    }
 
     const cached = await readCached(env, target.key);
     const owners =
@@ -3391,11 +3869,12 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
 }
 
 async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
-  const [targets, jobs, events, stateRaw] = await Promise.all([
+  const [targets, jobs, events, stateRaw, access] = await Promise.all([
     listRefreshTargets(env, refreshTargetListLimit),
     listRefreshJobs(env),
     listAuditEvents(env),
     env.DASHBOARD_CACHE?.get(refreshStateKey),
+    githubAccessSummary(env),
   ]);
   const state = stateRaw ? tryJsonParse<{ lastTickAt?: string }>(stateRaw, "refresh state") : null;
   const activeTargetKeys = new Set(
@@ -3406,8 +3885,14 @@ async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
   const targetStates = await Promise.all(
     targets.map(async (target) => ({ target, cached: await readCached(env, target.key) })),
   );
-  const dueTargets = targetStates.filter(
-    ({ target, cached }) => refreshTargetDue(target, cached) && !activeTargetKeys.has(target.key),
+  const dueTargetStates = await Promise.all(
+    targetStates.map(async (state) => ({
+      ...state,
+      due: await schedulerTargetDue(env, state.target, state.cached),
+    })),
+  );
+  const dueTargets = dueTargetStates.filter(
+    ({ target, due }) => due && !activeTargetKeys.has(target.key),
   ).length;
   return {
     generatedAt: new Date().toISOString(),
@@ -3429,6 +3914,7 @@ async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
     targets: targets.sort((a, b) => safeIso(a.nextDueAt) - safeIso(b.nextDueAt)).slice(0, 120),
     jobs,
     events,
+    githubAccess: access,
   };
 }
 
@@ -3827,6 +4313,7 @@ async function detailGitHubJson<TSchema extends GenericSchema>(
   onQuota: (quota: ApiQuota) => void,
   acceptOrAuditArea = "application/vnd.github+json",
   auditArea: GitHubAuditArea = "repo-detail",
+  env?: Env,
 ): Promise<InferOutput<TSchema>> {
   const { data } = await detailGitHubJsonWithHeaders(
     path,
@@ -3838,6 +4325,7 @@ async function detailGitHubJson<TSchema extends GenericSchema>(
     onQuota,
     acceptOrAuditArea,
     auditArea,
+    env,
   );
   return data;
 }
@@ -3852,6 +4340,7 @@ async function detailGitHubJsonWithHeaders<TSchema extends GenericSchema>(
   onQuota: (quota: ApiQuota) => void,
   acceptOrAuditArea = "application/vnd.github+json",
   auditArea: GitHubAuditArea = "repo-detail",
+  env?: Env,
 ): Promise<{ data: InferOutput<TSchema>; headers: Headers }> {
   const requestOptions = githubRequestOptions(acceptOrAuditArea, auditArea);
   const response = await workerFetch(`https://api.github.com${path}`, {
@@ -3864,7 +4353,15 @@ async function detailGitHubJsonWithHeaders<TSchema extends GenericSchema>(
   });
   const quota = quotaFromGitHubResponse(response, quotaSource, quotaAccount);
   onQuota(quota);
-  auditGitHubTokenUse(requestOptions.auditArea, path, response.status, quota);
+  const rateLimited = quota.source === "shared" ? await responseRateLimitSignal(response) : false;
+  await recordAuditedGitHubAccess(
+    env,
+    requestOptions.auditArea,
+    path,
+    response.status,
+    quota,
+    rateLimited,
+  );
   const body = await response.json().catch(() => null);
   if (!response.ok) {
     const message =
@@ -3887,6 +4384,7 @@ async function detailGitHubStats<TSchema extends GenericSchema>(
   quotaAccount: string | null,
   onQuota: (quota: ApiQuota) => void,
   auditArea: GitHubAuditArea = "repo-detail",
+  env?: Env,
 ): Promise<{
   state: "ready" | "warming" | "unavailable";
   data: InferOutput<TSchema> | null;
@@ -3902,7 +4400,8 @@ async function detailGitHubStats<TSchema extends GenericSchema>(
   });
   const quota = quotaFromGitHubResponse(response, quotaSource, quotaAccount);
   onQuota(quota);
-  auditGitHubTokenUse(auditArea, path, response.status, quota);
+  const rateLimited = quota.source === "shared" ? await responseRateLimitSignal(response) : false;
+  await recordAuditedGitHubAccess(env, auditArea, path, response.status, quota, rateLimited);
   if (response.status === 202) {
     return {
       state: "warming",
@@ -3942,6 +4441,7 @@ async function detailGitHubCount(
   quotaAccount: string | null,
   onQuota: (quota: ApiQuota) => void,
   auditArea: GitHubAuditArea = "repo-detail",
+  env?: Env,
 ): Promise<number> {
   const response = await workerFetch(`https://api.github.com${path}`, {
     headers: {
@@ -3953,7 +4453,8 @@ async function detailGitHubCount(
   });
   const quota = quotaFromGitHubResponse(response, quotaSource, quotaAccount);
   onQuota(quota);
-  auditGitHubTokenUse(auditArea, path, response.status, quota);
+  const rateLimited = quota.source === "shared" ? await responseRateLimitSignal(response) : false;
+  await recordAuditedGitHubAccess(env, auditArea, path, response.status, quota, rateLimited);
   const body = await response.json().catch(() => null);
   if (!response.ok) {
     const message =
@@ -3977,6 +4478,7 @@ async function detailGitHubSearchCount(
   quotaAccount: string | null,
   onQuota: (quota: ApiQuota) => void,
   auditArea: GitHubAuditArea = "repo-detail",
+  env?: Env,
 ): Promise<number> {
   const result = await detailGitHubJson(
     `/search/issues?q=${encodeURIComponent(query)}&per_page=1`,
@@ -3987,6 +4489,8 @@ async function detailGitHubSearchCount(
     quotaAccount,
     onQuota,
     auditArea,
+    undefined,
+    env,
   );
   return result.total_count ?? 0;
 }
@@ -3998,6 +4502,7 @@ async function buildWorkTrend(
   quotaAccount: string | null,
   onQuota: (quota: ApiQuota) => void,
   auditArea: GitHubAuditArea = "repo-detail",
+  env?: Env,
 ): Promise<RepoDetailWorkTrend> {
   const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const repoQuery = `repo:${fullName}`;
@@ -4010,6 +4515,7 @@ async function buildWorkTrend(
         quotaAccount,
         onQuota,
         auditArea,
+        env,
       ),
       detailGitHubSearchCount(
         `${repoQuery} is:issue closed:>=${since}`,
@@ -4018,6 +4524,7 @@ async function buildWorkTrend(
         quotaAccount,
         onQuota,
         auditArea,
+        env,
       ),
       detailGitHubSearchCount(
         `${repoQuery} is:pr created:>=${since}`,
@@ -4026,6 +4533,7 @@ async function buildWorkTrend(
         quotaAccount,
         onQuota,
         auditArea,
+        env,
       ),
       detailGitHubSearchCount(
         `${repoQuery} is:pr closed:>=${since}`,
@@ -4034,6 +4542,7 @@ async function buildWorkTrend(
         quotaAccount,
         onQuota,
         auditArea,
+        env,
       ),
     ]);
   return {
@@ -4313,6 +4822,7 @@ async function fetchOwnerActivityEvents(
   quotaSource: ApiQuota["source"],
   quotaAccount: string | null,
   onQuota: (quota: ApiQuota) => void,
+  env: Env,
 ): Promise<OwnerActivityEvent[]> {
   const events: OwnerActivityEvent[] = [];
   const base =
@@ -4329,6 +4839,8 @@ async function fetchOwnerActivityEvents(
       quotaAccount,
       onQuota,
       "owner-activity",
+      undefined,
+      env,
     );
     if (pageEvents.length === 0) break;
     const normalized = pageEvents.map(normalizeActivityEvent).filter((event) => event !== null);
@@ -4354,6 +4866,7 @@ async function fetchRepoActivityEvents(
   quotaSource: ApiQuota["source"],
   quotaAccount: string | null,
   onQuota: (quota: ApiQuota) => void,
+  env: Env,
 ): Promise<OwnerActivityEvent[]> {
   const events: OwnerActivityEvent[] = [];
   for (let page = 1; page <= activityEventPageLimit; page += 1) {
@@ -4366,6 +4879,8 @@ async function fetchRepoActivityEvents(
       quotaAccount,
       onQuota,
       "repo-activity",
+      undefined,
+      env,
     );
     if (pageEvents.length === 0) break;
     const normalized = pageEvents.map(normalizeActivityEvent).filter((event) => event !== null);
@@ -4640,6 +5155,7 @@ async function buildOwnerActivity(
     quotaSource,
     quotaAccount,
     onQuota,
+    env,
   );
   const generatedAt = new Date().toISOString();
   const payload: OwnerActivityPayload = {
@@ -4800,6 +5316,9 @@ async function buildRepoActivity(
     quotaSource,
     quotaAccount,
     onQuota,
+    undefined,
+    undefined,
+    env,
   );
   if (repo.private) {
     throw new Error("private repositories are not visible in public dashboards");
@@ -4812,6 +5331,7 @@ async function buildRepoActivity(
     quotaSource,
     quotaAccount,
     onQuota,
+    env,
   );
   const generatedAt = new Date().toISOString();
   const payload: RepoDetailActivityPayload = {
@@ -5325,6 +5845,8 @@ async function audienceUserProfile(
     quotaAccount,
     onQuota,
     auditArea,
+    undefined,
+    env,
   );
   await writeAudienceUser(env, user);
   return user;
@@ -5338,6 +5860,7 @@ async function recentRepoStargazers(
   quotaSource: ApiQuota["source"],
   quotaAccount: string | null,
   onQuota: (quota: ApiQuota) => void,
+  env: Env,
 ): Promise<GitHubStargazer[]> {
   const graphql = await recentRepoStargazersGraphql(
     owner,
@@ -5346,9 +5869,10 @@ async function recentRepoStargazers(
     quotaSource,
     quotaAccount,
     onQuota,
+    env,
   );
   if (graphql) return graphql;
-  return recentRepoStargazersRest(path, token, quotaSource, quotaAccount, onQuota);
+  return recentRepoStargazersRest(path, token, quotaSource, quotaAccount, onQuota, env);
 }
 
 async function recentRepoStargazersRest(
@@ -5357,6 +5881,7 @@ async function recentRepoStargazersRest(
   quotaSource: ApiQuota["source"],
   quotaAccount: string | null,
   onQuota: (quota: ApiQuota) => void,
+  env: Env,
 ): Promise<GitHubStargazer[]> {
   const firstPath = `${path}/stargazers?per_page=${repoAudienceStargazerLimit}`;
   const firstPage = await detailGitHubJsonWithHeaders(
@@ -5368,6 +5893,8 @@ async function recentRepoStargazersRest(
     quotaAccount,
     onQuota,
     "application/vnd.github.v3.star+json",
+    undefined,
+    env,
   );
   const lastPage = lastPageFromLink(firstPage.headers.get("link"));
   if (!lastPage || lastPage <= 1) return firstPage.data;
@@ -5381,6 +5908,8 @@ async function recentRepoStargazersRest(
     quotaAccount,
     onQuota,
     "application/vnd.github.v3.star+json",
+    undefined,
+    env,
   );
   if (last.length >= repoAudienceStargazerLimit) return last;
   const previous = await detailGitHubJson(
@@ -5392,6 +5921,8 @@ async function recentRepoStargazersRest(
     quotaAccount,
     onQuota,
     "application/vnd.github.v3.star+json",
+    undefined,
+    env,
   );
   return [...previous, ...last].slice(-repoAudienceStargazerLimit);
 }
@@ -5440,8 +5971,12 @@ async function recentRepoStargazersGraphql(
   quotaSource: ApiQuota["source"],
   quotaAccount: string | null,
   onQuota: (quota: ApiQuota) => void,
+  env: Env,
 ): Promise<GitHubStargazer[] | null> {
   if (!token) return null;
+  if (quotaSource === "shared" && (await graphqlBackoffActive(env, quotaSource, quotaAccount))) {
+    throw new GitHubRateLimitError("GitHub GraphQL backoff active", 15 * 60);
+  }
   const response = await workerFetch("https://api.github.com/graphql", {
     method: "POST",
     headers: {
@@ -5458,7 +5993,19 @@ async function recentRepoStargazersGraphql(
   });
   const quota = quotaFromGitHubResponse(response, quotaSource, quotaAccount);
   onQuota(quota);
-  auditGitHubTokenUse("repo-audience", "/graphql", response.status, quota);
+  const rateLimited = quota.source === "shared" ? await responseRateLimitSignal(response) : false;
+  await recordAuditedGitHubAccess(
+    env,
+    "repo-audience",
+    "/graphql",
+    response.status,
+    quota,
+    rateLimited,
+  );
+  if (quota.source === "shared" && response.status >= 500 && response.status < 600) {
+    await markGraphqlBackoff(env, quota.source, quota.account, response.status);
+    throw new GitHubRateLimitError("GitHub GraphQL temporarily unavailable", 15 * 60);
+  }
   const body = (await response.json().catch(() => null)) as GraphQLStargazerResponse | null;
   const message = body?.errors
     ?.map((error) => error.message ?? error.type)
@@ -5507,6 +6054,8 @@ async function audienceUserOrgs(
     quotaAccount,
     onQuota,
     auditArea,
+    undefined,
+    env,
   );
   await writeAudienceUserOrgs(env, login, orgs);
   return orgs;
@@ -5537,6 +6086,8 @@ async function audienceUserRepos(
     quotaAccount,
     onQuota,
     auditArea,
+    undefined,
+    env,
   );
   const publicRepos = repos.filter(isPublicAudienceRepository);
   await writeAudienceUserRepos(env, login, publicRepos);
@@ -6192,13 +6743,25 @@ async function buildRepoAudience(
     quotaSource,
     quotaAccount,
     onQuota,
+    undefined,
+    undefined,
+    env,
   );
   if (repo.private) {
     throw new Error("private repositories are not visible in public dashboards");
   }
   const since = Date.now() - audienceRangeMs(range);
   const stargazers = (
-    await recentRepoStargazers(owner, repoName, path, token, quotaSource, quotaAccount, onQuota)
+    await recentRepoStargazers(
+      owner,
+      repoName,
+      path,
+      token,
+      quotaSource,
+      quotaAccount,
+      onQuota,
+      env,
+    )
   ).filter((stargazer) => {
     const starredAt = Date.parse(stargazer.starred_at ?? "");
     return Number.isFinite(starredAt) && starredAt >= since;
@@ -6603,6 +7166,7 @@ async function compareCommitTitles(
   quotaSource: ApiQuota["source"],
   quotaAccount: string | null,
   onQuota: (quota: ApiQuota) => void,
+  env: Env,
 ): Promise<{ titles: string[]; total: number | null }> {
   const titles: string[] = [];
   let total: number | null = null;
@@ -6616,6 +7180,8 @@ async function compareCommitTitles(
       quotaAccount,
       onQuota,
       "release-summary",
+      undefined,
+      env,
     );
     total = compare.total_commits ?? total;
     const pageTitles = (compare.commits ?? [])
@@ -6679,6 +7245,7 @@ async function summarizeReleaseDelta(
     quotaSource,
     quotaAccount,
     onQuota,
+    env,
   );
   if (titles.length === 0) {
     return unavailableReleaseSummary(
@@ -6784,6 +7351,9 @@ async function buildRepoDetail(
     quotaSource,
     quotaAccount,
     onQuota,
+    undefined,
+    undefined,
+    env,
   );
   if (repo.private) {
     throw new Error("private repositories are not visible in public dashboards");
@@ -6798,6 +7368,9 @@ async function buildRepoDetail(
       quotaSource,
       quotaAccount,
       onQuota,
+      undefined,
+      undefined,
+      env,
     ),
     optionalRepoDetail(
       detailGitHubJson(
@@ -6808,6 +7381,9 @@ async function buildRepoDetail(
         quotaSource,
         quotaAccount,
         onQuota,
+        undefined,
+        undefined,
+        env,
       ),
       [],
     ),
@@ -6820,6 +7396,9 @@ async function buildRepoDetail(
         quotaSource,
         quotaAccount,
         onQuota,
+        undefined,
+        undefined,
+        env,
       ),
       {},
     ),
@@ -6832,6 +7411,9 @@ async function buildRepoDetail(
         quotaSource,
         quotaAccount,
         onQuota,
+        undefined,
+        undefined,
+        env,
       ),
       null,
     ),
@@ -6841,6 +7423,8 @@ async function buildRepoDetail(
       quotaSource,
       quotaAccount,
       onQuota,
+      undefined,
+      env,
     ),
   ]);
 
@@ -6855,6 +7439,9 @@ async function buildRepoDetail(
           quotaSource,
           quotaAccount,
           onQuota,
+          undefined,
+          undefined,
+          env,
         ),
         null,
       )
@@ -6869,6 +7456,9 @@ async function buildRepoDetail(
           quotaSource,
           quotaAccount,
           onQuota,
+          undefined,
+          undefined,
+          env,
         ),
         null,
       )
@@ -6882,6 +7472,8 @@ async function buildRepoDetail(
       quotaSource,
       quotaAccount,
       onQuota,
+      undefined,
+      env,
     ),
     detailGitHubStats(
       `${path}/stats/code_frequency`,
@@ -6890,8 +7482,12 @@ async function buildRepoDetail(
       quotaSource,
       quotaAccount,
       onQuota,
+      undefined,
+      env,
     ),
-    buildWorkTrend(repo.full_name, token, quotaSource, quotaAccount, onQuota).catch(() => null),
+    buildWorkTrend(repo.full_name, token, quotaSource, quotaAccount, onQuota, undefined, env).catch(
+      () => null,
+    ),
   ]);
   const statsWarming = [commitActivity, codeFrequency].some((stat) => stat.state === "warming");
   const project = releaseProject(repo);
@@ -7338,22 +7934,25 @@ async function discoverPayload(
     },
   });
   const quota = quotaFromResponse(response, env);
-  auditGitHubTokenUse("discover", `${search.pathname}${search.search}`, response.status, quota);
-  await recordGitHubAccessCounter(
-    env,
-    "discover",
-    `${search.pathname}${search.search}`,
-    response.status,
-    quota,
-  ).catch(() => undefined);
   const body = parseGitHubResponse(
     gitHubSearchRepositoryListSchema,
     await response.json(),
     "repository search",
   );
+  const message = !response.ok
+    ? (body.message ?? `GitHub repository search failed: ${response.status}`)
+    : "";
+  const rateLimited = !response.ok && isRateLimitResponse(response, message);
+  await recordAuditedGitHubAccess(
+    env,
+    "discover",
+    `${search.pathname}${search.search}`,
+    response.status,
+    quota,
+    rateLimited,
+  );
   if (!response.ok) {
-    const message = body.message ?? `GitHub repository search failed: ${response.status}`;
-    if (response.status === 403 || /rate limit|secondary rate/i.test(message)) {
+    if (rateLimited) {
       throw new GitHubRateLimitError(message, parseHeaderInt(response.headers.get("retry-after")));
     }
     throw new Error(message);
@@ -7390,7 +7989,7 @@ async function discoverPayload(
         limit: Math.min(discoverHydrateLimit, projects.length),
         done: false,
       },
-      message: "repository search loaded; scanning release data for all visible repositories",
+      message: "repository search loaded; scanning release data for top repositories",
     },
     totals: dashboardTotals(projects),
     projects,
@@ -7418,17 +8017,15 @@ async function hydrateDiscoverProject(
     },
   });
   const quota = quotaFromResponse(response, env);
-  auditGitHubTokenUse("discover", path, response.status, quota);
-  await recordGitHubAccessCounter(env, "discover", path, response.status, quota).catch(
-    () => undefined,
-  );
   const body = await response.json().catch(() => null);
+  const message =
+    body && typeof body === "object" && "message" in body
+      ? String((body as { message?: unknown }).message)
+      : `GitHub API ${response.status}`;
+  const rateLimited = !response.ok && isRateLimitResponse(response, message);
+  await recordAuditedGitHubAccess(env, "discover", path, response.status, quota, rateLimited);
   if (!response.ok) {
-    const message =
-      body && typeof body === "object" && "message" in body
-        ? String((body as { message?: unknown }).message)
-        : `GitHub API ${response.status}`;
-    if (isRateLimitResponse(response, message)) {
+    if (rateLimited) {
       throw new GitHubRateLimitError(message, parseHeaderInt(response.headers.get("retry-after")));
     }
     return { project, quota };
@@ -7535,6 +8132,21 @@ async function hydrateDiscoverCache(
   env: Env,
 ): Promise<void> {
   if (!discoverNeedsHydration(payload)) return;
+  const cooldown = await sharedQuotaCooldown(env, "core");
+  if (cooldown.active) {
+    await auditSyncEvent(env, {
+      event: "discover_hydrate_skip",
+      targetKey: key,
+      status: "skipped",
+      reason: "shared-quota",
+      projects: payload.projects.length,
+      scanned: payload.cache?.progress?.scanned,
+      limit: payload.cache?.progress?.limit,
+      done: payload.cache?.progress?.done,
+      detail: `remaining=${cooldown.remaining ?? "unknown"} resource=${cooldown.resource ?? "any"}`,
+    });
+    return;
+  }
   const lock = await acquireBuildLock(env, `hydrate:${key}`);
   if (!lock) {
     await auditSyncEvent(env, {
@@ -7630,7 +8242,7 @@ async function discoverResponse(env: Env, url: URL, context: ExecutionContext): 
         detail: dashboardSyncDetail(cached),
       });
       return jsonResponse(
-        withCacheState(cached, "partial", "scanning release data for all visible repositories"),
+        withCacheState(cached, "partial", "scanning release data for top repositories"),
         200,
         { "cache-control": "no-store" },
       );
@@ -8130,7 +8742,34 @@ async function rebuildWithBuildLock(
   }
 }
 
+async function sharedQuotaDashboardCooldown(
+  dashboard: DashboardRequest,
+  env: Env,
+): Promise<SharedQuotaCooldown | null> {
+  const source =
+    dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous");
+  return source === "shared" && env.GITHUB_TOKEN ? sharedQuotaCooldown(env) : null;
+}
+
+async function progressiveBuildPausedForSharedQuota(
+  dashboard: DashboardRequest,
+  env: Env,
+): Promise<boolean> {
+  const cooldown = await sharedQuotaDashboardCooldown(dashboard, env);
+  if (!cooldown?.active) return false;
+  const until = sharedQuotaDeferUntil(cooldown);
+  await auditSyncEvent(env, {
+    event: "dashboard_progressive_skip",
+    targetKey: dashboard.key,
+    status: "skipped",
+    reason: "shared-quota",
+    detail: `until=${until} remaining=${cooldown.remaining ?? "unknown"} resource=${cooldown.resource ?? "any"}`,
+  });
+  return true;
+}
+
 async function continueProgressiveBuild(dashboard: DashboardRequest, env: Env): Promise<void> {
+  if (await progressiveBuildPausedForSharedQuota(dashboard, env)) return;
   const startedAt = Date.now();
   await auditSyncEvent(env, {
     event: "dashboard_progressive_start",
@@ -8143,6 +8782,7 @@ async function continueProgressiveBuild(dashboard: DashboardRequest, env: Env): 
     payload?.cache?.progress?.done === false &&
     Date.now() - startedAt < progressiveBuildBudgetMs
   ) {
+    if (await progressiveBuildPausedForSharedQuota(dashboard, env)) break;
     payload = await rebuildWithBuildLock(dashboard, env);
   }
   await auditSyncEvent(env, {
@@ -8421,6 +9061,18 @@ async function adminResponse(
   const url = new URL(request.url);
   if (url.pathname === "/api/admin/scheduler" && request.method === "GET") {
     return jsonResponse(await schedulerAdminPayload(env), 200, { "cache-control": "no-store" });
+  }
+  if (url.pathname === "/api/admin/github-access" && request.method === "GET") {
+    const hours = Math.max(
+      1,
+      Math.min(
+        72,
+        Number.parseInt(url.searchParams.get("hours") ?? "", 10) || githubAccessAdminHours,
+      ),
+    );
+    return jsonResponse(await githubAccessSummary(env, hours), 200, {
+      "cache-control": "no-store",
+    });
   }
   if (url.pathname === "/api/admin/scheduler/run" && request.method === "POST") {
     const result = await schedulerTick(

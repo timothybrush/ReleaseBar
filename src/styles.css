@@ -1932,9 +1932,16 @@ body.dev-mode .table-head .since-heading .label-compact {
   font-size: 13px;
 }
 
+.admin-message.inline {
+  margin: 0 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--amber) 10%, transparent);
+}
+
 .admin-metrics {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   border-bottom: 1px solid var(--line);
 }
 
@@ -1991,6 +1998,10 @@ body.dev-mode .table-head .since-heading .label-compact {
 .admin-list.compact {
   max-height: 560px;
   overflow: auto;
+}
+
+.admin-list.token-use {
+  max-height: 340px;
 }
 
 .admin-row {

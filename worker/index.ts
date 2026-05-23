@@ -1017,6 +1017,8 @@ type SocialCard = {
 };
 
 const socialNumberFormat = new Intl.NumberFormat("en", { notation: "compact" });
+const socialAvatarMaxBytes = 256 * 1024;
+const socialAvatarTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 
 function ownerAvatarUrl(owner: string, size = 240): string {
   return `https://github.com/${encodeURIComponent(owner)}.png?size=${size}`;
@@ -1042,6 +1044,42 @@ function socialLine(value: string, maxLength: number): string {
   const normalized = value.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLength) return normalized;
   return `${normalized.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function base64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
+
+function socialAvatarInitials(title: string): string {
+  const normalized = title.replace(/^@/, "").replaceAll("/", " ").trim();
+  const initials = normalized
+    .split(/\s+/)
+    .map((part) => part[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+  return initials || "RB";
+}
+
+async function socialAvatarDataUrl(url: string | null): Promise<string | null> {
+  if (!url) return null;
+  try {
+    const response = await workerFetch(url, {
+      headers: { "user-agent": "ReleaseBar" },
+    });
+    if (!response.ok) return null;
+    const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+    if (!contentType || !socialAvatarTypes.has(contentType)) return null;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength === 0 || bytes.byteLength > socialAvatarMaxBytes) return null;
+    return `data:${contentType};base64,${base64(bytes)}`;
+  } catch {
+    return null;
+  }
 }
 
 function socialRepoCacheKey(owner: string, repo: string): string {
@@ -1202,28 +1240,33 @@ async function socialCardForLabel(
   };
 }
 
-function socialImage(card: SocialCard): Response {
+async function socialImage(card: SocialCard): Promise<Response> {
   const title = escapeHtml(socialLine(card.title, 42));
   const detail = escapeHtml(socialLine(card.detail, 68));
   const metric = escapeHtml(socialLine(card.metric, 58));
-  const avatar = card.avatarUrl ? escapeHtml(card.avatarUrl) : null;
+  const avatar = await socialAvatarDataUrl(card.avatarUrl);
+  const initials = escapeHtml(socialAvatarInitials(card.title));
   const titleSize =
     card.title.length > 34 ? 54 : card.title.length > 24 ? 66 : card.title.length > 17 ? 82 : 104;
-  const titleX = avatar ? 276 : 96;
+  const titleX = card.avatarUrl ? 276 : 96;
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
-  <defs>
-    <clipPath id="avatarClip"><rect x="96" y="198" width="148" height="148" rx="28"/></clipPath>
+	  <defs>
+	    <clipPath id="avatarClip"><rect x="96" y="198" width="148" height="148" rx="28"/></clipPath>
   </defs>
   <rect width="1200" height="630" fill="#080908"/>
   <path d="M0 124H1200M0 248H1200M0 372H1200M0 496H1200M160 0V630M400 0V630M640 0V630M880 0V630M1120 0V630" stroke="#182014" stroke-width="1"/>
-  <rect x="72" y="70" width="1056" height="490" rx="0" fill="none" stroke="#8cff4b" stroke-width="2"/>
-  <text x="96" y="148" fill="#a8ff6b" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="38" letter-spacing="0">ReleaseBar</text>
-  ${
-    avatar
-      ? `<rect x="96" y="198" width="148" height="148" rx="28" fill="#121b0f" stroke="#8cff4b" stroke-width="2"/>
-  <image x="96" y="198" width="148" height="148" href="${avatar}" preserveAspectRatio="xMidYMid slice" clip-path="url(#avatarClip)"/>`
-      : ""
-  }
+	  <rect x="72" y="70" width="1056" height="490" rx="0" fill="none" stroke="#8cff4b" stroke-width="2"/>
+	  <text x="96" y="148" fill="#a8ff6b" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="38" letter-spacing="0">ReleaseBar</text>
+	  ${
+      card.avatarUrl
+        ? `<rect x="96" y="198" width="148" height="148" rx="28" fill="#121b0f" stroke="#8cff4b" stroke-width="2"/>
+	  ${
+      avatar
+        ? `<image x="96" y="198" width="148" height="148" href="${avatar}" preserveAspectRatio="xMidYMid slice" clip-path="url(#avatarClip)"/>`
+        : `<text x="170" y="289" text-anchor="middle" fill="#a8ff6b" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="54" font-weight="700" letter-spacing="0">${initials}</text>`
+    }`
+        : ""
+    }
   <text x="${titleX}" y="318" fill="#f2ffe9" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="${titleSize}" font-weight="700" letter-spacing="0">${title}</text>
   <text x="96" y="424" fill="#a8ff6b" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="34" font-weight="700" letter-spacing="0">${metric}</text>
   <text x="96" y="474" fill="#8f9b89" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="28" letter-spacing="0">${detail}</text>
@@ -8880,7 +8923,7 @@ async function routeRequest(
     const label = decodeURIComponent(url.pathname.replace(/^\/og\//, "").replace(/\.svg$/, ""));
     const title =
       label.startsWith("@") || label.includes("/") || !validOwnerSlug(label) ? label : `@${label}`;
-    return socialImage(await socialCardForLabel(title, request, env, context));
+    return await socialImage(await socialCardForLabel(title, request, env, context));
   }
   if (url.pathname === "/openapi.json" || url.pathname === "/api/openapi.json") {
     return jsonResponse(openApiSpec(url.origin));

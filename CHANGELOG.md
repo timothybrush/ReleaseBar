@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Embedded social card avatars into generated SVGs and added a monogram fallback when avatar fetching fails.
 - Reduced GitHub Hot shared-token use by hydrating only release metadata instead of full per-repo commit, compare, pull request, and CI details.
 - Reduced GitHub dashboard hydration work by using owner GraphQL commit/status data, prioritizing issue/PR-sorted rows, caching owner identity, and storing hourly GitHub access counters in KV.
 - Split dashboard GraphQL hydration into a cheap owner metadata query plus a small CI rollup detail query to avoid large-owner GraphQL 502s.

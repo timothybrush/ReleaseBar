@@ -1179,32 +1179,52 @@ test("worker social cards include owner avatars and repository release metrics",
       "repo-detail:v4:acme/releasebar": JSON.stringify(repoPayload),
     }),
   };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.hostname === "github.com" && ["/acme.png", "/openclaw.png"].includes(url.pathname)) {
+      return new Response(new Uint8Array([1, 2, 3]), {
+        headers: { "content-type": "image/png" },
+      });
+    }
+    throw new Error(`unexpected fetch ${url.toString()}`);
+  };
 
-  const repoResponse = await worker.fetch(
-    new Request("https://release.bar/og/acme%2Freleasebar.svg"),
-    env,
-    { waitUntil: () => undefined },
-  );
-  assert.equal(repoResponse.status, 200);
-  const repoSvg = await repoResponse.text();
-  assert.match(repoSvg, /acme\/releasebar/);
-  assert.match(repoSvg, /v2\.0\.0 · 42 commits since release/);
-  assert.match(repoSvg, /https:\/\/github\.com\/acme\.png\?size=240/);
+  try {
+    const repoResponse = await worker.fetch(
+      new Request("https://release.bar/og/acme%2Freleasebar.svg"),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(repoResponse.status, 200);
+    const repoSvg = await repoResponse.text();
+    assert.match(repoSvg, /acme\/releasebar/);
+    assert.match(repoSvg, /v2\.0\.0 · 42 commits since release/);
+    assert.match(repoSvg, /data:image\/png;base64,AQID/);
+    assert.doesNotMatch(repoSvg, /https:\/\/github\.com\/acme\.png\?size=240/);
 
-  const ownerResponse = await worker.fetch(
-    new Request("https://release.bar/og/openclaw.svg"),
-    env,
-    { waitUntil: () => undefined },
-  );
-  const ownerSvg = await ownerResponse.text();
-  assert.match(ownerSvg, /@openclaw/);
-  assert.match(ownerSvg, /https:\/\/github\.com\/openclaw\.png\?size=240/);
+    const ownerResponse = await worker.fetch(
+      new Request("https://release.bar/og/openclaw.svg"),
+      env,
+      { waitUntil: () => undefined },
+    );
+    const ownerSvg = await ownerResponse.text();
+    assert.match(ownerSvg, /@openclaw/);
+    assert.match(ownerSvg, /data:image\/png;base64,AQID/);
+    assert.doesNotMatch(ownerSvg, /https:\/\/github\.com\/openclaw\.png\?size=240/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 
   const coldStore = kvStore();
-  const originalFetch = globalThis.fetch;
   const coldCalls: string[] = [];
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
+    if (url.hostname === "github.com" && url.pathname === "/cold.png") {
+      return new Response(new Uint8Array([4, 5, 6]), {
+        headers: { "content-type": "image/png" },
+      });
+    }
     coldCalls.push(url.pathname);
     assert.equal((init?.headers as Record<string, string>)?.authorization, "Bearer shared-token");
     if (url.pathname === "/repos/cold/repo") {
@@ -1255,6 +1275,7 @@ test("worker social cards include owner avatars and repository release metrics",
     );
     const coldSvg = await coldResponse.text();
     assert.match(coldSvg, /v3\.0\.0 · 9 commits since release/);
+    assert.match(coldSvg, /data:image\/png;base64,BAUG/);
     assert.deepEqual(coldCalls, [
       "/repos/cold/repo",
       "/repos/cold/repo/releases",
@@ -1278,7 +1299,11 @@ test("worker social cards include owner avatars and repository release metrics",
   };
   const queued: Promise<unknown>[] = [];
   let backgroundCalls = 0;
-  globalThis.fetch = async () => {
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.hostname === "github.com" && url.pathname === "/stale.png") {
+      return new Response("not an image", { headers: { "content-type": "text/plain" } });
+    }
     backgroundCalls += 1;
     throw new Error("queued refresh only");
   };
@@ -1294,6 +1319,7 @@ test("worker social cards include owner avatars and repository release metrics",
     );
     const staleSvg = await staleResponse.text();
     assert.match(staleSvg, /v9\.9\.9 · 7 commits since release/);
+    assert.match(staleSvg, />SR<\/text>/);
     assert.equal(queued.length, 1);
     await Promise.all(queued);
     assert.equal(backgroundCalls > 0, true);

@@ -8,6 +8,7 @@ Work style: terse.
 - `release.bar` is not GitHub Pages. Do not trust Pages deploys for prod.
 - Push to `main` runs `.github/workflows/deploy.yml`, then `npm exec --yes --package wrangler -- wrangler deploy`.
 - Required GitHub secret: `CLOUDFLARE_API_TOKEN`.
+- Cloudflare accounts: ReleaseBar prod uses `steipete@gmail.com` account `de09342a728de2c25c85cc6b34d68739`; OpenClaw stuff uses OpenClaw account `91b59577e757131d68d55a471fe32aca`. Ask if unsure.
 - Post-deploy smoke compares live JS/CSS hashes against local `dist/index.html`, then checks `/`, `/steipete`, `/openclaw/openclaw`, and `/api/_discover`.
 - Local prod deploy: `npx wrangler deploy`.
 - Local real-data dev: `npm run dev:worker:real` uses Wrangler `--remote` on port 8787 with real secrets and preview KV.

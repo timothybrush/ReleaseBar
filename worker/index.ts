@@ -51,6 +51,7 @@ import {
   type GitHubUserProfile,
   type GitHubUserRepository,
 } from "./schemas.js";
+import { initWasm, Resvg } from "@resvg/resvg-wasm";
 import type {
   ApiQuota,
   AudienceRange,
@@ -939,14 +940,15 @@ async function assetResponse(request: Request, env: Env): Promise<Response> {
     }
     const originalUrl = new URL(request.url);
     const label = socialLabel(originalUrl);
-    const image = `${originalUrl.origin}/og/${encodeURIComponent(label)}.svg`;
+    const title = socialPreviewTitle(label);
+    const image = `${originalUrl.origin}/og/${encodeURIComponent(label)}.png`;
     const initialData = await initialPageData(request, originalUrl, env).catch(() => null);
     const html = injectInitialPageData(
       (await response.text())
-        .replace(/<title>.*?<\/title>/, `<title>${escapeHtml(label)} · release.bar</title>`)
+        .replace(/<title>.*?<\/title>/, `<title>${escapeHtml(title)} · release.bar</title>`)
         .replace(
           /<meta property="og:title" content="[^"]*" \/>/,
-          `<meta property="og:title" content="${escapeHtml(label)} · release.bar" />`,
+          `<meta property="og:title" content="${escapeHtml(title)}" />`,
         )
         .replace(
           /<meta property="og:url" content="[^"]*" \/>/,
@@ -958,7 +960,7 @@ async function assetResponse(request: Request, env: Env): Promise<Response> {
         )
         .replace(
           /<meta name="twitter:title" content="[^"]*" \/>/,
-          `<meta name="twitter:title" content="${escapeHtml(label)} · release.bar" />`,
+          `<meta name="twitter:title" content="${escapeHtml(title)}" />`,
         )
         .replace(
           /<meta name="twitter:image" content="[^"]*" \/>/,
@@ -1009,6 +1011,10 @@ function socialLabel(url: URL): string {
   return repos.length > 1 ? `custom deck +${repos.length}` : "ReleaseBar Hot";
 }
 
+function socialPreviewTitle(label: string): string {
+  return `ReleaseBar release freshness dashboard for ${label}`;
+}
+
 type SocialCard = {
   title: string;
   avatarUrl: string | null;
@@ -1019,6 +1025,12 @@ type SocialCard = {
 const socialNumberFormat = new Intl.NumberFormat("en", { notation: "compact" });
 const socialAvatarMaxBytes = 256 * 1024;
 const socialAvatarTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const socialRendererWasmAsset = "/resvg.wasm";
+const socialRendererFontAssets = [
+  "/jetbrains-mono-latin-400-normal.woff2",
+  "/jetbrains-mono-latin-700-normal.woff2",
+] as const;
+let socialRendererReady: Promise<Uint8Array[]> | null = null;
 
 function ownerAvatarUrl(owner: string, size = 240): string {
   return `https://github.com/${encodeURIComponent(owner)}.png?size=${size}`;
@@ -1240,7 +1252,7 @@ async function socialCardForLabel(
   };
 }
 
-async function socialImage(card: SocialCard): Promise<Response> {
+async function socialSvg(card: SocialCard): Promise<string> {
   const title = escapeHtml(socialLine(card.title, 42));
   const detail = escapeHtml(socialLine(card.detail, 68));
   const metric = escapeHtml(socialLine(card.metric, 58));
@@ -1249,35 +1261,96 @@ async function socialImage(card: SocialCard): Promise<Response> {
   const titleSize =
     card.title.length > 34 ? 54 : card.title.length > 24 ? 66 : card.title.length > 17 ? 82 : 104;
   const titleX = card.avatarUrl ? 276 : 96;
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
 	  <defs>
 	    <clipPath id="avatarClip"><rect x="96" y="198" width="148" height="148" rx="28"/></clipPath>
   </defs>
   <rect width="1200" height="630" fill="#080908"/>
   <path d="M0 124H1200M0 248H1200M0 372H1200M0 496H1200M160 0V630M400 0V630M640 0V630M880 0V630M1120 0V630" stroke="#182014" stroke-width="1"/>
 	  <rect x="72" y="70" width="1056" height="490" rx="0" fill="none" stroke="#8cff4b" stroke-width="2"/>
-	  <text x="96" y="148" fill="#a8ff6b" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="38" letter-spacing="0">ReleaseBar</text>
+	  <text x="96" y="148" fill="#a8ff6b" font-family="JetBrains Mono, SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="38" letter-spacing="0">ReleaseBar</text>
 	  ${
       card.avatarUrl
         ? `<rect x="96" y="198" width="148" height="148" rx="28" fill="#121b0f" stroke="#8cff4b" stroke-width="2"/>
 	  ${
       avatar
         ? `<image x="96" y="198" width="148" height="148" href="${avatar}" preserveAspectRatio="xMidYMid slice" clip-path="url(#avatarClip)"/>`
-        : `<text x="170" y="289" text-anchor="middle" fill="#a8ff6b" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="54" font-weight="700" letter-spacing="0">${initials}</text>`
+        : `<text x="170" y="289" text-anchor="middle" fill="#a8ff6b" font-family="JetBrains Mono, SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="54" font-weight="700" letter-spacing="0">${initials}</text>`
     }`
         : ""
     }
-  <text x="${titleX}" y="318" fill="#f2ffe9" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="${titleSize}" font-weight="700" letter-spacing="0">${title}</text>
-  <text x="96" y="424" fill="#a8ff6b" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="34" font-weight="700" letter-spacing="0">${metric}</text>
-  <text x="96" y="474" fill="#8f9b89" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="28" letter-spacing="0">${detail}</text>
-  <text x="96" y="506" fill="#52604d" font-family="SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="24" letter-spacing="0">release.bar</text>
+  <text x="${titleX}" y="318" fill="#f2ffe9" font-family="JetBrains Mono, SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="${titleSize}" font-weight="700" letter-spacing="0">${title}</text>
+  <text x="96" y="424" fill="#a8ff6b" font-family="JetBrains Mono, SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="34" font-weight="700" letter-spacing="0">${metric}</text>
+  <text x="96" y="474" fill="#8f9b89" font-family="JetBrains Mono, SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="28" letter-spacing="0">${detail}</text>
+  <text x="96" y="506" fill="#52604d" font-family="JetBrains Mono, SFMono-Regular, ui-monospace, Menlo, Consolas, monospace" font-size="24" letter-spacing="0">release.bar</text>
 </svg>`;
+}
+
+async function socialImage(card: SocialCard): Promise<Response> {
+  const svg = await socialSvg(card);
   return new Response(svg, {
     headers: {
       "content-type": "image/svg+xml; charset=utf-8",
       "cache-control": "public, max-age=3600",
     },
   });
+}
+
+async function socialRendererBytes(request: Request, env: Env): Promise<Uint8Array[]> {
+  if (!env.ASSETS) throw new Error("missing assets binding");
+  if (socialRendererReady) return socialRendererReady;
+  socialRendererReady = (async () => {
+    const fetchAsset = async (pathname: string) => {
+      const url = new URL(request.url);
+      url.pathname = pathname;
+      url.search = "";
+      const response = await env.ASSETS!.fetch(new Request(url, request));
+      if (!response.ok) throw new Error(`missing social renderer asset ${pathname}`);
+      return new Uint8Array(await response.arrayBuffer());
+    };
+    const isNode = typeof process !== "undefined" && Boolean(process.versions?.node);
+    const wasm = isNode
+      ? await fetchAsset(socialRendererWasmAsset)
+      : (await import("@resvg/resvg-wasm/index_bg.wasm")).default;
+    const fontBuffers = await Promise.all(socialRendererFontAssets.map(fetchAsset));
+    await initWasm(wasm);
+    return fontBuffers;
+  })().catch((error) => {
+    socialRendererReady = null;
+    throw error;
+  });
+  return socialRendererReady;
+}
+
+async function socialPng(card: SocialCard, request: Request, env: Env): Promise<Response> {
+  const fontBuffers = await socialRendererBytes(request, env);
+  const svg = await socialSvg(card);
+  const resvg = new Resvg(svg, {
+    font: {
+      loadSystemFonts: false,
+      defaultFontFamily: "JetBrains Mono",
+      monospaceFamily: "JetBrains Mono",
+      fontBuffers,
+    },
+  });
+  const image = resvg.render();
+  const png = image.asPng();
+  image.free();
+  resvg.free();
+  const body = png.buffer.slice(png.byteOffset, png.byteOffset + png.byteLength) as ArrayBuffer;
+  return new Response(body, {
+    headers: {
+      "content-type": "image/png",
+      "cache-control": "public, max-age=3600",
+    },
+  });
+}
+
+function socialRouteLabel(pathname: string): { label: string; extension: string } {
+  const raw = decodeURIComponent(pathname.replace(/^\/og\//, ""));
+  const match = raw.match(/\.(svg|png)$/i);
+  const label = match ? raw.slice(0, -match[0].length) : raw;
+  return { label, extension: match?.[1]?.toLowerCase() ?? "svg" };
 }
 
 function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
@@ -8920,10 +8993,12 @@ async function routeRequest(
   url: URL,
 ): Promise<Response> {
   if (url.pathname.startsWith("/og/")) {
-    const label = decodeURIComponent(url.pathname.replace(/^\/og\//, "").replace(/\.svg$/, ""));
+    const { label, extension } = socialRouteLabel(url.pathname);
     const title =
       label.startsWith("@") || label.includes("/") || !validOwnerSlug(label) ? label : `@${label}`;
-    return await socialImage(await socialCardForLabel(title, request, env, context));
+    const card = await socialCardForLabel(title, request, env, context);
+    if (extension === "png") return await socialPng(card, request, env);
+    return await socialImage(card);
   }
   if (url.pathname === "/openapi.json" || url.pathname === "/api/openapi.json") {
     return jsonResponse(openApiSpec(url.origin));

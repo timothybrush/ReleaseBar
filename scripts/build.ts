@@ -24,6 +24,15 @@ async function finishStaticAssets(): Promise<void> {
   ]) {
     await copyFile(path.join(publicDir, file), path.join(distDir, file));
   }
+  for (const file of [
+    "jetbrains-mono-latin-400-normal.woff2",
+    "jetbrains-mono-latin-700-normal.woff2",
+  ]) {
+    await copyFile(
+      path.join(root, "node_modules", "@fontsource", "jetbrains-mono", "files", file),
+      path.join(distDir, file),
+    );
+  }
 
   await copyFile(path.join(distDir, "index.html"), path.join(distDir, "404.html"));
 }

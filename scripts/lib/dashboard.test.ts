@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { calculateAudienceScore, isLikelyBot } from "./audience.js";
@@ -51,6 +52,24 @@ import type {
 import worker, { DashboardBuildLock, dashboardStreamSignature } from "../../worker/index.js";
 
 const textEncoder = new TextEncoder();
+
+async function socialRenderAsset(request: Request, paths?: string[]): Promise<Response> {
+  const pathname = new URL(request.url).pathname;
+  paths?.push(pathname);
+  const assets: Record<string, string> = {
+    "/resvg.wasm": "node_modules/@resvg/resvg-wasm/index_bg.wasm",
+    "/jetbrains-mono-latin-400-normal.woff2":
+      "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff2",
+    "/jetbrains-mono-latin-700-normal.woff2":
+      "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-700-normal.woff2",
+  };
+  const file = assets[pathname];
+  return file
+    ? new Response(await readFile(file))
+    : new Response("not found", {
+        status: 404,
+      });
+}
 
 function kvStore(initial: Record<string, string> = {}) {
   const values = new Map(Object.entries(initial));
@@ -913,7 +932,15 @@ test("worker serves escaped dotted repository detail paths as app shell", async 
 
   assert.equal(response.status, 200);
   const html = await response.text();
-  assert.match(html, /openclaw\/react\.dev · release\.bar/);
+  assert.match(html, /ReleaseBar release freshness dashboard for openclaw\/react\.dev/);
+  assert.match(
+    html,
+    /property="og:image" content="https:\/\/release\.bar\/og\/openclaw%2Freact\.dev\.png"/,
+  );
+  assert.match(
+    html,
+    /name="twitter:image" content="https:\/\/release\.bar\/og\/openclaw%2Freact\.dev\.png"/,
+  );
 });
 
 test("worker embeds cached public dashboard data in the app shell", async () => {
@@ -942,6 +969,14 @@ test("worker embeds cached public dashboard data in the app shell", async () => 
   assert.match(html, /id="releasebar-initial-data"/);
   assert.match(html, /"route":"dashboard"/);
   assert.match(html, /acme\\u002freleasebar|acme\/releasebar/);
+  assert.match(
+    html,
+    /property="og:title" content="ReleaseBar release freshness dashboard for ReleaseBar Hot"/,
+  );
+  assert.match(
+    html,
+    /property="og:image" content="https:\/\/release\.bar\/og\/ReleaseBar%20Hot\.png"/,
+  );
   assert.ok(html.indexOf('id="releasebar-initial-data"') < html.indexOf('<script type="module"'));
 });
 
@@ -1148,6 +1183,14 @@ test("worker embeds cached public repository detail data in the app shell", asyn
   assert.match(html, /id="releasebar-initial-data"/);
   assert.match(html, /"route":"repo"/);
   assert.match(html, /acme\\u002freleasebar|acme\/releasebar/);
+  assert.match(
+    html,
+    /property="og:title" content="ReleaseBar release freshness dashboard for acme\/releasebar"/,
+  );
+  assert.match(
+    html,
+    /property="og:image" content="https:\/\/release\.bar\/og\/acme%2Freleasebar\.png"/,
+  );
 });
 
 test("worker social cards include owner avatars and repository release metrics", async () => {
@@ -1212,6 +1255,29 @@ test("worker social cards include owner avatars and repository release metrics",
     assert.match(ownerSvg, /@openclaw/);
     assert.match(ownerSvg, /data:image\/png;base64,AQID/);
     assert.doesNotMatch(ownerSvg, /https:\/\/github\.com\/openclaw\.png\?size=240/);
+
+    const pngAssetPaths: string[] = [];
+    const pngResponse = await worker.fetch(
+      new Request("https://release.bar/og/acme%2Freleasebar.png"),
+      {
+        ...env,
+        ASSETS: {
+          fetch: (request: Request) => socialRenderAsset(request, pngAssetPaths),
+        },
+      },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(pngResponse.status, 200);
+    assert.equal(pngResponse.headers.get("content-type"), "image/png");
+    const pngBytes = new Uint8Array(await pngResponse.arrayBuffer());
+    assert.deepEqual(Array.from(pngBytes.slice(0, 8)), [137, 80, 78, 71, 13, 10, 26, 10]);
+    assert.ok(pngBytes.byteLength > 1_000);
+    assert.deepEqual(pngAssetPaths, [
+      "/resvg.wasm",
+      "/jetbrains-mono-latin-400-normal.woff2",
+      "/jetbrains-mono-latin-700-normal.woff2",
+    ]);
+    assert.notEqual(pngAssetPaths[0], "/og-card.png");
   } finally {
     globalThis.fetch = originalFetch;
   }

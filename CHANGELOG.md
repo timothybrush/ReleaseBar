@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Improved mobile dashboards with fixed viewport scaling, a single-row status/theme/login header, denser repository cards, and softer light-mode row colors.
 - Pointed social preview metadata at PNG cards and lengthened preview titles for better crawler compatibility.
 - Embedded social card avatars into generated SVGs and added a monogram fallback when avatar fetching fails.
 - Reduced GitHub Hot shared-token use by hydrating only release metadata instead of full per-repo commit, compare, pull request, and CI details.

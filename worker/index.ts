@@ -176,6 +176,11 @@ const discoverHydrateBatchSize = 8;
 const discoverCacheTtlMs = 60 * 60 * 1000;
 const repoDetailCacheTtlMs = 6 * 60 * 60 * 1000;
 const repoDetailWarmingRefreshMs = 30 * 1000;
+const repoDetailAuxCacheVersion = 1;
+const repoDetailAuxTtlSeconds = 7 * 24 * 60 * 60;
+const repoDetailSearchCountCacheTtlMs = 24 * 60 * 60 * 1000;
+const repoDetailStatsCacheTtlMs = 12 * 60 * 60 * 1000;
+const repoDetailStatsBackoffTtlSeconds = 10 * 60;
 const repoAudienceCacheTtlMs = 6 * 60 * 60 * 1000;
 const repoAudienceUserTtlSeconds = 7 * 24 * 60 * 60;
 const repoAudienceStargazerLimit = 30;
@@ -4376,6 +4381,77 @@ async function detailGitHubJsonWithHeaders<TSchema extends GenericSchema>(
   return { data: parseGitHubResponse(schema, body, context), headers: response.headers };
 }
 
+type RepoDetailAuxCacheRecord<T> = {
+  generatedAt: string;
+  data: T;
+};
+
+function repoDetailAuxCacheKey(kind: string, id: string): string {
+  return `repo-detail:aux:v${repoDetailAuxCacheVersion}:${kind}:${encodeURIComponent(id.toLowerCase())}`;
+}
+
+async function readRepoDetailAux<T>(
+  env: Env | undefined,
+  key: string,
+  maxAgeMs: number,
+): Promise<T | null> {
+  const raw = await env?.DASHBOARD_CACHE?.get(key);
+  if (!raw) return null;
+  const record = tryJsonParse<RepoDetailAuxCacheRecord<T>>(raw, `repo detail aux ${key}`);
+  const generatedAt = Date.parse(record?.generatedAt ?? "");
+  if (!Number.isFinite(generatedAt) || Date.now() - generatedAt > maxAgeMs) return null;
+  return record?.data ?? null;
+}
+
+async function writeRepoDetailAux<T>(
+  env: Env | undefined,
+  key: string,
+  data: T,
+  ttlSeconds = repoDetailAuxTtlSeconds,
+): Promise<void> {
+  await env?.DASHBOARD_CACHE?.put(
+    key,
+    JSON.stringify({ generatedAt: new Date().toISOString(), data }),
+    { expirationTtl: ttlSeconds },
+  );
+}
+
+async function cachedDetailGitHubJson<TSchema extends GenericSchema>(
+  cacheKind: string,
+  path: string,
+  schema: TSchema,
+  context: string,
+  token: string | null,
+  quotaSource: ApiQuota["source"],
+  quotaAccount: string | null,
+  onQuota: (quota: ApiQuota) => void,
+  acceptOrAuditArea = "application/vnd.github+json",
+  auditArea: GitHubAuditArea = "repo-detail",
+  env?: Env,
+): Promise<InferOutput<TSchema>> {
+  const cacheKey = repoDetailAuxCacheKey(cacheKind, path);
+  const cached = await readRepoDetailAux<InferOutput<TSchema>>(
+    env,
+    cacheKey,
+    repoDetailAuxTtlSeconds * 1000,
+  );
+  if (cached !== null) return cached;
+  const data = await detailGitHubJson(
+    path,
+    schema,
+    context,
+    token,
+    quotaSource,
+    quotaAccount,
+    onQuota,
+    acceptOrAuditArea,
+    auditArea,
+    env,
+  );
+  await writeRepoDetailAux(env, cacheKey, data);
+  return data;
+}
+
 async function detailGitHubStats<TSchema extends GenericSchema>(
   path: string,
   schema: TSchema,
@@ -4390,6 +4466,31 @@ async function detailGitHubStats<TSchema extends GenericSchema>(
   data: InferOutput<TSchema> | null;
   message?: string;
 }> {
+  type StatsResult = {
+    state: "ready" | "warming" | "unavailable";
+    data: InferOutput<TSchema> | null;
+    message?: string;
+  };
+  const statsCacheKey = repoDetailAuxCacheKey("stats", path);
+  const cached = await readRepoDetailAux<StatsResult>(
+    env,
+    statsCacheKey,
+    repoDetailStatsCacheTtlMs,
+  );
+  if (cached) return cached;
+  const backoffKey = repoDetailAuxCacheKey("stats-backoff", path);
+  const backoff = await readRepoDetailAux<{ message?: string }>(
+    env,
+    backoffKey,
+    repoDetailStatsBackoffTtlSeconds * 1000,
+  );
+  if (backoff) {
+    return {
+      state: "warming",
+      data: null,
+      message: backoff.message ?? "GitHub is preparing repository statistics.",
+    };
+  }
   const response = await workerFetch(`https://api.github.com${path}`, {
     headers: {
       accept: "application/vnd.github+json",
@@ -4403,10 +4504,12 @@ async function detailGitHubStats<TSchema extends GenericSchema>(
   const rateLimited = quota.source === "shared" ? await responseRateLimitSignal(response) : false;
   await recordAuditedGitHubAccess(env, auditArea, path, response.status, quota, rateLimited);
   if (response.status === 202) {
+    const message = "GitHub is preparing repository statistics.";
+    await writeRepoDetailAux(env, backoffKey, { message }, repoDetailStatsBackoffTtlSeconds);
     return {
       state: "warming",
       data: null,
-      message: "GitHub is preparing repository statistics.",
+      message,
     };
   }
   const body = response.status === 204 ? null : await response.json().catch(() => null);
@@ -4415,11 +4518,18 @@ async function detailGitHubStats<TSchema extends GenericSchema>(
       ? String((body as { message?: unknown }).message)
       : undefined;
   if (response.status === 204 || response.status === 422) {
-    return {
+    const result: StatsResult = {
       state: "unavailable",
       data: null,
       ...(message ? { message } : {}),
     };
+    await writeRepoDetailAux(
+      env,
+      statsCacheKey,
+      result,
+      Math.floor(repoDetailStatsCacheTtlMs / 1000),
+    );
+    return result;
   }
   if (!response.ok) {
     const errorMessage = message ?? `GitHub API ${response.status}`;
@@ -4429,9 +4539,23 @@ async function detailGitHubStats<TSchema extends GenericSchema>(
         parseHeaderInt(response.headers.get("retry-after")),
       );
     }
-    return { state: "unavailable", data: null, message: errorMessage };
+    const result: StatsResult = { state: "unavailable", data: null, message: errorMessage };
+    await writeRepoDetailAux(
+      env,
+      statsCacheKey,
+      result,
+      Math.floor(repoDetailStatsCacheTtlMs / 1000),
+    );
+    return result;
   }
-  return { state: "ready", data: parseGitHubResponse(schema, body, path) };
+  const result: StatsResult = { state: "ready", data: parseGitHubResponse(schema, body, path) };
+  await writeRepoDetailAux(
+    env,
+    statsCacheKey,
+    result,
+    Math.floor(repoDetailStatsCacheTtlMs / 1000),
+  );
+  return result;
 }
 
 async function detailGitHubCount(
@@ -4480,6 +4604,9 @@ async function detailGitHubSearchCount(
   auditArea: GitHubAuditArea = "repo-detail",
   env?: Env,
 ): Promise<number> {
+  const cacheKey = repoDetailAuxCacheKey("search-count", query);
+  const cached = await readRepoDetailAux<number>(env, cacheKey, repoDetailSearchCountCacheTtlMs);
+  if (cached !== null) return cached;
   const result = await detailGitHubJson(
     `/search/issues?q=${encodeURIComponent(query)}&per_page=1`,
     gitHubSearchCountSchema,
@@ -4492,7 +4619,14 @@ async function detailGitHubSearchCount(
     undefined,
     env,
   );
-  return result.total_count ?? 0;
+  const count = result.total_count ?? 0;
+  await writeRepoDetailAux(
+    env,
+    cacheKey,
+    count,
+    Math.floor(repoDetailSearchCountCacheTtlMs / 1000),
+  );
+  return count;
 }
 
 async function buildWorkTrend(
@@ -7373,7 +7507,8 @@ async function buildRepoDetail(
       env,
     ),
     optionalRepoDetail(
-      detailGitHubJson(
+      cachedDetailGitHubJson(
+        "contributors",
         `${path}/contributors?per_page=12`,
         v.array(gitHubContributorSchema),
         "repository contributors",
@@ -7388,7 +7523,8 @@ async function buildRepoDetail(
       [],
     ),
     optionalRepoDetail(
-      detailGitHubJson(
+      cachedDetailGitHubJson(
+        "languages",
         `${path}/languages`,
         gitHubLanguageSchema,
         "repository languages",

@@ -4169,6 +4169,99 @@ test("worker keeps repository detail when work trend search is rate limited", as
   }
 });
 
+test("worker reuses repository detail auxiliary caches across rebuilds", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = new Map<string, number>();
+  const count = (key: string) => calls.set(key, (calls.get(key) ?? 0) + 1);
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    const path = url.pathname;
+    if (path === "/repos/acme/cachebar") {
+      return Response.json({
+        owner: { login: "acme" },
+        name: "cachebar",
+        full_name: "acme/cachebar",
+        private: false,
+        fork: false,
+        archived: false,
+        html_url: "https://github.com/acme/cachebar",
+        description: "Cached detail dashboard",
+        default_branch: "main",
+        language: "TypeScript",
+        topics: [],
+        stargazers_count: 20,
+        forks_count: 1,
+        open_issues_count: 4,
+        pushed_at: "2026-05-16T12:00:00Z",
+        updated_at: "2026-05-16T12:00:00Z",
+      });
+    }
+    if (path === "/repos/acme/cachebar/releases") return Response.json([]);
+    if (path === "/repos/acme/cachebar/commits/main") {
+      return Response.json({
+        sha: "1234567890",
+        commit: { committer: { date: "2026-05-16T12:00:00Z" } },
+      });
+    }
+    if (path === "/repos/acme/cachebar/pulls") return Response.json([]);
+    if (path === "/repos/acme/cachebar/commits/1234567890/check-runs") {
+      return Response.json({ check_runs: [] });
+    }
+    if (path === "/repos/acme/cachebar/contributors") {
+      count("contributors");
+      return Response.json([]);
+    }
+    if (path === "/repos/acme/cachebar/languages") {
+      count("languages");
+      return Response.json({ TypeScript: 100 });
+    }
+    if (path === "/repos/acme/cachebar/stats/commit_activity") {
+      count("commit_activity");
+      return new Response("", { status: 202 });
+    }
+    if (path === "/repos/acme/cachebar/stats/code_frequency") {
+      count("code_frequency");
+      return new Response("", { status: 202 });
+    }
+    if (path === "/search/issues") {
+      count(`search:${url.searchParams.get("q") ?? ""}`);
+      return Response.json({ total_count: 1 });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const cache = kvStore();
+  try {
+    const request = new Request("https://release.bar/api/repos/acme/cachebar");
+    const first = await worker.fetch(
+      request,
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(first.status, 202);
+    assert.equal(calls.get("contributors"), 1);
+    assert.equal(calls.get("languages"), 1);
+    assert.equal(calls.get("commit_activity"), 1);
+    assert.equal(calls.get("code_frequency"), 1);
+    assert.equal([...calls.keys()].filter((key) => key.startsWith("search:")).length, 4);
+
+    await cache.delete("repo-detail:v4:acme/cachebar");
+
+    const second = await worker.fetch(
+      request,
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(second.status, 202);
+    assert.equal(calls.get("contributors"), 1);
+    assert.equal(calls.get("languages"), 1);
+    assert.equal(calls.get("commit_activity"), 1);
+    assert.equal(calls.get("code_frequency"), 1);
+    assert.equal([...calls.keys()].filter((key) => key.startsWith("search:")).length, 4);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("worker manual dashboard refresh returns metadata before release hydration", async () => {
   const originalFetch = globalThis.fetch;
   const waits: Array<Promise<unknown>> = [];

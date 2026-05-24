@@ -178,6 +178,8 @@ const repoDetailCacheTtlMs = 6 * 60 * 60 * 1000;
 const repoDetailWarmingRefreshMs = 30 * 1000;
 const repoDetailAuxCacheVersion = 1;
 const repoDetailAuxTtlSeconds = 7 * 24 * 60 * 60;
+const repoDetailReleaseCacheTtlMs = 60 * 60 * 1000;
+const repoDetailLiveProbeCacheTtlMs = 10 * 60 * 1000;
 const repoDetailSearchCountCacheTtlMs = 24 * 60 * 60 * 1000;
 const repoDetailStatsCacheTtlMs = 12 * 60 * 60 * 1000;
 const repoDetailStatsBackoffTtlSeconds = 10 * 60;
@@ -4428,13 +4430,10 @@ async function cachedDetailGitHubJson<TSchema extends GenericSchema>(
   acceptOrAuditArea = "application/vnd.github+json",
   auditArea: GitHubAuditArea = "repo-detail",
   env?: Env,
+  maxAgeMs = repoDetailAuxTtlSeconds * 1000,
 ): Promise<InferOutput<TSchema>> {
   const cacheKey = repoDetailAuxCacheKey(cacheKind, path);
-  const cached = await readRepoDetailAux<InferOutput<TSchema>>(
-    env,
-    cacheKey,
-    repoDetailAuxTtlSeconds * 1000,
-  );
+  const cached = await readRepoDetailAux<InferOutput<TSchema>>(env, cacheKey, maxAgeMs);
   if (cached !== null) return cached;
   const data = await detailGitHubJson(
     path,
@@ -4448,8 +4447,35 @@ async function cachedDetailGitHubJson<TSchema extends GenericSchema>(
     auditArea,
     env,
   );
-  await writeRepoDetailAux(env, cacheKey, data);
+  await writeRepoDetailAux(env, cacheKey, data, Math.floor(maxAgeMs / 1000));
   return data;
+}
+
+async function cachedDetailGitHubCount(
+  cacheKind: string,
+  path: string,
+  maxAgeMs: number,
+  token: string | null,
+  quotaSource: ApiQuota["source"],
+  quotaAccount: string | null,
+  onQuota: (quota: ApiQuota) => void,
+  auditArea: GitHubAuditArea = "repo-detail",
+  env?: Env,
+): Promise<number> {
+  const cacheKey = repoDetailAuxCacheKey(cacheKind, path);
+  const cached = await readRepoDetailAux<number>(env, cacheKey, maxAgeMs);
+  if (cached !== null) return cached;
+  const count = await detailGitHubCount(
+    path,
+    token,
+    quotaSource,
+    quotaAccount,
+    onQuota,
+    auditArea,
+    env,
+  );
+  await writeRepoDetailAux(env, cacheKey, count, Math.floor(maxAgeMs / 1000));
+  return count;
 }
 
 async function detailGitHubStats<TSchema extends GenericSchema>(
@@ -7494,7 +7520,8 @@ async function buildRepoDetail(
   }
 
   const [releases, contributors, languages, latestCommit, openPullRequests] = await Promise.all([
-    detailGitHubJson(
+    cachedDetailGitHubJson(
+      "releases",
       `${path}/releases?per_page=100`,
       v.array(gitHubReleaseSchema),
       "repository releases",
@@ -7505,6 +7532,7 @@ async function buildRepoDetail(
       undefined,
       undefined,
       env,
+      repoDetailReleaseCacheTtlMs,
     ),
     optionalRepoDetail(
       cachedDetailGitHubJson(
@@ -7539,7 +7567,8 @@ async function buildRepoDetail(
       {},
     ),
     optionalRepoDetail(
-      detailGitHubJson(
+      cachedDetailGitHubJson(
+        "latest-commit",
         `${path}/commits/${encodeURIComponent(repo.default_branch)}`,
         gitHubCommitSchema,
         "latest commit",
@@ -7550,11 +7579,14 @@ async function buildRepoDetail(
         undefined,
         undefined,
         env,
+        repoDetailLiveProbeCacheTtlMs,
       ),
       null,
     ),
-    detailGitHubCount(
+    cachedDetailGitHubCount(
+      "open-pulls",
       `${path}/pulls?state=open&per_page=1`,
+      repoDetailLiveProbeCacheTtlMs,
       token,
       quotaSource,
       quotaAccount,
@@ -7567,7 +7599,8 @@ async function buildRepoDetail(
   const latestRelease = releases.find((release) => !release.draft) ?? null;
   const compare = latestRelease
     ? await optionalRepoDetail(
-        detailGitHubJson(
+        cachedDetailGitHubJson(
+          "compare",
           `${path}/compare/${encodeURIComponent(latestRelease.tag_name)}...${encodeURIComponent(repo.default_branch)}`,
           gitHubCompareSchema,
           "release compare",
@@ -7578,13 +7611,15 @@ async function buildRepoDetail(
           undefined,
           undefined,
           env,
+          repoDetailLiveProbeCacheTtlMs,
         ),
         null,
       )
     : null;
   const checks = latestCommit?.sha
     ? await optionalRepoDetail(
-        detailGitHubJson(
+        cachedDetailGitHubJson(
+          "check-runs",
           `${path}/commits/${encodeURIComponent(latestCommit.sha)}/check-runs?per_page=100`,
           gitHubCheckRunsSchema,
           "repository check runs",
@@ -7595,6 +7630,7 @@ async function buildRepoDetail(
           undefined,
           undefined,
           env,
+          repoDetailLiveProbeCacheTtlMs,
         ),
         null,
       )

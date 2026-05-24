@@ -4196,15 +4196,41 @@ test("worker reuses repository detail auxiliary caches across rebuilds", async (
         updated_at: "2026-05-16T12:00:00Z",
       });
     }
-    if (path === "/repos/acme/cachebar/releases") return Response.json([]);
+    if (path === "/repos/acme/cachebar/releases") {
+      count("releases");
+      return Response.json([
+        {
+          tag_name: "v1.0.0",
+          name: "v1.0.0",
+          draft: false,
+          prerelease: false,
+          published_at: "2026-05-15T12:00:00Z",
+          html_url: "https://github.com/acme/cachebar/releases/tag/v1.0.0",
+        },
+      ]);
+    }
     if (path === "/repos/acme/cachebar/commits/main") {
+      count("latest_commit");
       return Response.json({
         sha: "1234567890",
         commit: { committer: { date: "2026-05-16T12:00:00Z" } },
       });
     }
-    if (path === "/repos/acme/cachebar/pulls") return Response.json([]);
+    if (path === "/repos/acme/cachebar/pulls") {
+      count("open_pulls");
+      return Response.json([]);
+    }
+    if (path === "/repos/acme/cachebar/compare/v1.0.0...main") {
+      count("compare");
+      return Response.json({
+        html_url: "https://github.com/acme/cachebar/compare/v1.0.0...main",
+        ahead_by: 0,
+        total_commits: 0,
+        commits: [],
+      });
+    }
     if (path === "/repos/acme/cachebar/commits/1234567890/check-runs") {
+      count("check_runs");
       return Response.json({ check_runs: [] });
     }
     if (path === "/repos/acme/cachebar/contributors") {
@@ -4238,6 +4264,11 @@ test("worker reuses repository detail auxiliary caches across rebuilds", async (
       { waitUntil: () => undefined },
     );
     assert.equal(first.status, 202);
+    assert.equal(calls.get("releases"), 1);
+    assert.equal(calls.get("latest_commit"), 1);
+    assert.equal(calls.get("open_pulls"), 1);
+    assert.equal(calls.get("compare"), 1);
+    assert.equal(calls.get("check_runs"), 1);
     assert.equal(calls.get("contributors"), 1);
     assert.equal(calls.get("languages"), 1);
     assert.equal(calls.get("commit_activity"), 1);
@@ -4252,6 +4283,11 @@ test("worker reuses repository detail auxiliary caches across rebuilds", async (
       { waitUntil: () => undefined },
     );
     assert.equal(second.status, 202);
+    assert.equal(calls.get("releases"), 1);
+    assert.equal(calls.get("latest_commit"), 1);
+    assert.equal(calls.get("open_pulls"), 1);
+    assert.equal(calls.get("compare"), 1);
+    assert.equal(calls.get("check_runs"), 1);
     assert.equal(calls.get("contributors"), 1);
     assert.equal(calls.get("languages"), 1);
     assert.equal(calls.get("commit_activity"), 1);

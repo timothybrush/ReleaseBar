@@ -2361,7 +2361,8 @@
           onclick={login}
           title={auth?.configured ? "Connect GitHub" : "GitHub login unavailable"}
         >
-          <span class="account-label">{auth?.configured ? "Connect GitHub" : "Login Unavailable"}</span>
+          <span class="account-label account-label-full">{auth?.configured ? "Connect GitHub" : "Login Unavailable"}</span>
+          <span class="account-label account-label-short">{auth?.configured ? "Connect" : "Login"}</span>
           {#if auth?.configured}
             <span class="account-caret" aria-hidden="true"></span>
           {/if}

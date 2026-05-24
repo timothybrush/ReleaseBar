@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Kept the mobile status/action bar within the viewport in narrow embedded browsers by using fixed control columns and a shorter GitHub connect label.
 - Reduced repository detail GitHub API usage by caching contributors, languages, releases, live status probes, stats, and issue/PR search counts across rebuilds, with short backoff for warming stats endpoints.
 - Added GitHub token-use monitoring to the admin console and reduced shared-token pressure with quota pause guards, GraphQL backoff, smaller discovery release batches, and capped shared owner scans.
 - Improved mobile dashboards with fixed viewport scaling, a single-row status/theme/login header, denser repository cards, and softer light-mode row colors.

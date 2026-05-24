@@ -1071,6 +1071,10 @@ button:focus-visible {
   text-align: center;
 }
 
+.account-label-short {
+  display: none;
+}
+
 .account-caret {
   grid-column: 3;
   justify-self: end;
@@ -2897,16 +2901,17 @@ body.dev-mode .table-head .since-heading .label-compact {
   }
 
   .top-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 32px 32px minmax(104px, 132px);
     width: 100%;
     align-items: center;
-    justify-content: stretch;
-    flex-wrap: nowrap;
     gap: 6px;
     margin-top: 0;
+    overflow: hidden;
   }
 
   .status {
-    flex: 1 1 0;
+    width: 100%;
     min-width: 0;
     margin-top: 0;
     font-size: 12px;
@@ -2918,18 +2923,40 @@ body.dev-mode .table-head .since-heading .label-compact {
 
   .theme-toggle,
   .refresh-toggle {
-    flex: 0 0 32px;
+    width: 32px;
+    min-width: 0;
+  }
+
+  .refresh-toggle {
+    grid-column: 2;
+  }
+
+  .theme-toggle {
+    grid-column: 3;
   }
 
   .account-button {
-    width: auto;
-    min-width: 116px;
-    max-width: 160px;
-    flex: 0 1 auto;
+    grid-column: 4;
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+    padding: 0 9px;
   }
 
   .account-label {
-    max-width: 122px;
+    max-width: none;
+  }
+
+  .account-button:not(:has(.account-avatar)) {
+    min-width: 0;
+  }
+
+  .account-label-full {
+    display: none;
+  }
+
+  .account-label-short {
+    display: block;
   }
 
   .discover-nav {

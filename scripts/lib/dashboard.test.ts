@@ -5390,6 +5390,7 @@ test("worker exposes GitHub App auth endpoints", async () => {
   assert.equal(location.startsWith("https://github.com/login/oauth/authorize?"), true);
   assert.match(location, /client_id=Iv123/);
   assert.match(location, /redirect_uri=https%3A%2F%2Frelease.bar%2Fapi%2Fauth%2Fcallback/);
+  assert.equal(new URL(location).searchParams.has("scope"), false);
 
   const badCallback = await worker.fetch(
     new Request("https://release.bar/api/auth/callback?code=x&state=bad"),
@@ -5408,6 +5409,65 @@ test("worker exposes GitHub App auth endpoints", async () => {
     install.headers.get("location"),
     "https://github.com/apps/releasebar-app/installations/new",
   );
+});
+
+test("worker remembers GitHub App installs without OAuth session", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs1", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const installReturn = await signedJson("test-secret", {
+    returnTo: "/openclaw",
+    iat: Math.floor(Date.now() / 1000),
+    nonce: "install-nonce",
+  });
+  const cache = kvStore();
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: cache,
+    GITHUB_APP_ID: "123",
+    GITHUB_APP_PRIVATE_KEY: privateKey,
+    GITHUB_APP_SLUG: "releasebar-app",
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    const authorization = new Headers(init?.headers).get("authorization");
+    if (url.pathname === "/app/installations/77") {
+      assert.match(authorization ?? "", /^Bearer [^.]+\.[^.]+\.[^.]+$/);
+      return Response.json({
+        id: 77,
+        account: {
+          login: "openclaw",
+          type: "Organization",
+          avatar_url: "https://avatars.githubusercontent.com/u/2",
+          html_url: "https://github.com/openclaw",
+        },
+        html_url: "https://github.com/organizations/openclaw/settings/installations/77",
+        repository_selection: "all",
+        target_type: "Organization",
+      });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const install = await worker.fetch(
+      new Request("https://release.bar/api/auth/install?installation_id=77&setup_action=install", {
+        headers: { cookie: `rd_install_return=${installReturn}` },
+      }),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(install.status, 302);
+    assert.equal(install.headers.get("location"), "/openclaw");
+    const remembered = JSON.parse((await cache.get("auth:installation:v1:openclaw")) ?? "{}");
+    assert.equal(remembered.id, 77);
+    assert.equal(remembered.accountLogin, "openclaw");
+    assert.equal(remembered.repositorySelection, "all");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("worker reports GitHub App installation coverage for signed-in users", async () => {

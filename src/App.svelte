@@ -745,6 +745,27 @@
     location.assign(installUrl.toString());
   }
 
+  function primaryAuthAction(): void {
+    if (!auth?.configured && !auth?.quotaConfigured) return;
+    if (adminRoute || !auth?.quotaConfigured) {
+      login();
+      return;
+    }
+    installApp();
+  }
+
+  function primaryAuthLabel(short = false): string {
+    if (!auth?.configured && !auth?.quotaConfigured) return short ? "Login" : "Login Unavailable";
+    if (adminRoute || !auth?.quotaConfigured) return short ? "Connect" : "Connect GitHub";
+    return short ? "Install" : "Install GitHub App";
+  }
+
+  function primaryAuthTitle(): string {
+    if (!auth?.configured && !auth?.quotaConfigured) return "GitHub connection unavailable";
+    if (adminRoute || !auth?.quotaConfigured) return "Connect GitHub";
+    return "Install GitHub App";
+  }
+
   function logout(): void {
     const logoutUrl = new URL(auth?.logoutUrl ?? "/api/auth/logout", location.origin);
     logoutUrl.searchParams.set("returnTo", currentReturnTo());
@@ -762,7 +783,7 @@
       );
     }
     return auth.quotaConfigured
-      ? "Connect GitHub to use dedicated API quota for dashboards you choose."
+      ? "Install the GitHub App for dedicated API quota. ReleaseBar only reads public metadata."
       : "Connect GitHub to manage dashboard access.";
   }
 
@@ -2082,15 +2103,15 @@
         keywords: ["hide", "show", "owner", owner],
         onRun: () => toggleOwner(owner, hiddenOwnerSet.has(owner)),
       })),
-      ...(authPayload?.configured && !authPayload.user
+      ...((authPayload?.configured || authPayload?.quotaConfigured) && !authPayload.user
         ? [
             {
               actionId: "auth:login",
-              title: "Connect GitHub",
+              title: authPayload?.quotaConfigured && !adminRoute ? "Install GitHub App" : "Connect GitHub",
               subTitle: "dedicated API quota",
               group: "Account",
               keywords: ["login", "github", "quota"],
-              onRun: login,
+              onRun: primaryAuthAction,
             },
           ]
         : []),
@@ -2357,13 +2378,13 @@
         <button
           class="account-button"
           type="button"
-          disabled={!auth?.configured}
-          onclick={login}
-          title={auth?.configured ? "Connect GitHub" : "GitHub login unavailable"}
+          disabled={!auth?.configured && !auth?.quotaConfigured}
+          onclick={primaryAuthAction}
+          title={primaryAuthTitle()}
         >
-          <span class="account-label account-label-full">{auth?.configured ? "Connect GitHub" : "Login Unavailable"}</span>
-          <span class="account-label account-label-short">{auth?.configured ? "Connect" : "Login"}</span>
-          {#if auth?.configured}
+          <span class="account-label account-label-full">{primaryAuthLabel()}</span>
+          <span class="account-label account-label-short">{primaryAuthLabel(true)}</span>
+          {#if auth?.configured || auth?.quotaConfigured}
             <span class="account-caret" aria-hidden="true"></span>
           {/if}
         </button>
@@ -2685,8 +2706,8 @@
           <span class="loading-kicker">repository unavailable</span>
           <strong>{errorMessage}</strong>
           <small>ReleaseBar only reads public GitHub metadata. Connected GitHub App quota can make public repo refreshes more reliable.</small>
-          {#if auth?.configured && !auth.user}
-            <button type="button" onclick={login}>Connect GitHub</button>
+          {#if (auth?.configured || auth?.quotaConfigured) && !auth.user}
+            <button type="button" onclick={primaryAuthAction}>{primaryAuthLabel()}</button>
           {/if}
         </div>
       {:else if !repoDetail}
@@ -3399,8 +3420,8 @@
           <span class="loading-kicker">dashboard unavailable</span>
           <strong>{errorMessage}</strong>
           <small>Unknown owners, cold caches, and GitHub rate limits can all land here. Connecting GitHub gives ReleaseBar dedicated App quota for dashboards you can access.</small>
-          {#if auth?.configured && !auth.user}
-            <button type="button" onclick={login}>Connect GitHub</button>
+          {#if (auth?.configured || auth?.quotaConfigured) && !auth.user}
+            <button type="button" onclick={primaryAuthAction}>{primaryAuthLabel()}</button>
           {/if}
         </div>
       {:else if dashboardFetching}

@@ -2371,14 +2371,22 @@ async function acknowledgedInstallations(
   installationId: number | null,
 ): Promise<AuthInstallation[]> {
   const record = await currentSessionRecord(request, env);
-  if (!record) return [];
-  const liveInstallations = await githubInstallations(record.session.accessToken).catch(() => []);
   const acknowledged: AuthInstallation[] = [];
+  const appInstallation = installationId
+    ? await githubAppInstallation(env, installationId).catch(() => null)
+    : null;
+  if (!record) {
+    if (appInstallation) {
+      await writeInstallationRegistry(env, [appInstallation]);
+      return [appInstallation];
+    }
+    return [];
+  }
+  const liveInstallations = await githubInstallations(record.session.accessToken).catch(() => []);
   if (
     installationId &&
     !liveInstallations.some((installation) => installation.id === installationId)
   ) {
-    const appInstallation = await githubAppInstallation(env, installationId).catch(() => null);
     acknowledged.push(
       appInstallation ??
         inferredInstallation(installationId, returnTo, new URL(request.url).origin, record.session),

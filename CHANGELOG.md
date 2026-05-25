@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Kept verified crawlers and bot user agents from scheduling dashboard, repository, discover, trust, and activity refresh work while still serving cached or cold data.
+- Made GitHub token-use audit counters durable so admin quota views reflect live Worker requests instead of only console logs.
 - Recorded GitHub App install callbacks even when users start from GitHub's public app page, added install/login funnel counters, and exposed install sync coverage in the admin console.
 - Routed public GitHub connection actions through GitHub App installation instead of OAuth sign-in, while still remembering installed app quota for anonymous dashboards.
 - Kept the mobile status/action bar within the viewport in narrow embedded browsers by using fixed control columns and a shorter GitHub connect label.

@@ -230,7 +230,6 @@ test("worker stores GitHub access counters and cached owner identity", async () 
 
     assert.equal(response.status, 200);
     await Promise.all(waits);
-    await new Promise((resolve) => setTimeout(resolve, 0));
     const owner = JSON.parse((await cache.get("owner:v1:owner")) ?? "{}") as {
       login?: string;
     };
@@ -274,6 +273,24 @@ async function signedJson(secret: string, value: unknown): Promise<string> {
   );
   const signature = await crypto.subtle.sign("HMAC", key, textEncoder.encode(payload));
   return `${payload}.${base64Url(new Uint8Array(signature))}`;
+}
+
+function crawlerRequest(
+  url: string,
+  userAgent = "Mozilla/5.0 (Linux; Android 6.0.1) AppleWebKit/537.36 Chrome/148.0 Mobile Safari/537.36 (compatible; GoogleOther)",
+  cf: Record<string, unknown> | null = { verifiedBotCategory: "AI Crawler" },
+): Request {
+  const request = new Request(url, {
+    headers: {
+      "user-agent": userAgent,
+    },
+  });
+  if (cf) {
+    Object.defineProperty(request, "cf", {
+      value: cf,
+    });
+  }
+  return request;
 }
 
 function testProject(overrides: Partial<Project> & Pick<Project, "owner" | "name">): Project {
@@ -1060,6 +1077,61 @@ test("worker embeds cached metadata-only owner dashboard data in the app shell",
   assert.match(html, /release scan skipped/);
 });
 
+test("worker embeds cached crawler dashboard shells without discovering app installs", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs1", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const payload = testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]);
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: false,
+    schemaVersion: 5,
+  });
+  let installationListCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/app/installations") {
+      installationListCalls += 1;
+      return Response.json([]);
+    }
+    throw new Error(`crawler shell should not call GitHub ${String(input)}`);
+  };
+  try {
+    const response = await worker.fetch(
+      crawlerRequest("https://release.bar/owner", "Googlebot/2.1", null),
+      {
+        ASSETS: {
+          fetch: async (request: Request) => {
+            assert.equal(new URL(request.url).pathname, "/index.html");
+            return new Response(
+              '<title>ReleaseBar</title><script type="module" src="/assets/index.js"></script>',
+              { headers: { "content-type": "text/html" } },
+            );
+          },
+        },
+        DASHBOARD_CACHE: kvStore({
+          [key]: JSON.stringify(payload),
+        }),
+        GITHUB_APP_ID: "123",
+        GITHUB_APP_PRIVATE_KEY: privateKey,
+      },
+      { waitUntil: () => undefined },
+    );
+
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(html, /id="releasebar-initial-data"/);
+    assert.match(html, /owner\\u002frepo|owner\/repo/);
+    assert.equal(installationListCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("worker embeds cached language-filtered discover data in the app shell", async () => {
   const allPayload = testDashboard("all", [testProject({ owner: "acme", name: "allbar" })]);
   const languagePayload = testDashboard("typescript", [
@@ -1612,6 +1684,60 @@ test("worker does not rehydrate completed GitHub discovery cache", async () => {
     const body = (await response.json()) as DashboardPayload;
     assert.equal(body.projects[0]?.version, "v2.0.0");
     assert.equal(body.cache?.state, "fresh");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker serves stale discovery caches to crawlers without searching GitHub", async () => {
+  const originalFetch = globalThis.fetch;
+  const cached = testDashboard("cached", [
+    testProject({
+      owner: "cached",
+      name: "repo",
+      version: "v2.0.0",
+      releaseDate: "2026-05-16T00:00:00Z",
+      commitsSinceRelease: 2,
+    }),
+  ]);
+  const waits: Array<Promise<unknown>> = [];
+  const env = {
+    DASHBOARD_CACHE: kvStore({
+      "discover:v4:week:all": JSON.stringify({
+        ...cached,
+        title: "GitHub Hot",
+        owners: [],
+        generatedAt: "2026-05-15T12:00:00Z",
+        cache: {
+          ...(cached.cache ?? {
+            capped: false,
+            repoLimit: 40,
+            generatedAt: cached.generatedAt,
+          }),
+          state: "fresh",
+          stale: false,
+          generatedAt: "2026-05-15T12:00:00Z",
+          progress: { scanned: 1, limit: 1, done: true },
+        },
+      }),
+    }),
+  };
+  globalThis.fetch = async (input) => {
+    throw new Error(`crawler should not refresh discovery ${String(input)}`);
+  };
+  try {
+    const response = await worker.fetch(
+      crawlerRequest("https://release.bar/api/_discover?period=week", "SemrushBot/7~bl", null),
+      env,
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.projects[0]?.version, "v2.0.0");
+    assert.equal(body.cache?.state, "stale");
+    assert.equal(body.cache?.message, "showing cached discovery results");
+    assert.equal(waits.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2980,6 +3106,55 @@ test("worker refreshes cached warming repository detail after short grace window
     assert.equal(body.cache.message, "refreshing repository statistics");
     assert.equal(waitUntilPromises.length, 1);
     await Promise.all(waitUntilPromises);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker serves stale repository detail to crawlers without refreshing", async () => {
+  const generatedAt = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+  const payload: RepoDetailPayload = {
+    fullName: "acme/warmbar",
+    generatedAt,
+    cache: {
+      state: "warming",
+      stale: true,
+      generatedAt,
+      message: "GitHub is preparing repository statistics.",
+    },
+    project: testProject({ owner: "acme", name: "warmbar" }),
+    releases: [],
+    contributors: [],
+    commitActivity: [],
+    codeFrequency: [],
+    languages: [],
+    workTrend: null,
+  };
+  const waitUntilPromises: Promise<unknown>[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    throw new Error(`crawler should not refresh ${String(input)}`);
+  };
+  try {
+    const response = await worker.fetch(
+      crawlerRequest("https://release.bar/api/repos/acme/warmbar"),
+      {
+        DASHBOARD_CACHE: kvStore({
+          "repo-detail:v4:acme/warmbar": JSON.stringify(payload),
+        }),
+        GITHUB_TOKEN: "shared-token",
+      },
+      {
+        waitUntil: (promise) => {
+          waitUntilPromises.push(promise);
+        },
+      },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as RepoDetailPayload;
+    assert.equal(body.cache.state, "stale");
+    assert.equal(body.cache.message, "showing cached repository statistics");
+    assert.equal(waitUntilPromises.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -7922,6 +8097,184 @@ test("worker skips request-triggered progressive rebuilds while shared quota is 
     );
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker serves cached dashboards to crawlers without scheduling refreshes", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs1", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: false,
+    schemaVersion: 5,
+  });
+  const dashboard: DashboardPayload = {
+    ...testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]),
+    generatedAt: "2026-05-15T12:00:00Z",
+    options: {
+      includeForks: false,
+      includeArchived: false,
+      includeUnreleased: true,
+      repoLimit: 200,
+    },
+    cache: {
+      state: "partial",
+      stale: true,
+      capped: false,
+      repoLimit: 200,
+      generatedAt: "2026-05-15T12:00:00Z",
+      progress: {
+        scanned: 1,
+        limit: 200,
+        done: false,
+      },
+    },
+  };
+  const cache = kvStore({
+    [key]: JSON.stringify(dashboard),
+  });
+  const waits: Array<Promise<unknown>> = [];
+  const originalFetch = globalThis.fetch;
+  let installationListCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/app/installations") {
+      installationListCalls += 1;
+      return Response.json([
+        {
+          id: 7,
+          account: {
+            login: "owner",
+            type: "User",
+            avatar_url: "https://avatars.githubusercontent.com/u/7",
+            html_url: "https://github.com/owner",
+          },
+          html_url: "https://github.com/settings/installations/7",
+          repository_selection: "all",
+          target_type: "User",
+        },
+      ]);
+    }
+    if (url.pathname === "/app/installations/7/access_tokens") {
+      return Response.json({ token: "installation-token" });
+    }
+    throw new Error(`crawler should not refresh dashboard ${String(input)}`);
+  };
+  try {
+    const response = await worker.fetch(
+      crawlerRequest("https://release.bar/api/owner", "AhrefsBot/7.0", null),
+      {
+        DASHBOARD_CACHE: cache,
+        GITHUB_APP_ID: "123",
+        GITHUB_APP_PRIVATE_KEY: privateKey,
+        GITHUB_TOKEN: "shared-token",
+      },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.cache?.state, "partial");
+    await Promise.all(waits);
+    const events = await refreshAuditEvents(cache);
+    assert.equal(
+      events.some((event) => event.event === "dashboard_refresh_schedule"),
+      false,
+    );
+    assert.equal(installationListCalls, 0);
+    assert.equal(await cache.get(`refresh:target:v1:${key}`), null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker keeps crawler cold dashboard builds alive without follow-up refreshes", async () => {
+  const key = dashboardCacheKey({
+    owner: "coldbot",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 5,
+  });
+  const cache = kvStore();
+  const waits: Array<{ promise: Promise<unknown>; pending: () => boolean }> = [];
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  let resolveGraphql!: (response: Response) => void;
+  const graphqlResponse = new Promise<Response>((resolve) => {
+    resolveGraphql = resolve;
+  });
+  globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) =>
+    originalSetTimeout(handler, timeout === 15_000 ? 0 : timeout, ...args)) as typeof setTimeout;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/users/coldbot") {
+      return Response.json({ login: "coldbot", type: "User" });
+    }
+    if (url.pathname === "/graphql") {
+      return graphqlResponse;
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      crawlerRequest("https://release.bar/api/coldbot", "Googlebot/2.1", null),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      {
+        waitUntil: (promise) => {
+          let pending = true;
+          waits.push({
+            promise: promise.finally(() => {
+              pending = false;
+            }),
+            pending: () => pending,
+          });
+        },
+      },
+    );
+    assert.equal(response.status, 202);
+    assert.equal(((await response.json()) as DashboardPayload).cache?.state, "rebuilding");
+    await new Promise((resolve) => originalSetTimeout(resolve, 0));
+    assert.equal(
+      waits.some((wait) => wait.pending()),
+      true,
+    );
+
+    resolveGraphql(
+      Response.json(
+        {
+          data: {
+            repositoryOwner: {
+              __typename: "User",
+              repositories: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [],
+              },
+            },
+          },
+        },
+        {
+          headers: {
+            "x-ratelimit-limit": "5000",
+            "x-ratelimit-remaining": "4998",
+            "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 3600),
+            "x-ratelimit-resource": "graphql",
+          },
+        },
+      ),
+    );
+    await Promise.all(waits.map((wait) => wait.promise));
+    assert.notEqual(await cache.get(key), null);
+    const events = await refreshAuditEvents(cache);
+    assert.equal(
+      events.some((event) => event.event === "dashboard_refresh_schedule"),
+      false,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
   }
 });
 

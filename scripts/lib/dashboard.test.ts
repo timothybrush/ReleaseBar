@@ -5398,6 +5398,7 @@ test("worker exposes GitHub App auth endpoints", async () => {
     context,
   );
   assert.equal(badCallback.status, 400);
+  assert.equal((await env.DASHBOARD_CACHE.list({ prefix: "auth:funnel:v1:" })).keys.length, 0);
 
   const install = await worker.fetch(
     new Request("https://release.bar/api/auth/install?returnTo=/openclaw"),
@@ -5894,6 +5895,59 @@ test("worker ignores install callback acknowledgements without signed return sta
     assert.equal(response.headers.get("location"), "/");
     const stored = JSON.parse((await cache.get(`auth:session:${sessionId}`)) ?? "{}");
     assert.equal(stored.installations, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker records server-verified install callbacks without signed return state", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs1", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const cache = kvStore();
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: cache,
+    GITHUB_APP_ID: "123",
+    GITHUB_APP_PRIVATE_KEY: privateKey,
+    GITHUB_APP_SLUG: "releasebar-app",
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    const authorization = new Headers(init?.headers).get("authorization");
+    if (url.pathname === "/app/installations/101") {
+      assert.match(authorization ?? "", /^Bearer [^.]+\.[^.]+\.[^.]+$/);
+      return Response.json({
+        id: 101,
+        account: {
+          login: "outside-org",
+          type: "Organization",
+          avatar_url: "https://avatars.githubusercontent.com/u/101",
+          html_url: "https://github.com/outside-org",
+        },
+        html_url: "https://github.com/organizations/outside-org/settings/installations/101",
+        repository_selection: "all",
+        target_type: "Organization",
+      });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/auth/install?installation_id=101&setup_action=install"),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 302);
+    assert.equal(response.headers.get("location"), "/");
+    const remembered = JSON.parse((await cache.get("auth:installation:v1:outside-org")) ?? "{}");
+    assert.equal(remembered.id, 101);
+    assert.equal(remembered.accountLogin, "outside-org");
+    const events = await cache.list({ prefix: "auth:funnel:v1:" });
+    assert.equal(events.keys.length, 2);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -6872,6 +6926,237 @@ test("worker admin scheduler requires an admin session and reports refresh targe
   assert.equal(runBody.enqueued, 0);
   assert.equal(runBody.due, 0);
   assert.deepEqual(sentJobs, []);
+});
+
+test("worker admin installation sync removes stale registry entries", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs1", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const sessionId = "session-admin-install-sync";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    "auth:installation:v1:stale-org": JSON.stringify({
+      id: 7,
+      accountLogin: "stale-org",
+      accountType: "org",
+      accountUrl: "https://github.com/stale-org",
+      avatarUrl: "https://avatars.githubusercontent.com/u/7",
+      repositorySelection: "all",
+      repositories: [],
+      updatedAt: "2026-05-15T12:00:00Z",
+    }),
+  });
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: cache,
+    GITHUB_APP_ID: "123",
+    GITHUB_APP_PRIVATE_KEY: privateKey,
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    const authorization = new Headers(init?.headers).get("authorization");
+    if (url.pathname === "/app/installations") {
+      assert.match(authorization ?? "", /^Bearer [^.]+\.[^.]+\.[^.]+$/);
+      return Response.json([
+        {
+          id: 11,
+          account: {
+            login: "fresh-org",
+            type: "Organization",
+            avatar_url: "https://avatars.githubusercontent.com/u/11",
+            html_url: "https://github.com/fresh-org",
+          },
+          html_url: "https://github.com/organizations/fresh-org/settings/installations/11",
+          repository_selection: "all",
+          target_type: "Organization",
+        },
+      ]);
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/admin/installations/sync", {
+        method: "POST",
+        headers: { cookie: `rd_session=${authCookie}` },
+      }),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as { count?: number };
+    assert.equal(body.count, 1);
+    assert.equal(await cache.get("auth:installation:v1:stale-org"), null);
+    const fresh = JSON.parse((await cache.get("auth:installation:v1:fresh-org")) ?? "{}");
+    assert.equal(fresh.id, 11);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker admin installation sync keeps registry when GitHub listing fails", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs1", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const sessionId = "session-admin-install-sync-failed";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    "auth:installation:v1:known-org": JSON.stringify({
+      id: 7,
+      accountLogin: "known-org",
+      accountType: "org",
+      accountUrl: "https://github.com/known-org",
+      avatarUrl: "https://avatars.githubusercontent.com/u/7",
+      repositorySelection: "all",
+      repositories: [],
+      updatedAt: "2026-05-15T12:00:00Z",
+    }),
+  });
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: cache,
+    GITHUB_APP_ID: "123",
+    GITHUB_APP_PRIVATE_KEY: privateKey,
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/app/installations") {
+      return Response.json({ message: "try later" }, { status: 503 });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/admin/installations/sync", {
+        method: "POST",
+        headers: { cookie: `rd_session=${authCookie}` },
+      }),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 400);
+    assert.notEqual(await cache.get("auth:installation:v1:known-org"), null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker admin installation sync keeps selected repos when repository listing fails", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs1", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const sessionId = "session-admin-install-sync-selected-failed";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    "auth:installation:v1:known-org": JSON.stringify({
+      id: 7,
+      accountLogin: "known-org",
+      accountType: "org",
+      accountUrl: "https://github.com/known-org",
+      avatarUrl: "https://avatars.githubusercontent.com/u/7",
+      repositorySelection: "selected",
+      repositories: ["known-org/releasebar"],
+      updatedAt: "2026-05-15T12:00:00Z",
+    }),
+  });
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: cache,
+    GITHUB_APP_ID: "123",
+    GITHUB_APP_PRIVATE_KEY: privateKey,
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    const authorization = new Headers(init?.headers).get("authorization");
+    if (url.pathname === "/app/installations") {
+      assert.match(authorization ?? "", /^Bearer [^.]+\.[^.]+\.[^.]+$/);
+      return Response.json([
+        {
+          id: 7,
+          account: {
+            login: "known-org",
+            type: "Organization",
+            avatar_url: "https://avatars.githubusercontent.com/u/7",
+            html_url: "https://github.com/known-org",
+          },
+          html_url: "https://github.com/organizations/known-org/settings/installations/7",
+          repository_selection: "selected",
+          target_type: "Organization",
+        },
+      ]);
+    }
+    if (url.pathname === "/app/installations/7/access_tokens") {
+      return Response.json({ token: "installation-token" });
+    }
+    if (url.pathname === "/installation/repositories") {
+      assert.equal(authorization, "Bearer installation-token");
+      return Response.json({ message: "try later" }, { status: 503 });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/admin/installations/sync", {
+        method: "POST",
+        headers: { cookie: `rd_session=${authCookie}` },
+      }),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 400);
+    const preserved = JSON.parse((await cache.get("auth:installation:v1:known-org")) ?? "{}");
+    assert.deepEqual(preserved.repositories, ["known-org/releasebar"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("worker admin scheduler counts missing caches as due even before nextDueAt", async () => {

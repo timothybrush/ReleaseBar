@@ -55,7 +55,10 @@ import { initWasm, Resvg } from "@resvg/resvg-wasm";
 import type {
   ApiQuota,
   AudienceRange,
+  AuthFunnelEvent,
+  AuthFunnelSummary,
   AuthInstallation,
+  AuthInstallationRecord,
   AuthPayload,
   AuthUser,
   ActivityRange,
@@ -214,6 +217,9 @@ const githubSharedBudgetPrefix = `github:budget:v1:shared:`;
 const githubGraphqlBackoffPrefix = `github:backoff:v1:graphql:`;
 const githubAccessAdminHours = 24;
 const githubAccessAdminRouteLimit = 30;
+const authFunnelPrefix = `auth:funnel:v1:`;
+const authFunnelCounterPrefix = `auth:funnel-counter:v1:`;
+const authFunnelListLimit = 80;
 const sharedQuotaCooldownFallbackSeconds = 30 * 60;
 const sharedQuotaMinimumRemaining: Record<string, number> = {
   core: 500,
@@ -427,6 +433,147 @@ const storedInstallationSchema = v.object({
 type StoredInstallationRecord = AuthInstallation & {
   updatedAt?: string;
 };
+
+function authFunnelStorageKey(event: Pick<AuthFunnelEvent, "id" | "at">): string {
+  const timestamp = safeIso(event.at) || Date.now();
+  const reverseTimestamp = String(Number.MAX_SAFE_INTEGER - timestamp).padStart(16, "0");
+  return `${authFunnelPrefix}${reverseTimestamp}:${event.id}`;
+}
+
+function authFunnelCounterKey(
+  event: string,
+  account: string | null,
+  status: string | null,
+): string {
+  const day = new Date().toISOString().slice(0, 10);
+  return `${authFunnelCounterPrefix}${day}:${event}:${account ?? "_"}:${status ?? "_"}`;
+}
+
+function authEventDetail(value: string | null | undefined): string | null {
+  if (!value) return null;
+  return value.replace(/\s+/g, " ").slice(0, 160);
+}
+
+async function readCounter(env: Env, key: string): Promise<number> {
+  const current = Number.parseInt((await env.DASHBOARD_CACHE?.get(key)) ?? "0", 10);
+  return Number.isFinite(current) ? current : 0;
+}
+
+async function recordAuthFunnelEvent(
+  env: Env,
+  input: Omit<AuthFunnelEvent, "id" | "at">,
+): Promise<void> {
+  if (!env.DASHBOARD_CACHE) return;
+  try {
+    const item: AuthFunnelEvent = {
+      id: randomNonce(),
+      at: new Date().toISOString(),
+      ...input,
+      account: input.account ? slugOwner(input.account) : null,
+      detail: authEventDetail(input.detail),
+    };
+    const counterKey = authFunnelCounterKey(item.event, item.account, item.status);
+    await Promise.all([
+      env.DASHBOARD_CACHE.put(authFunnelStorageKey(item), JSON.stringify(item), {
+        expirationTtl: dashboardStorageTtlSeconds,
+      }),
+      readCounter(env, counterKey).then((count) =>
+        env.DASHBOARD_CACHE!.put(counterKey, String(count + 1), {
+          expirationTtl: dashboardStorageTtlSeconds,
+        }),
+      ),
+    ]);
+  } catch (error) {
+    console.warn(
+      JSON.stringify({ area: "auth", event: "funnel_write_failed", error: errorMessage(error) }),
+    );
+  }
+}
+
+function storedInstallationRecord(record: StoredInstallationRecord): AuthInstallationRecord {
+  return {
+    ...record,
+    updatedAt: record.updatedAt ?? new Date(0).toISOString(),
+  };
+}
+
+async function listStoredInstallations(env: Env): Promise<AuthInstallationRecord[]> {
+  if (!env.DASHBOARD_CACHE?.list) return [];
+  const records: AuthInstallationRecord[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await env.DASHBOARD_CACHE.list({
+      prefix: `auth:installation:v1:`,
+      limit: 1000,
+      ...(cursor ? { cursor } : {}),
+    });
+    for (const key of page.keys) {
+      const raw = await env.DASHBOARD_CACHE.get(key.name);
+      if (!raw) continue;
+      const parsed = safeJsonParse(storedInstallationSchema, raw, `app installation ${key.name}`);
+      if (parsed) records.push(storedInstallationRecord(parsed));
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return records.sort((a, b) => safeIso(b.updatedAt) - safeIso(a.updatedAt));
+}
+
+async function listAuthFunnelEvents(env: Env): Promise<AuthFunnelEvent[]> {
+  if (!env.DASHBOARD_CACHE?.list) return [];
+  const events: AuthFunnelEvent[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await env.DASHBOARD_CACHE.list({
+      prefix: authFunnelPrefix,
+      limit: Math.min(1000, authFunnelListLimit - events.length),
+      ...(cursor ? { cursor } : {}),
+    });
+    for (const key of page.keys) {
+      const raw = await env.DASHBOARD_CACHE.get(key.name);
+      if (!raw) continue;
+      const parsed = tryJsonParse<AuthFunnelEvent>(raw, `auth funnel ${key.name}`);
+      if (parsed?.id && parsed.at && parsed.event) events.push(parsed);
+      if (events.length >= authFunnelListLimit) break;
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor && events.length < authFunnelListLimit);
+  return events.sort((a, b) => safeIso(b.at) - safeIso(a.at));
+}
+
+async function listAuthFunnelCounts(env: Env): Promise<Array<{ key: string; count: number }>> {
+  if (!env.DASHBOARD_CACHE?.list) return [];
+  const counts: Array<{ key: string; count: number }> = [];
+  let cursor: string | undefined;
+  do {
+    const page = await env.DASHBOARD_CACHE.list({
+      prefix: authFunnelCounterPrefix,
+      limit: 1000,
+      ...(cursor ? { cursor } : {}),
+    });
+    for (const key of page.keys) {
+      const count = Number.parseInt((await env.DASHBOARD_CACHE.get(key.name)) ?? "0", 10);
+      if (Number.isFinite(count) && count > 0) {
+        counts.push({ key: key.name.slice(authFunnelCounterPrefix.length), count });
+      }
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return counts.sort((a, b) => b.count - a.count || a.key.localeCompare(b.key)).slice(0, 80);
+}
+
+async function authFunnelSummary(env: Env): Promise<AuthFunnelSummary> {
+  const [installations, events, counts] = await Promise.all([
+    listStoredInstallations(env),
+    listAuthFunnelEvents(env),
+    listAuthFunnelCounts(env),
+  ]);
+  return {
+    generatedAt: new Date().toISOString(),
+    installations,
+    events,
+    counts,
+  };
+}
 
 function isPublicInstallationRepository(repo: GitHubInstallationRepository): boolean {
   if (repo.private === true) {
@@ -1966,8 +2113,9 @@ async function loginResponse(request: Request, env: Env): Promise<Response> {
     });
   }
   const url = new URL(request.url);
+  const returnTo = safeReturnTo(url.searchParams.get("returnTo"), url.origin);
   const state = await signedJson(env.AUTH_COOKIE_SECRET, {
-    returnTo: safeReturnTo(url.searchParams.get("returnTo"), url.origin),
+    returnTo,
     iat: Math.floor(Date.now() / 1000),
     nonce: randomNonce(),
   });
@@ -2084,13 +2232,17 @@ async function githubInstallations(accessToken: string): Promise<AuthInstallatio
   );
 }
 
-async function githubAppInstallationsForSession(
+async function githubAppInstallations(
   env: Env,
-  session: StoredAuthSession,
+  accountFilter: string | null = null,
+  strict = false,
 ): Promise<AuthInstallation[]> {
-  if (!appTokenConfigured(env)) return [];
+  if (!appTokenConfigured(env)) {
+    if (strict) throw new Error("GitHub App credentials are not configured");
+    return [];
+  }
   const jwt = await githubAppJwt(env);
-  const accountLogin = session.user.login.toLowerCase();
+  const normalizedAccountFilter = accountFilter ? slugOwner(accountFilter) : null;
   const installations: AuthInstallation[] = [];
   for (let page = 1; page <= 10; page += 1) {
     const response = await workerFetch(
@@ -2104,7 +2256,10 @@ async function githubAppInstallationsForSession(
         },
       },
     );
-    if (!response.ok) break;
+    if (!response.ok) {
+      if (strict) throw new Error(`GitHub App installation list failed: ${response.status}`);
+      break;
+    }
     const result = parseGitHubResponse(
       v.array(gitHubInstallationSchema),
       await response.json(),
@@ -2113,10 +2268,12 @@ async function githubAppInstallationsForSession(
     const batch = result;
     for (const installation of batch) {
       const account = installation.account;
-      if (!account || account.login.toLowerCase() !== accountLogin) continue;
+      const accountLogin = account ? slugOwner(account.login) : "";
+      if (!account || !validOwnerSlug(accountLogin)) continue;
+      if (normalizedAccountFilter && accountLogin !== normalizedAccountFilter) continue;
       const repositories =
         installation.repository_selection === "selected"
-          ? await githubAppInstallationRepositories(env, installation.id)
+          ? await githubAppInstallationRepositories(env, installation.id, strict)
           : [];
       installations.push({
         id: installation.id,
@@ -2129,8 +2286,49 @@ async function githubAppInstallationsForSession(
       });
     }
     if (batch.length < 100) break;
+    if (strict && page === 10) {
+      throw new Error("GitHub App installation list exceeded sync page limit");
+    }
   }
   return installations;
+}
+
+async function githubAppInstallationsForSession(
+  env: Env,
+  session: StoredAuthSession,
+): Promise<AuthInstallation[]> {
+  return githubAppInstallations(env, session.user.login);
+}
+
+async function syncGithubAppInstallations(env: Env): Promise<AuthInstallationRecord[]> {
+  const installations = await githubAppInstallations(env, null, true);
+  const freshAccounts = new Set(installations.map((installation) => installation.accountLogin));
+  const existing = await listStoredInstallations(env);
+  await Promise.all(
+    existing
+      .filter((installation) => !freshAccounts.has(installation.accountLogin))
+      .map(async (installation) => {
+        await env.DASHBOARD_CACHE?.delete?.(installationRegistryKey(installation.accountLogin));
+        await recordAuthFunnelEvent(env, {
+          event: "install_removed",
+          account: installation.accountLogin,
+          installationId: installation.id,
+          repositorySelection: installation.repositorySelection,
+          status: "sync_absent",
+          detail: null,
+        });
+      }),
+  );
+  await writeInstallationRegistry(env, installations);
+  await recordAuthFunnelEvent(env, {
+    event: "install_sync",
+    account: null,
+    installationId: null,
+    repositorySelection: null,
+    status: "ok",
+    detail: `installations=${installations.length}`,
+  });
+  return listStoredInstallations(env);
 }
 
 async function githubInstallationRepositories(
@@ -2321,9 +2519,13 @@ async function githubAppInstallationForAccount(
 async function githubAppInstallationRepositories(
   env: Env,
   installationId: number,
+  strict = false,
 ): Promise<string[]> {
   const token = await cachedInstallationToken(env, installationId);
-  if (!token) return [];
+  if (!token) {
+    if (strict) throw new Error(`GitHub App installation token unavailable: ${installationId}`);
+    return [];
+  }
   const repositories: string[] = [];
   for (let page = 1; page <= 10; page += 1) {
     const response = await workerFetch(
@@ -2337,7 +2539,12 @@ async function githubAppInstallationRepositories(
         },
       },
     );
-    if (!response.ok) break;
+    if (!response.ok) {
+      if (strict) {
+        throw new Error(`GitHub App installation repositories failed: ${response.status}`);
+      }
+      break;
+    }
     const result = parseGitHubResponse(
       gitHubInstallationRepositoryListSchema,
       await response.json(),
@@ -2348,6 +2555,9 @@ async function githubAppInstallationRepositories(
       ...batch.filter(isPublicInstallationRepository).map((repo) => repo.full_name.toLowerCase()),
     );
     if (batch.length < 100) break;
+    if (strict && page === 10) {
+      throw new Error("GitHub App installation repositories exceeded sync page limit");
+    }
   }
   return repositories;
 }
@@ -2802,6 +3012,7 @@ async function callbackResponse(request: Request, env: Env): Promise<Response> {
     });
   }
   const url = new URL(request.url);
+  let validatedState = false;
   try {
     const state = await verifySignedJson<AuthState>(
       env.AUTH_COOKIE_SECRET,
@@ -2810,6 +3021,7 @@ async function callbackResponse(request: Request, env: Env): Promise<Response> {
     if (!state || Math.floor(Date.now() / 1000) - state.iat > stateMaxAgeSeconds) {
       throw new Error("invalid OAuth state");
     }
+    validatedState = true;
     const accessToken = await exchangeCode(url, env);
     const user = await githubUser(accessToken);
     const now = Math.floor(Date.now() / 1000);
@@ -2833,6 +3045,14 @@ async function callbackResponse(request: Request, env: Env): Promise<Response> {
       appTokenConfigured(env),
       user.login,
     );
+    await recordAuthFunnelEvent(env, {
+      event: "login_success",
+      account: user.login,
+      installationId: null,
+      repositorySelection: null,
+      status: installations.length > 0 ? "installed" : "no_install",
+      detail: `installations=${installations.length}`,
+    });
     if (coverage.needed) {
       const installReturn = await signedJson(env.AUTH_COOKIE_SECRET, {
         returnTo: state.returnTo,
@@ -2845,6 +3065,16 @@ async function callbackResponse(request: Request, env: Env): Promise<Response> {
     }
     return redirectResponse(state.returnTo, { "set-cookie": sessionCookieValue });
   } catch (error) {
+    if (validatedState) {
+      await recordAuthFunnelEvent(env, {
+        event: "login_failed",
+        account: null,
+        installationId: null,
+        repositorySelection: null,
+        status: "error",
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
     return jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 400, {
       "cache-control": "no-store",
     });
@@ -2880,13 +3110,38 @@ async function installResponse(request: Request, env: Env): Promise<Response> {
       state !== null && Math.floor(Date.now() / 1000) - state.iat <= stateMaxAgeSeconds;
     const returnTo = stateIsFresh ? state.returnTo : "/";
     const installationId = Number(url.searchParams.get("installation_id"));
+    const validInstallationId = Number.isFinite(installationId) ? installationId : null;
+    const canVerifyCallback = stateIsFresh || !(await authInstallCallbackRateLimited(request, env));
+    const appInstallation =
+      validInstallationId && canVerifyCallback
+        ? await githubAppInstallation(env, validInstallationId).catch(() => null)
+        : null;
+    if (stateIsFresh || appInstallation) {
+      await recordAuthFunnelEvent(env, {
+        event: "install_callback",
+        account: appInstallation?.accountLogin ?? null,
+        installationId: validInstallationId,
+        repositorySelection: appInstallation?.repositorySelection ?? null,
+        status: stateIsFresh ? "fresh_state" : state ? "stale_state" : "missing_state",
+        detail: returnTo,
+      });
+    }
+    if (appInstallation) {
+      await writeInstallationRegistry(env, [appInstallation]);
+      await recordAuthFunnelEvent(env, {
+        event: "install_recorded",
+        account: appInstallation.accountLogin,
+        installationId: appInstallation.id,
+        repositorySelection: appInstallation.repositorySelection,
+        status: stateIsFresh ? "fresh_state" : "server_verified",
+        detail:
+          appInstallation.repositorySelection === "selected"
+            ? `repos=${appInstallation.repositories.length}`
+            : "repos=all",
+      });
+    }
     if (stateIsFresh) {
-      await acknowledgedInstallations(
-        request,
-        env,
-        returnTo,
-        Number.isFinite(installationId) ? installationId : null,
-      );
+      await acknowledgedInstallations(request, env, returnTo, validInstallationId);
     }
     return redirectResponse(returnTo, {
       "set-cookie": installReturnCookieValue("", 0),
@@ -3337,6 +3592,25 @@ async function clientTimingRateLimited(request: Request, env: Env): Promise<bool
   const key = `client:timing:rate:v1:${id}:${minute}`;
   const current = Number.parseInt((await env.DASHBOARD_CACHE.get(key)) ?? "0", 10);
   if (Number.isFinite(current) && current >= 30) return true;
+  await env.DASHBOARD_CACHE.put(key, String((Number.isFinite(current) ? current : 0) + 1), {
+    expirationTtl: 120,
+  });
+  return false;
+}
+
+async function authInstallCallbackRateLimited(request: Request, env: Env): Promise<boolean> {
+  if (!env.DASHBOARD_CACHE) return true;
+  const forwardedFor = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+  const client =
+    request.headers.get("cf-connecting-ip") ??
+    forwardedFor ??
+    request.headers.get("user-agent") ??
+    "unknown";
+  const minute = Math.floor(Date.now() / 60000);
+  const id = (await sha256Base64Url(client)).slice(0, 16);
+  const key = `auth:install-callback:rate:v1:${id}:${minute}`;
+  const current = Number.parseInt((await env.DASHBOARD_CACHE.get(key)) ?? "0", 10);
+  if (Number.isFinite(current) && current >= 6) return true;
   await env.DASHBOARD_CACHE.put(key, String((Number.isFinite(current) ? current : 0) + 1), {
     expirationTtl: 120,
   });
@@ -3884,12 +4158,13 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
 }
 
 async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
-  const [targets, jobs, events, stateRaw, access] = await Promise.all([
+  const [targets, jobs, events, stateRaw, access, auth] = await Promise.all([
     listRefreshTargets(env, refreshTargetListLimit),
     listRefreshJobs(env),
     listAuditEvents(env),
     env.DASHBOARD_CACHE?.get(refreshStateKey),
     githubAccessSummary(env),
+    authFunnelSummary(env),
   ]);
   const state = stateRaw ? tryJsonParse<{ lastTickAt?: string }>(stateRaw, "refresh state") : null;
   const activeTargetKeys = new Set(
@@ -3930,6 +4205,7 @@ async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
     jobs,
     events,
     githubAccess: access,
+    auth,
   };
 }
 
@@ -9254,6 +9530,21 @@ async function adminResponse(
       "cache-control": "no-store",
     });
   }
+  if (url.pathname === "/api/admin/installations" && request.method === "GET") {
+    return jsonResponse(await authFunnelSummary(env), 200, { "cache-control": "no-store" });
+  }
+  if (url.pathname === "/api/admin/installations/sync" && request.method === "POST") {
+    try {
+      const installations = await syncGithubAppInstallations(env);
+      return jsonResponse({ ok: true, installations, count: installations.length }, 200, {
+        "cache-control": "no-store",
+      });
+    } catch (error) {
+      return jsonResponse({ ok: false, error: errorMessage(error) }, 400, {
+        "cache-control": "no-store",
+      });
+    }
+  }
   if (url.pathname === "/api/admin/scheduler/run" && request.method === "POST") {
     const result = await schedulerTick(
       env,
@@ -9775,7 +10066,10 @@ export default {
       (request.method === "POST" || request.method === "DELETE");
     const audienceBackfillWrite =
       isRepoAudienceBackfillApiPath(url.pathname) && request.method === "POST";
-    const adminWrite = url.pathname === "/api/admin/scheduler/run" && request.method === "POST";
+    const adminWrite =
+      (url.pathname === "/api/admin/scheduler/run" ||
+        url.pathname === "/api/admin/installations/sync") &&
+      request.method === "POST";
     const ownerRefreshWrite = isOwnerRefreshApiPath(url.pathname) && request.method === "POST";
     const clientTimingWrite = url.pathname === "/api/_client-timing" && request.method === "POST";
     if (

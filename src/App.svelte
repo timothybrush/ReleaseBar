@@ -1590,6 +1590,27 @@
     }
   }
 
+  async function syncInstallations(): Promise<void> {
+    if (!adminRoute) return;
+    adminActionMessage = "syncing GitHub App installs";
+    try {
+      const response = await fetch("/api/admin/installations/sync", {
+        method: "POST",
+        cache: "no-store",
+      });
+      const body = (await response.json().catch(() => null)) as
+        | { ok?: boolean; count?: number; error?: string }
+        | null;
+      if (!response.ok || !body?.ok) {
+        throw new Error(body?.error ?? `install sync failed: ${response.status}`);
+      }
+      adminActionMessage = `${numberFormat.format(body.count ?? 0)} GitHub App installs synced`;
+      await loadAdmin();
+    } catch (error) {
+      adminActionMessage = error instanceof Error ? error.message : String(error);
+    }
+  }
+
   function adminAge(value: string | null): string {
     return value ? relativeDate(value) : "never";
   }
@@ -2546,6 +2567,7 @@
           <div class="admin-actions">
             <button type="button" disabled={adminLoading} onclick={loadAdmin}>refresh</button>
             <button type="button" disabled={adminLoading} onclick={runScheduler}>run now</button>
+            <button type="button" disabled={adminLoading} onclick={syncInstallations}>sync installs</button>
           </div>
         </div>
         {#if adminActionMessage}
@@ -2580,8 +2602,72 @@
             <span>shared pause</span>
             <strong>{admin.githubAccess.cooldown.active ? "on" : "off"}</strong>
           </div>
+          <div>
+            <span>installs</span>
+            <strong>{numberFormat.format(admin.auth.installations.length)}</strong>
+          </div>
+          <div>
+            <span>auth events</span>
+            <strong>{numberFormat.format(admin.auth.events.length)}</strong>
+          </div>
         </div>
         <div class="admin-grid">
+          <section class="admin-panel admin-wide">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-kicker">GitHub App installs</span>
+                <h2>sync coverage</h2>
+              </div>
+              <strong>{numberFormat.format(admin.auth.installations.length)}</strong>
+            </div>
+            <div class="admin-list compact">
+              {#each admin.auth.installations as installation}
+                <div class="admin-row">
+                  <span>
+                    <strong>@{installation.accountLogin}</strong>
+                    <small>
+                      {installation.accountType} · {installation.repositorySelection === "all" ? "all repos" : `${numberFormat.format(installation.repositories.length)} public repos`}
+                    </small>
+                  </span>
+                  <span>
+                    <strong>{installation.repositorySelection}</strong>
+                    <small>updated {adminAge(installation.updatedAt)}</small>
+                  </span>
+                </div>
+              {/each}
+              {#if admin.auth.installations.length === 0}
+                <p class="detail-empty">No GitHub App installations recorded yet. Use sync installs to read GitHub's current app installation list.</p>
+              {/if}
+            </div>
+          </section>
+
+          <section class="admin-panel admin-wide">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-kicker">auth funnel</span>
+                <h2>recent events</h2>
+              </div>
+              <strong>{numberFormat.format(admin.auth.counts.length)} counters</strong>
+            </div>
+            <div class="admin-list compact token-use">
+              {#each admin.auth.events as event}
+                <div class={`admin-row status-${event.status === "error" ? "failed" : "succeeded"}`}>
+                  <span>
+                    <strong>{event.event}{event.account ? ` · @${event.account}` : ""}</strong>
+                    <small>{event.detail ?? event.status ?? "recorded"}</small>
+                  </span>
+                  <span>
+                    <strong>{event.repositorySelection ?? event.status ?? "event"}</strong>
+                    <small>{adminAge(event.at)}</small>
+                  </span>
+                </div>
+              {/each}
+              {#if admin.auth.events.length === 0}
+                <p class="detail-empty">No auth or install funnel events recorded yet.</p>
+              {/if}
+            </div>
+          </section>
+
           <section class="admin-panel admin-wide">
             <div class="panel-heading">
               <div>

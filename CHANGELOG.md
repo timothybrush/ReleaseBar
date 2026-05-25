@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Recorded GitHub App install callbacks even when users start from GitHub's public app page, added install/login funnel counters, and exposed install sync coverage in the admin console.
 - Routed public GitHub connection actions through GitHub App installation instead of OAuth sign-in, while still remembering installed app quota for anonymous dashboards.
 - Kept the mobile status/action bar within the viewport in narrow embedded browsers by using fixed control columns and a shorter GitHub connect label.
 - Reduced repository detail GitHub API usage by caching contributors, languages, releases, live status probes, stats, and issue/PR search counts across rebuilds, with short backoff for warming stats endpoints.

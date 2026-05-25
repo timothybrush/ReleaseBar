@@ -81,6 +81,28 @@ export type AuthInstallation = {
   repositories: string[];
 };
 
+export type AuthInstallationRecord = AuthInstallation & {
+  updatedAt: string;
+};
+
+export type AuthFunnelEvent = {
+  id: string;
+  at: string;
+  event: string;
+  account: string | null;
+  installationId: number | null;
+  repositorySelection: "all" | "selected" | null;
+  status: string | null;
+  detail: string | null;
+};
+
+export type AuthFunnelSummary = {
+  generatedAt: string;
+  installations: AuthInstallationRecord[];
+  events: AuthFunnelEvent[];
+  counts: Array<{ key: string; count: number }>;
+};
+
 export type AuthPayload = {
   configured: boolean;
   quotaConfigured: boolean;
@@ -556,6 +578,7 @@ export type SchedulerAdminPayload = {
   jobs: RefreshJob[];
   events: SchedulerAuditEvent[];
   githubAccess: GitHubAccessSummary;
+  auth: AuthFunnelSummary;
 };
 
 export type GitHubAccessRouteSummary = {

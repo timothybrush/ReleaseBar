@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Clarified trust score tooltips for owner, organization, contributor, and stargazer signals. Thanks @vincent-peng.
+- Made dashboard search match separate terms across repository metadata and release names. Thanks @tanish19078.
+- Kept light-mode trust panels on theme-aware surfaces instead of dark translucent backgrounds. Thanks @shubh73.
 - Kept verified crawlers and bot user agents from scheduling dashboard, repository, discover, trust, and activity refresh work while still serving cached or cold data.
 - Made GitHub token-use audit counters durable so admin quota views reflect live Worker requests instead of only console logs.
 - Recorded GitHub App install callbacks even when users start from GitHub's public app page, added install/login funnel counters, and exposed install sync coverage in the admin console.

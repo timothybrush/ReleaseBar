@@ -8433,6 +8433,103 @@ test("worker refresh jobs defer shared work while shared quota is paused", async
   assert.match(storedTarget.message ?? "", /shared GitHub quota paused/);
 });
 
+test("worker refresh jobs defer shared work while GraphQL is backed off", async () => {
+  const key = dashboardCacheKey({
+    owner: "openclaw",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 5,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "openclaw",
+    owners: ["openclaw"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/openclaw",
+    priority: 100,
+    lastSeenAt: "2026-05-15T12:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-05-15T13:00:00Z",
+    failureCount: 0,
+  };
+  const job: RefreshJob = {
+    id: "job-shared-graphql-paused",
+    targetKey: key,
+    kind: "dashboard",
+    status: "queued",
+    reason: "scheduled",
+    createdAt: "2026-05-15T13:00:00Z",
+    updatedAt: "2026-05-15T13:00:00Z",
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const cache = kvStore({
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+    [`refresh:job:v1:${job.id}`]: JSON.stringify(job),
+    "github:backoff:v1:graphql:shared:_": JSON.stringify({
+      active: true,
+      status: 502,
+      source: "shared",
+      account: null,
+      at: new Date().toISOString(),
+    }),
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("GraphQL backoff should skip GitHub fetches");
+  };
+  let acked = false;
+  try {
+    await (
+      worker as unknown as {
+        queue(
+          batch: {
+            messages: Array<{
+              body: RefreshJob;
+              ack(): void;
+              retry(options?: { delaySeconds?: number }): void;
+            }>;
+          },
+          env: unknown,
+          context: unknown,
+        ): Promise<void>;
+      }
+    ).queue(
+      {
+        messages: [
+          {
+            body: job,
+            ack() {
+              acked = true;
+            },
+            retry() {
+              throw new Error("job should not retry");
+            },
+          },
+        ],
+      },
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(acked, true);
+  const updated = JSON.parse((await cache.get(`refresh:job:v1:${job.id}`)) ?? "{}") as RefreshJob;
+  assert.equal(updated.status, "skipped");
+  assert.match(updated.error ?? "", /GraphQL temporarily paused/);
+  const storedTarget = JSON.parse(
+    (await cache.get(`refresh:target:v1:${key}`)) ?? "{}",
+  ) as RefreshTarget;
+  assert.equal(storedTarget.failureCount, 0);
+  assert.match(storedTarget.message ?? "", /GitHub GraphQL paused/);
+});
+
 test("worker skips request-triggered progressive rebuilds while shared quota is paused", async () => {
   const key = dashboardCacheKey({
     owner: "owner",

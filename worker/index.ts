@@ -222,6 +222,7 @@ const githubAccessTtlSeconds = 14 * 24 * 60 * 60;
 const githubAccessShardCount = 16;
 const githubSharedBudgetPrefix = `github:budget:v1:shared:`;
 const githubGraphqlBackoffPrefix = `github:backoff:v1:graphql:`;
+const githubGraphqlBackoffSeconds = 15 * 60;
 const githubAccessAdminHours = 24;
 const githubAccessAdminRouteLimit = 30;
 const crawlerUserAgentPattern =
@@ -848,8 +849,12 @@ async function markGraphqlBackoff(
       account,
       at: new Date().toISOString(),
     }),
-    { expirationTtl: 15 * 60 },
+    { expirationTtl: githubGraphqlBackoffSeconds },
   );
+}
+
+function githubGraphqlBackoffDeferUntil(): string {
+  return new Date(Date.now() + githubGraphqlBackoffSeconds * 1000).toISOString();
 }
 
 async function recordGitHubAccessCounter(
@@ -4157,6 +4162,37 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
         status: "skipped",
         reason: "shared-quota",
         detail: `until=${nextDueAt} remaining=${sharedCooldown.remaining ?? "unknown"} resource=${sharedCooldown.resource ?? "any"}`,
+      });
+      return skipped;
+    }
+    const quotaSource = token?.quotaSource ?? (env.GITHUB_TOKEN ? "shared" : "anonymous");
+    const quotaAccount = token?.quotaAccount ?? null;
+    if (await graphqlBackoffActive(env, quotaSource, quotaAccount)) {
+      const nextDueAt = githubGraphqlBackoffDeferUntil();
+      const now = new Date().toISOString();
+      await writeRefreshTarget(env, {
+        ...target,
+        lastAttemptAt: now,
+        nextDueAt,
+        failureCount: target.failureCount,
+        message: `GitHub GraphQL paused until ${nextDueAt}`,
+      });
+      const skipped = {
+        ...job,
+        status: "skipped" as const,
+        finishedAt: now,
+        updatedAt: now,
+        durationMs: Date.now() - startedAt,
+        error: "GitHub GraphQL temporarily paused after upstream errors",
+      };
+      await writeRefreshJob(env, skipped);
+      await auditSyncEvent(env, {
+        event: "job_skipped",
+        targetKey: target.key,
+        jobId: job.id,
+        status: "skipped",
+        reason: "graphql-backoff",
+        detail: `until=${nextDueAt} source=${quotaSource} account=${quotaAccount ?? "_"}`,
       });
       return skipped;
     }

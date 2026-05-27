@@ -515,6 +515,10 @@ function githubClient(
   };
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 async function github<T>(
   client: GitHubClient,
   pathname: string,
@@ -533,7 +537,17 @@ async function github<T>(
     const body = await response.text();
     throw new Error(`GitHub API ${response.status} for ${pathname}: ${body.slice(0, 500)}`);
   }
-  return (await response.json()) as T;
+  return githubJsonBody<T>(response, pathname);
+}
+
+async function githubJsonBody<T>(response: Response, pathname: string): Promise<T | null> {
+  const text = await response.text();
+  if (!text.trim()) return null;
+  try {
+    return JSON.parse(text) as T;
+  } catch (error) {
+    throw new Error(`GitHub API invalid JSON for ${pathname}: ${errorMessage(error)}`);
+  }
 }
 
 async function githubPage<T>(client: GitHubClient, pathname: string, page: number): Promise<T[]> {
@@ -583,7 +597,8 @@ async function githubGraphql<T>(
   if (!response.ok) {
     return null;
   }
-  const body = (await response.json()) as GraphQLRepoPage;
+  const body = await githubJsonBody<GraphQLRepoPage>(response, "/graphql");
+  if (!body) return null;
   if (body.errors?.length) {
     const message = body.errors.map((error) => error.message ?? error.type).join("; ");
     if (/rate limit|secondary rate|api rate limit/i.test(message)) {
@@ -884,7 +899,7 @@ async function githubCount(client: GitHubClient, pathname: string): Promise<numb
     return Number(lastPage);
   }
 
-  const items = (await response.json()) as unknown[];
+  const items = (await githubJsonBody<unknown[]>(response, pathname)) ?? [];
   return items.length;
 }
 

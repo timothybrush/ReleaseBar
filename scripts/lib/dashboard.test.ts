@@ -8966,6 +8966,93 @@ test("dashboard build skips empty unreleased repositories without failing", asyn
   assert.equal(payload.totals.repos, 0);
 });
 
+test("dashboard build treats empty successful GitHub JSON as no data", async () => {
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [],
+    includeRepos: ["other/repo"],
+    includeForks: false,
+    includeArchived: false,
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      if (path === "/repos/other/repo") {
+        return Response.json({
+          owner: { login: "other" },
+          name: "repo",
+          full_name: "other/repo",
+          description: null,
+          html_url: "https://github.com/other/repo",
+          default_branch: "main",
+          language: null,
+          stargazers_count: 1,
+          forks_count: 0,
+          open_issues_count: 0,
+          archived: false,
+          pushed_at: "2026-01-02T00:00:00Z",
+          updated_at: "2026-01-02T00:00:00Z",
+          fork: false,
+          private: false,
+        });
+      }
+      if (path === "/repos/other/repo/releases") {
+        return Response.json([
+          {
+            tag_name: "v1.0.0",
+            name: null,
+            html_url: "https://github.com/other/repo/releases/v1.0.0",
+            draft: false,
+            published_at: "2026-01-01T00:00:00Z",
+          },
+        ]);
+      }
+      if (path === "/repos/other/repo/commits/main") {
+        return Response.json({
+          sha: "abcdef123456",
+          commit: { committer: { date: "2026-01-02T00:00:00Z" } },
+        });
+      }
+      if (path === "/repos/other/repo/compare/v1.0.0...main") {
+        return Response.json({
+          total_commits: 0,
+          html_url: "https://github.com/other/repo/compare/v1.0.0...main",
+        });
+      }
+      if (path === "/repos/other/repo/pulls") {
+        return new Response("", { status: 200 });
+      }
+      if (path === "/repos/other/repo/commits/abcdef123456/check-runs") {
+        return Response.json({ check_runs: [] });
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+  });
+
+  assert.equal(payload.totals.repos, 1);
+  assert.equal(payload.projects[0]?.openPullRequests, 0);
+});
+
+test("dashboard build falls back when GraphQL returns an empty success body", async () => {
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    token: "token",
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      if (path === "/graphql") return new Response("", { status: 200 });
+      if (path === "/users/owner/repos") return Response.json([]);
+      throw new Error(`unexpected ${path}`);
+    },
+  });
+
+  assert.equal(payload.totals.repos, 0);
+});
+
 test("dashboard build treats ignored 403 check-run rate limits as quota errors", async () => {
   await assert.rejects(
     buildDashboard({

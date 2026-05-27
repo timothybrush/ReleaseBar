@@ -190,7 +190,7 @@ const repoDetailAuxCacheVersion = 1;
 const repoDetailAuxTtlSeconds = 7 * 24 * 60 * 60;
 const repoDetailReleaseCacheTtlMs = 60 * 60 * 1000;
 const repoDetailLiveProbeCacheTtlMs = 10 * 60 * 1000;
-const repoDetailSearchCountCacheTtlMs = 24 * 60 * 60 * 1000;
+const repoDetailSearchCountCacheTtlMs = 7 * 24 * 60 * 60 * 1000;
 const repoDetailStatsCacheTtlMs = 12 * 60 * 60 * 1000;
 const repoDetailStatsBackoffTtlSeconds = 10 * 60;
 const repoAudienceCacheTtlMs = 6 * 60 * 60 * 1000;
@@ -248,6 +248,8 @@ const refreshTargetListLimit = 5000;
 const refreshJobListLimit = 80;
 const refreshAuditListLimit = 80;
 const schedulerBatchLimit = 20;
+const schedulerSharedDormantRefreshMs = 7 * 24 * 60 * 60 * 1000;
+const schedulerSharedDormantAfterMs = 24 * 60 * 60 * 1000;
 const schedulerRecentViewMs = 7 * 24 * 60 * 60 * 1000;
 const schedulerActiveRefreshMs = 6 * 60 * 60 * 1000;
 const schedulerDormantRefreshMs = 24 * 60 * 60 * 1000;
@@ -2638,8 +2640,11 @@ async function dashboardReleaseDataAllowed(
   env: Env,
   sources: TokenSources,
   token: RequestToken | null | undefined,
+  options: { sourceAppCovered?: boolean } = {},
 ): Promise<boolean> {
-  if (!appTokenConfigured(env) || token?.quotaSource === "app") return true;
+  if (!appTokenConfigured(env) || token?.quotaSource === "app" || options.sourceAppCovered) {
+    return true;
+  }
   if (sourceAccounts(sources).length <= 1) return false;
   return Boolean(await currentSession(request, env));
 }
@@ -3354,6 +3359,22 @@ function allowRequestRefresh(request: Request): boolean {
   return !isCrawlerRequest(request);
 }
 
+function crawlerCacheOnlyResponse(message: string, status = 202): Response {
+  return jsonResponse(
+    {
+      error: message,
+      cache: {
+        state: "warming",
+        stale: true,
+        generatedAt: new Date().toISOString(),
+        message,
+      },
+    },
+    status,
+    { "cache-control": "no-store" },
+  );
+}
+
 function refreshTargetStorageKey(key: string): string {
   return `${refreshTargetPrefix}${key}`;
 }
@@ -3937,17 +3958,76 @@ function sharedQuotaDeferredTarget(target: RefreshTarget): boolean {
   );
 }
 
+type SchedulerDueOptions = {
+  sharedQuotaPaused: boolean;
+  sharedGraphqlPaused: boolean;
+  now: number;
+};
+
+function dormantSharedTargetDue(target: RefreshTarget, now: number): boolean {
+  const lastSeenAt = safeIso(target.lastSeenAt);
+  if (!lastSeenAt || now - lastSeenAt < schedulerSharedDormantAfterMs) return false;
+  const cadenceAnchor = Math.max(
+    lastSeenAt,
+    safeIso(target.lastAttemptAt),
+    safeIso(target.lastSuccessAt),
+  );
+  const nextDormantRefreshAt =
+    cadenceAnchor + schedulerSharedDormantRefreshMs + jitterMs(target.key, 24 * 60 * 60 * 1000);
+  return now >= nextDormantRefreshAt;
+}
+
 async function schedulerTargetDue(
   env: Env,
   target: RefreshTarget,
   cached: DashboardPayload | null,
+  options: SchedulerDueOptions = {
+    sharedQuotaPaused: false,
+    sharedGraphqlPaused: false,
+    now: Date.now(),
+  },
 ): Promise<boolean> {
-  if (!sharedQuotaDeferredTarget(target)) return refreshTargetDue(target, cached);
-  const hasAppTokenCoverage = await sourceInstallationRegistryCovers(env, {
-    owners: target.owners,
-    repos: target.repos,
-  }).catch(() => false);
-  return hasAppTokenCoverage;
+  const hasAppTokenCoverage = () =>
+    sourceInstallationRegistryCovers(env, {
+      owners: target.owners,
+      repos: target.repos,
+    }).catch(() => false);
+  if (sharedQuotaDeferredTarget(target)) {
+    return hasAppTokenCoverage();
+  }
+  if (
+    (options.sharedQuotaPaused || options.sharedGraphqlPaused) &&
+    !(await hasAppTokenCoverage())
+  ) {
+    return false;
+  }
+  if (!refreshTargetDue(target, cached)) return false;
+  const hasHealthyCache =
+    cached &&
+    canDisplayCached(cached) &&
+    cached.cache?.state !== "error" &&
+    cached.cache?.progress?.done !== false;
+  if (!hasHealthyCache) return true;
+  if (dormantSharedTargetDue(target, options.now)) return true;
+  const lastSeenAt = safeIso(target.lastSeenAt);
+  const dormantSharedTarget =
+    lastSeenAt > 0 && options.now - lastSeenAt >= schedulerSharedDormantAfterMs;
+  if (!dormantSharedTarget) return true;
+  const hasApp = await hasAppTokenCoverage();
+  if (hasApp) return true;
+  return false;
+}
+
+async function schedulerDueOptions(env: Env): Promise<SchedulerDueOptions> {
+  const [cooldown, graphBackoff] = await Promise.all([
+    env.GITHUB_TOKEN ? sharedQuotaCooldown(env) : Promise.resolve(null),
+    env.GITHUB_TOKEN ? graphqlBackoffActive(env, "shared", null) : Promise.resolve(false),
+  ]);
+  return {
+    sharedQuotaPaused: Boolean(cooldown?.active),
+    sharedGraphqlPaused: graphBackoff,
+    now: Date.now(),
+  };
 }
 
 async function schedulerTick(
@@ -3956,7 +4036,11 @@ async function schedulerTick(
   cause: string,
   limit = schedulerBatchLimit,
 ): Promise<{ enqueued: number; considered: number; due: number }> {
-  const [targets, jobs] = await Promise.all([listRefreshTargets(env), listRefreshJobs(env)]);
+  const [targets, jobs, dueOptions] = await Promise.all([
+    listRefreshTargets(env),
+    listRefreshJobs(env),
+    schedulerDueOptions(env),
+  ]);
   const activeTargetKeys = new Set(
     jobs
       .filter((job) => job.status === "queued" || job.status === "running")
@@ -3968,7 +4052,7 @@ async function schedulerTick(
   const duePairs = await Promise.all(
     pairs.map(async (pair) => ({
       ...pair,
-      due: await schedulerTargetDue(env, pair.target, pair.cached),
+      due: await schedulerTargetDue(env, pair.target, pair.cached, dueOptions),
     })),
   );
   const due = duePairs
@@ -4186,13 +4270,14 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
 }
 
 async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
-  const [targets, jobs, events, stateRaw, access, auth] = await Promise.all([
+  const [targets, jobs, events, stateRaw, access, auth, dueOptions] = await Promise.all([
     listRefreshTargets(env, refreshTargetListLimit),
     listRefreshJobs(env),
     listAuditEvents(env),
     env.DASHBOARD_CACHE?.get(refreshStateKey),
     githubAccessSummary(env),
     authFunnelSummary(env),
+    schedulerDueOptions(env),
   ]);
   const state = stateRaw ? tryJsonParse<{ lastTickAt?: string }>(stateRaw, "refresh state") : null;
   const activeTargetKeys = new Set(
@@ -4206,7 +4291,7 @@ async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
   const dueTargetStates = await Promise.all(
     targetStates.map(async (state) => ({
       ...state,
-      due: await schedulerTargetDue(env, state.target, state.cached),
+      due: await schedulerTargetDue(env, state.target, state.cached, dueOptions),
     })),
   );
   const dueTargets = dueTargetStates.filter(
@@ -4704,6 +4789,14 @@ function repoDetailAuxCacheKey(kind: string, id: string): string {
   return `repo-detail:aux:v${repoDetailAuxCacheVersion}:${kind}:${encodeURIComponent(id.toLowerCase())}`;
 }
 
+function repoStatsBackoffCacheKeys(path: string): string[] {
+  const repoPath = path.replace(/\/stats\/[^/?]+(\?.*)?$/, "/stats");
+  return [
+    repoDetailAuxCacheKey("stats-backoff", path),
+    repoDetailAuxCacheKey("stats-backoff", repoPath),
+  ];
+}
+
 async function readRepoDetailAux<T>(
   env: Env | undefined,
   key: string,
@@ -4816,12 +4909,16 @@ async function detailGitHubStats<TSchema extends GenericSchema>(
     repoDetailStatsCacheTtlMs,
   );
   if (cached) return cached;
-  const backoffKey = repoDetailAuxCacheKey("stats-backoff", path);
-  const backoff = await readRepoDetailAux<{ message?: string }>(
-    env,
-    backoffKey,
-    repoDetailStatsBackoffTtlSeconds * 1000,
-  );
+  const backoffKeys = repoStatsBackoffCacheKeys(path);
+  let backoff: { message?: string } | null = null;
+  for (const key of backoffKeys) {
+    backoff = await readRepoDetailAux<{ message?: string }>(
+      env,
+      key,
+      repoDetailStatsBackoffTtlSeconds * 1000,
+    );
+    if (backoff) break;
+  }
   if (backoff) {
     return {
       state: "warming",
@@ -4843,7 +4940,11 @@ async function detailGitHubStats<TSchema extends GenericSchema>(
   await recordAuditedGitHubAccess(env, auditArea, path, response.status, quota, rateLimited);
   if (response.status === 202) {
     const message = "GitHub is preparing repository statistics.";
-    await writeRepoDetailAux(env, backoffKey, { message }, repoDetailStatsBackoffTtlSeconds);
+    await Promise.all(
+      backoffKeys.map((key) =>
+        writeRepoDetailAux(env, key, { message }, repoDetailStatsBackoffTtlSeconds),
+      ),
+    );
     return {
       state: "warming",
       data: null,
@@ -5964,6 +6065,9 @@ async function ownerActivityResponse(
       { "cache-control": "no-store" },
     );
   }
+  if (!allowRefresh) {
+    return crawlerCacheOnlyResponse("cached owner activity unavailable for crawler");
+  }
 
   try {
     const payload = await buildOwnerActivity(ownerSlug, range, request, env);
@@ -6139,6 +6243,9 @@ async function repoActivityResponse(
       200,
       { "cache-control": "no-store" },
     );
+  }
+  if (!allowRefresh) {
+    return crawlerCacheOnlyResponse("cached repository activity unavailable for crawler");
   }
 
   try {
@@ -7170,6 +7277,9 @@ async function trustProfileResponse(
       ),
     );
   }
+  if (!allowRefresh) {
+    return crawlerCacheOnlyResponse("cached trust profile unavailable for crawler");
+  }
   try {
     const payload = await buildTrustProfile(login, request, env);
     await writeTrustProfile(env, key, payload);
@@ -7374,6 +7484,18 @@ async function repoAudienceResponse(
     return jsonResponse(
       withRepoAudienceState(await withRepoAudienceTrustProfiles(cached, env), "fresh"),
     );
+  }
+  if (cached && ageMs <= maxDisplayStaleMs && !allowRefresh) {
+    return jsonResponse(
+      withRepoAudienceState(
+        await withRepoAudienceTrustProfiles(cached, env),
+        "stale",
+        "showing cached repository audience signals",
+      ),
+    );
+  }
+  if (!allowRefresh) {
+    return crawlerCacheOnlyResponse("cached repository audience signals unavailable for crawler");
   }
   const requestToken = appTokenConfigured(env)
     ? await requestInstallationToken(request, env, {
@@ -7974,20 +8096,10 @@ async function buildRepoDetail(
       )
     : null;
 
-  const [commitActivity, codeFrequency, workTrend] = await Promise.all([
+  const [commitActivity, workTrend] = await Promise.all([
     detailGitHubStats(
       `${path}/stats/commit_activity`,
       gitHubCommitActivitySchema,
-      token,
-      quotaSource,
-      quotaAccount,
-      onQuota,
-      undefined,
-      env,
-    ),
-    detailGitHubStats(
-      `${path}/stats/code_frequency`,
-      gitHubCodeFrequencySchema,
       token,
       quotaSource,
       quotaAccount,
@@ -7999,6 +8111,23 @@ async function buildRepoDetail(
       () => null,
     ),
   ]);
+  const codeFrequency =
+    commitActivity.state === "warming"
+      ? {
+          state: "warming" as const,
+          data: null,
+          message: commitActivity.message ?? "GitHub is preparing repository statistics.",
+        }
+      : await detailGitHubStats(
+          `${path}/stats/code_frequency`,
+          gitHubCodeFrequencySchema,
+          token,
+          quotaSource,
+          quotaAccount,
+          onQuota,
+          undefined,
+          env,
+        );
   const statsWarming = [commitActivity, codeFrequency].some((stat) => stat.state === "warming");
   const project = releaseProject(repo);
   project.openPullRequests = openPullRequests;
@@ -8286,6 +8415,9 @@ async function repoDetailResponse(
         env,
       ),
     );
+  }
+  if (!allowRefresh) {
+    return crawlerCacheOnlyResponse("cached repository statistics unavailable for crawler");
   }
 
   try {
@@ -8868,12 +9000,13 @@ async function dashboardCacheKeyForPage(
       ? [primaryOwner, ...extraOwnerSlugs]
       : extraOwnerSlugs;
   const tokenSources = { owners: ownerSlugs, repos: includeRepos };
-  const token = await (
-    allowRequestRefresh(request)
-      ? bestInstallationToken(request, env, tokenSources)
-      : sourceInstallationToken(env, tokenSources, { discover: false })
-  ).catch(() => null);
-  const includeReleaseData = await dashboardReleaseDataAllowed(request, env, tokenSources, token);
+  const allowRefresh = allowRequestRefresh(request);
+  const [token, sourceAppCovered] = allowRefresh
+    ? [await bestInstallationToken(request, env, tokenSources).catch(() => null), false]
+    : [null, await sourceInstallationRegistryCovers(env, tokenSources).catch(() => false)];
+  const includeReleaseData = await dashboardReleaseDataAllowed(request, env, tokenSources, token, {
+    sourceAppCovered,
+  });
   return dashboardCacheKey({
     owner: primaryOwner ?? "custom",
     owners: extraOwnerSlugs,
@@ -8939,12 +9072,13 @@ async function dashboardEventParts(request: Request, env: Env): Promise<{ key: s
       ? [primaryOwner, ...extraOwnerSlugs]
       : extraOwnerSlugs;
   const tokenSources = { owners: ownerSlugs, repos: includeRepos };
-  const token = await (
-    allowRequestRefresh(request)
-      ? bestInstallationToken(request, env, tokenSources)
-      : sourceInstallationToken(env, tokenSources, { discover: false })
-  ).catch(() => null);
-  const includeReleaseData = await dashboardReleaseDataAllowed(request, env, tokenSources, token);
+  const allowRefresh = allowRequestRefresh(request);
+  const [token, sourceAppCovered] = allowRefresh
+    ? [await bestInstallationToken(request, env, tokenSources).catch(() => null), false]
+    : [null, await sourceInstallationRegistryCovers(env, tokenSources).catch(() => false)];
+  const includeReleaseData = await dashboardReleaseDataAllowed(request, env, tokenSources, token, {
+    sourceAppCovered,
+  });
   return {
     key: dashboardCacheKey({
       owner: primaryOwner ?? "custom",
@@ -9690,12 +9824,12 @@ async function ownerResponse(
       ? [primaryOwner, ...extraOwnerSlugs]
       : extraOwnerSlugs;
   const tokenSources = { owners: ownerSlugs, repos: includeRepos };
-  const requestToken = () =>
-    allowRefresh
-      ? bestInstallationToken(request, env, tokenSources)
-      : sourceInstallationToken(env, tokenSources, { discover: false });
-  const token = await requestToken().catch(() => null);
-  const includeReleaseData = await dashboardReleaseDataAllowed(request, env, tokenSources, token);
+  const [token, sourceAppCovered] = allowRefresh
+    ? [await bestInstallationToken(request, env, tokenSources).catch(() => null), false]
+    : [null, await sourceInstallationRegistryCovers(env, tokenSources).catch(() => false)];
+  const includeReleaseData = await dashboardReleaseDataAllowed(request, env, tokenSources, token, {
+    sourceAppCovered,
+  });
   const key = dashboardCacheKey({
     owner: primaryOwner ?? "custom",
     owners: extraOwnerSlugs,
@@ -9918,6 +10052,29 @@ async function ownerResponse(
     return jsonResponse(withCacheState(cached, state), 200, {
       "cache-control": "no-store",
     });
+  }
+
+  if (!allowRefresh) {
+    const dashboard = unresolvedDashboardRequest(
+      ownerSlugs,
+      includeRepos,
+      profile,
+      key,
+      url,
+      includeReleaseData,
+      token,
+    );
+    return jsonResponse(
+      statusPayload(
+        dashboard,
+        env,
+        "rebuilding",
+        "cached dashboard unavailable for crawler",
+        new Date().toISOString(),
+      ),
+      202,
+      { "cache-control": "no-store" },
+    );
   }
 
   let owners: Owner[] | null;

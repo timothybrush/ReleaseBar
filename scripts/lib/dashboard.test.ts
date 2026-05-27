@@ -2356,6 +2356,53 @@ test("worker REST stargazer fallback samples newest stargazers", async () => {
   }
 });
 
+test("worker serves stale repository audience caches to crawlers without refreshing", async () => {
+  const generatedAt = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+  const cache = kvStore({
+    "repo-audience:v5:acme/releasebar:month": JSON.stringify({
+      fullName: "acme/releasebar",
+      range: "month",
+      generatedAt,
+      cache: {
+        state: "fresh",
+        stale: false,
+        generatedAt,
+      },
+      totals: {
+        stargazers: 10,
+        stargazersSampled: 1,
+        highSignal: 1,
+        mediumSignal: 0,
+        lowSignal: 0,
+        bots: 0,
+        highSignalPercent: 100,
+        mediumSignalPercent: 0,
+        lowSignalPercent: 0,
+        botPercent: 0,
+      },
+      users: [],
+    } satisfies RepoAudiencePayload),
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    throw new Error(`crawler stale audience cache should not call GitHub ${String(input)}`);
+  };
+  try {
+    const response = await worker.fetch(
+      crawlerRequest("https://release.bar/api/repos/acme/releasebar/audience"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as RepoAudiencePayload;
+    assert.equal(body.cache.state, "stale");
+    assert.equal(body.cache.message, "showing cached repository audience signals");
+    assert.equal(body.totals.stargazers, 10);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("worker serves OpenAPI spec aliases for Swagger tooling", async () => {
   const env = { DASHBOARD_CACHE: kvStore() };
   for (const path of ["/openapi.json", "/api/openapi.json", "/api/swagger.json"]) {
@@ -3177,6 +3224,33 @@ test("worker serves stale repository detail to crawlers without refreshing", asy
     assert.equal(body.cache.state, "stale");
     assert.equal(body.cache.message, "showing cached repository statistics");
     assert.equal(waitUntilPromises.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker keeps crawler-only auxiliary API misses off GitHub", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    throw new Error(`crawler auxiliary cache miss should not call GitHub ${String(input)}`);
+  };
+  try {
+    for (const url of [
+      "https://release.bar/api/kvark/activity?range=week",
+      "https://release.bar/api/users/kvark/trust",
+      "https://release.bar/api/repos/acme/coldbar/activity?range=week",
+      "https://release.bar/api/repos/acme/coldbar",
+    ]) {
+      const response = await worker.fetch(
+        crawlerRequest(url),
+        { DASHBOARD_CACHE: kvStore(), GITHUB_TOKEN: "shared-token" },
+        { waitUntil: () => undefined },
+      );
+      assert.equal(response.status, 202, url);
+      const body = (await response.json()) as { cache?: { state?: string; message?: string } };
+      assert.equal(body.cache?.state, "warming");
+      assert.match(body.cache?.message ?? "", /crawler/);
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -4253,6 +4327,74 @@ test("worker ignores optional repository detail permission gaps", async () => {
   }
 });
 
+test("worker backs off repository stats per repo after one warming response", async () => {
+  const originalFetch = globalThis.fetch;
+  let codeFrequencyCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    const path = url.pathname;
+    if (path === "/repos/acme/warmstats") {
+      return Response.json({
+        owner: { login: "acme" },
+        name: "warmstats",
+        full_name: "acme/warmstats",
+        private: false,
+        fork: false,
+        archived: false,
+        html_url: "https://github.com/acme/warmstats",
+        description: "Stats warming",
+        default_branch: "main",
+        language: "TypeScript",
+        topics: [],
+        stargazers_count: 20,
+        forks_count: 1,
+        open_issues_count: 0,
+        pushed_at: "2026-05-16T12:00:00Z",
+        updated_at: "2026-05-16T12:00:00Z",
+      });
+    }
+    if (path === "/repos/acme/warmstats/releases") return Response.json([]);
+    if (path === "/repos/acme/warmstats/contributors") return Response.json([]);
+    if (path === "/repos/acme/warmstats/languages") return Response.json({});
+    if (path === "/repos/acme/warmstats/commits/main") {
+      return Response.json({
+        sha: "1234567890",
+        commit: { committer: { date: "2026-05-16T12:00:00Z" } },
+      });
+    }
+    if (path === "/repos/acme/warmstats/pulls") return Response.json([]);
+    if (path === "/repos/acme/warmstats/commits/1234567890/check-runs") {
+      return Response.json({ check_runs: [] });
+    }
+    if (path === "/repos/acme/warmstats/stats/commit_activity") {
+      return new Response(null, { status: 202 });
+    }
+    if (path === "/repos/acme/warmstats/stats/code_frequency") {
+      codeFrequencyCalls += 1;
+      return Response.json([]);
+    }
+    if (path === "/search/issues") {
+      return Response.json({ total_count: 0 });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/repos/acme/warmstats"),
+      { DASHBOARD_CACHE: kvStore(), GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 202);
+    const body = (await response.json()) as RepoDetailPayload;
+    assert.equal(body.cache.state, "warming");
+    assert.equal(body.stats?.commitActivity.state, "warming");
+    assert.equal(body.stats?.codeFrequency.state, "warming");
+    assert.equal(codeFrequencyCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("worker does not cache repository detail when optional calls are rate limited", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input) => {
@@ -4480,7 +4622,7 @@ test("worker reuses repository detail auxiliary caches across rebuilds", async (
     assert.equal(calls.get("contributors"), 1);
     assert.equal(calls.get("languages"), 1);
     assert.equal(calls.get("commit_activity"), 1);
-    assert.equal(calls.get("code_frequency"), 1);
+    assert.equal(calls.get("code_frequency") ?? 0, 0);
     assert.equal([...calls.keys()].filter((key) => key.startsWith("search:")).length, 4);
 
     await cache.delete("repo-detail:v4:acme/cachebar");
@@ -4499,7 +4641,7 @@ test("worker reuses repository detail auxiliary caches across rebuilds", async (
     assert.equal(calls.get("contributors"), 1);
     assert.equal(calls.get("languages"), 1);
     assert.equal(calls.get("commit_activity"), 1);
-    assert.equal(calls.get("code_frequency"), 1);
+    assert.equal(calls.get("code_frequency") ?? 0, 0);
     assert.equal([...calls.keys()].filter((key) => key.startsWith("search:")).length, 4);
   } finally {
     globalThis.fetch = originalFetch;
@@ -7418,6 +7560,207 @@ test("worker admin scheduler counts missing caches as due even before nextDueAt"
   assert.equal(body.status.dueTargets, 1);
 });
 
+test("worker scheduler skips shared cold targets while GraphQL is backed off", async () => {
+  const sessionId = "session-admin-graphql-backoff";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const target: RefreshTarget = {
+    key: "dashboard:v5:owner=backedoff",
+    kind: "dashboard",
+    owner: "backedoff",
+    owners: ["backedoff"],
+    repos: [],
+    includeReleaseData: false,
+    path: "/backedoff",
+    priority: 100,
+    lastSeenAt: new Date().toISOString(),
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2000-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+    "github:backoff:v1:graphql:shared:_": JSON.stringify({
+      active: true,
+      status: 502,
+      source: "shared",
+      account: null,
+      at: new Date().toISOString(),
+    }),
+  });
+  const sentJobs: RefreshJob[] = [];
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: cache,
+    GITHUB_TOKEN: "shared-token",
+    REFRESH_QUEUE: {
+      async send(job: RefreshJob) {
+        sentJobs.push(job);
+      },
+    },
+  };
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler/run", {
+      method: "POST",
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    env,
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { due: number; enqueued: number };
+  assert.equal(body.due, 0);
+  assert.equal(body.enqueued, 0);
+  assert.deepEqual(sentJobs, []);
+});
+
+test("worker scheduler keeps dormant shared targets on weekly cadence after success", async () => {
+  const sessionId = "session-admin-dormant-shared-cadence";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const now = Date.now();
+  const key = dashboardCacheKey({
+    owner: "sleepy",
+    includeUnreleased: true,
+    includeReleaseData: false,
+    schemaVersion: 5,
+  });
+  const lastRefreshAt = new Date(now - 25 * 60 * 60 * 1000).toISOString();
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "sleepy",
+    owners: ["sleepy"],
+    repos: [],
+    includeReleaseData: false,
+    path: "/sleepy",
+    priority: 100,
+    lastSeenAt: new Date(now - 10 * 24 * 60 * 60 * 1000).toISOString(),
+    lastAttemptAt: lastRefreshAt,
+    lastSuccessAt: lastRefreshAt,
+    nextDueAt: "2000-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    [key]: JSON.stringify(testDashboard("sleepy", [])),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+  });
+  const sentJobs: RefreshJob[] = [];
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler/run", {
+      method: "POST",
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    {
+      AUTH_COOKIE_SECRET: "test-secret",
+      DASHBOARD_CACHE: cache,
+      GITHUB_TOKEN: "shared-token",
+      REFRESH_QUEUE: {
+        async send(job: RefreshJob) {
+          sentJobs.push(job);
+        },
+      },
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { due: number; enqueued: number };
+  assert.equal(body.due, 0);
+  assert.equal(body.enqueued, 0);
+  assert.deepEqual(sentJobs, []);
+});
+
+test("worker scheduler still rebuilds missing dormant shared caches", async () => {
+  const sessionId = "session-admin-dormant-shared-missing";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const now = Date.now();
+  const target: RefreshTarget = {
+    key: "dashboard:v5:owner=sleepy-missing",
+    kind: "dashboard",
+    owner: "sleepy-missing",
+    owners: ["sleepy-missing"],
+    repos: [],
+    includeReleaseData: false,
+    path: "/sleepy-missing",
+    priority: 100,
+    lastSeenAt: new Date(now - 10 * 24 * 60 * 60 * 1000).toISOString(),
+    lastAttemptAt: new Date(now - 25 * 60 * 60 * 1000).toISOString(),
+    lastSuccessAt: new Date(now - 25 * 60 * 60 * 1000).toISOString(),
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+  });
+  const sentJobs: RefreshJob[] = [];
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler/run", {
+      method: "POST",
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    {
+      AUTH_COOKIE_SECRET: "test-secret",
+      DASHBOARD_CACHE: cache,
+      GITHUB_TOKEN: "shared-token",
+      REFRESH_QUEUE: {
+        async send(job: RefreshJob) {
+          sentJobs.push(job);
+        },
+      },
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { due: number; enqueued: number };
+  assert.equal(body.due, 1);
+  assert.equal(body.enqueued, 1);
+  assert.equal(sentJobs.length, 1);
+});
+
 test("worker admin GitHub access ignores expired shared quota cooldowns", async () => {
   const sessionId = "session-admin-expired-cooldown";
   const exp = Math.floor(Date.now() / 1000) + 600;
@@ -8224,82 +8567,53 @@ test("worker serves cached dashboards to crawlers without scheduling refreshes",
   }
 });
 
-test("worker keeps crawler cold dashboard builds alive without follow-up refreshes", async () => {
+test("worker serves cache-only cold dashboard status to crawlers", async () => {
   const key = dashboardCacheKey({
     owner: "coldbot",
     includeUnreleased: true,
     includeReleaseData: true,
     schemaVersion: 5,
   });
-  const cache = kvStore();
-  const waits: Array<{ promise: Promise<unknown>; pending: () => boolean }> = [];
-  const originalFetch = globalThis.fetch;
-  const originalSetTimeout = globalThis.setTimeout;
-  let resolveGraphql!: (response: Response) => void;
-  const graphqlResponse = new Promise<Response>((resolve) => {
-    resolveGraphql = resolve;
+  const baseCache = kvStore({
+    "auth:installation:v1:coldbot": JSON.stringify({
+      id: 42,
+      accountLogin: "coldbot",
+      accountType: "org",
+      accountUrl: "https://github.com/coldbot",
+      avatarUrl: "https://avatars.githubusercontent.com/u/42",
+      repositorySelection: "all",
+      repositories: [],
+      updatedAt: "2026-05-15T12:00:00Z",
+    }),
   });
-  globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) =>
-    originalSetTimeout(handler, timeout === 15_000 ? 0 : timeout, ...args)) as typeof setTimeout;
+  let installationTokenReads = 0;
+  const cache = {
+    ...baseCache,
+    async get(key: string) {
+      if (key.startsWith("auth:installation-token:")) installationTokenReads += 1;
+      return baseCache.get(key);
+    },
+  };
+  const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input) => {
-    const url = new URL(String(input));
-    if (url.pathname === "/users/coldbot") {
-      return Response.json({ login: "coldbot", type: "User" });
-    }
-    if (url.pathname === "/graphql") {
-      return graphqlResponse;
-    }
-    throw new Error(`unexpected fetch ${url.pathname}`);
+    throw new Error(`crawler cold dashboard should not call GitHub ${String(input)}`);
   };
   try {
+    const waits: Promise<unknown>[] = [];
     const response = await worker.fetch(
       crawlerRequest("https://release.bar/api/coldbot", "Googlebot/2.1", null),
-      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { DASHBOARD_CACHE: cache, GITHUB_APP_ID: "123", GITHUB_APP_PRIVATE_KEY: "invalid" },
       {
-        waitUntil: (promise) => {
-          let pending = true;
-          waits.push({
-            promise: promise.finally(() => {
-              pending = false;
-            }),
-            pending: () => pending,
-          });
-        },
+        waitUntil: (promise) => waits.push(promise),
       },
     );
     assert.equal(response.status, 202);
-    assert.equal(((await response.json()) as DashboardPayload).cache?.state, "rebuilding");
-    await new Promise((resolve) => originalSetTimeout(resolve, 0));
-    assert.equal(
-      waits.some((wait) => wait.pending()),
-      true,
-    );
-
-    resolveGraphql(
-      Response.json(
-        {
-          data: {
-            repositoryOwner: {
-              __typename: "User",
-              repositories: {
-                pageInfo: { hasNextPage: false, endCursor: null },
-                nodes: [],
-              },
-            },
-          },
-        },
-        {
-          headers: {
-            "x-ratelimit-limit": "5000",
-            "x-ratelimit-remaining": "4998",
-            "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 3600),
-            "x-ratelimit-resource": "graphql",
-          },
-        },
-      ),
-    );
-    await Promise.all(waits.map((wait) => wait.promise));
-    assert.notEqual(await cache.get(key), null);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.cache?.state, "rebuilding");
+    assert.equal(body.cache?.message, "cached dashboard unavailable for crawler");
+    assert.equal(await cache.get(key), null);
+    assert.equal(installationTokenReads, 0);
+    await Promise.all(waits);
     const events = await refreshAuditEvents(cache);
     assert.equal(
       events.some((event) => event.event === "dashboard_refresh_schedule"),
@@ -8307,7 +8621,6 @@ test("worker keeps crawler cold dashboard builds alive without follow-up refresh
     );
   } finally {
     globalThis.fetch = originalFetch;
-    globalThis.setTimeout = originalSetTimeout;
   }
 });
 

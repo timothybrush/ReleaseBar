@@ -1098,7 +1098,9 @@ async function repoSummary(
       : Promise.resolve(null),
     repo.open_pull_requests_total ??
       githubCount(client, `/repos/${repo.full_name}/pulls?state=open`),
-    repo.status_check_rollup ? Promise.resolve([]) : checkRuns(client, repo, latestRef),
+    repo.status_check_rollup || !latestCommit
+      ? Promise.resolve([])
+      : checkRuns(client, repo, latestRef),
   ]);
   commitsSinceRelease = compare?.total_commits ?? null;
   compareUrl = compare?.html_url ?? null;

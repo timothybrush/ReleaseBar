@@ -9244,6 +9244,66 @@ test("dashboard build skips empty unreleased repositories without failing", asyn
   assert.equal(payload.totals.repos, 0);
 });
 
+test("dashboard build keeps empty included repositories without check-run calls", async () => {
+  const requested: string[] = [];
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    fetch: async (url) => {
+      const parsed = new URL(String(url));
+      const path = parsed.pathname;
+      requested.push(path);
+      if (path === "/users/owner/repos") {
+        return Response.json([
+          {
+            owner: { login: "owner" },
+            name: "empty",
+            full_name: "owner/empty",
+            description: null,
+            html_url: "https://github.com/owner/empty",
+            default_branch: "main",
+            language: null,
+            stargazers_count: 0,
+            forks_count: 0,
+            open_issues_count: 0,
+            archived: false,
+            pushed_at: null,
+            updated_at: null,
+            fork: false,
+            private: false,
+          },
+        ]);
+      }
+      if (path === "/repos/owner/empty/releases") {
+        return Response.json([]);
+      }
+      if (path === "/repos/owner/empty/commits/main") {
+        return Response.json(
+          { message: "Git Repository is empty.", status: "409" },
+          { status: 409 },
+        );
+      }
+      if (path === "/repos/owner/empty/pulls") {
+        return Response.json([]);
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+  });
+
+  assert.equal(payload.totals.repos, 1);
+  assert.equal(payload.projects[0]?.version, "unreleased");
+  assert.equal(payload.projects[0]?.ciState, "unknown");
+  assert.equal(
+    requested.some((path) => path.includes("/check-runs")),
+    false,
+  );
+});
+
 test("dashboard build treats empty successful GitHub JSON as no data", async () => {
   const payload = await buildDashboard({
     title: "ReleaseBar",

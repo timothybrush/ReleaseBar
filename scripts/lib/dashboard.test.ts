@@ -5922,6 +5922,7 @@ test("worker exposes GitHub App auth endpoints", async () => {
   assert.match(location, /client_id=Iv123/);
   assert.match(location, /redirect_uri=https%3A%2F%2Frelease.bar%2Fapi%2Fauth%2Fcallback/);
   assert.equal(new URL(location).searchParams.has("scope"), false);
+  assert.match(login.headers.get("set-cookie") ?? "", /rd_oauth_state_[^=]+=.+HttpOnly/);
 
   const badCallback = await worker.fetch(
     new Request("https://release.bar/api/auth/callback?code=x&state=bad"),
@@ -5941,6 +5942,84 @@ test("worker exposes GitHub App auth endpoints", async () => {
     install.headers.get("location"),
     "https://github.com/apps/releasebar-app/installations/new",
   );
+});
+
+test("worker binds OAuth callbacks to the initiating browser", async () => {
+  const returnTo = "/openclaw?owners=steipete";
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: kvStore(),
+    GITHUB_APP_CLIENT_ID: "Iv123",
+    GITHUB_APP_CLIENT_SECRET: "client-secret",
+    GITHUB_APP_SLUG: "releasebar-app",
+  };
+  const context = { waitUntil: () => undefined };
+  const login = await worker.fetch(
+    new Request(`https://release.bar/api/auth/login?returnTo=${encodeURIComponent(returnTo)}`),
+    env,
+    context,
+  );
+  const location = new URL(login.headers.get("location") ?? "");
+  const state = location.searchParams.get("state") ?? "";
+  const stateCookie = (login.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+  assert.equal(stateCookie.length < 256, true);
+
+  const longLogin = await worker.fetch(
+    new Request(
+      `https://release.bar/api/auth/login?returnTo=${encodeURIComponent(`/openclaw?filter=${"x".repeat(5000)}`)}`,
+    ),
+    env,
+    context,
+  );
+  const longState =
+    new URL(longLogin.headers.get("location") ?? "").searchParams.get("state") ?? "";
+  const longStatePayload = JSON.parse(
+    Buffer.from(longState.split(".")[0] ?? "", "base64url").toString("utf8"),
+  ) as { returnTo: string };
+  assert.equal(longState.length < 2048, true);
+  assert.equal(longStatePayload.returnTo, "/");
+
+  let oauthExchanges = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.hostname === "github.com" && url.pathname === "/login/oauth/access_token") {
+      oauthExchanges += 1;
+      return Response.json({ access_token: "user-token", token_type: "bearer", scope: "" });
+    }
+    if (url.hostname === "api.github.com" && url.pathname === "/user") {
+      return Response.json({
+        id: 1,
+        login: "octocat",
+        name: "The Octocat",
+        avatar_url: "https://avatars.githubusercontent.com/u/1",
+        html_url: "https://github.com/octocat",
+      });
+    }
+    if (url.hostname === "api.github.com" && url.pathname === "/user/installations") {
+      return Response.json({ installations: [] });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  try {
+    const callbackUrl = `https://release.bar/api/auth/callback?code=code&state=${encodeURIComponent(state)}`;
+    const unbound = await worker.fetch(new Request(callbackUrl), env, context);
+    assert.equal(unbound.status, 400);
+    assert.equal(oauthExchanges, 0);
+
+    const callback = await worker.fetch(
+      new Request(callbackUrl, { headers: { cookie: stateCookie } }),
+      env,
+      context,
+    );
+    assert.equal(callback.status, 302);
+    assert.equal(callback.headers.get("location"), returnTo);
+    assert.match(callback.headers.get("set-cookie") ?? "", /rd_session=/);
+    assert.match(callback.headers.get("set-cookie") ?? "", /rd_oauth_state_[^=]+=;.*Max-Age=0/);
+    assert.equal(oauthExchanges, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("worker remembers GitHub App installs without OAuth session", async () => {

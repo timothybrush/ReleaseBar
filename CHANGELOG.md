@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Bound GitHub OAuth callbacks to the initiating browser and capped return targets to prevent session-swapping attacks and oversized authorization requests.
+- Kept asynchronously loaded GitHub connection state reactive so configured deployments show the install or connect action instead of a stale unavailable label.
 - Kept dashboards from getting stuck on empty repositories by skipping check-run hydration when GitHub has no commit to check, and stopped passing the Actions `GITHUB_TOKEN` into deploy builds that do not need it.
 - Stopped classifying human audience logins that merely end in `bot` as automation when GitHub account metadata does not identify them as bots. Thanks @devYRPauli.
 - Clarified trust score tooltips for owner, organization, contributor, and stargazer signals. Thanks @vincent-peng.

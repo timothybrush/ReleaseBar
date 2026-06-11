@@ -253,7 +253,7 @@
   $: settingsSummary = `${sourceCount === 0 ? "default sources" : `${numberFormat.format(sourceCount)} added`} · ${
     hiddenCount === 0 ? "all visible" : `${numberFormat.format(hiddenCount)} hidden`
   }`;
-  $: connectionStatus = authStatus();
+  $: connectionStatus = authStatus(auth);
   $: canEditPublicDefault =
     !repoRoute &&
     Boolean(auth?.user && initialRoute.owner) &&
@@ -740,15 +740,20 @@
     installApp();
   }
 
-  function primaryAuthLabel(short = false): string {
-    if (!auth?.configured && !auth?.quotaConfigured) return short ? "Login" : "Login Unavailable";
-    if (adminRoute || !auth?.quotaConfigured) return short ? "Connect" : "Connect GitHub";
+  // Keep auth explicit so Svelte tracks async auth updates in template helper calls.
+  function primaryAuthLabel(authPayload: AuthPayload | null, short = false): string {
+    if (!authPayload?.configured && !authPayload?.quotaConfigured) {
+      return short ? "Login" : "Login Unavailable";
+    }
+    if (adminRoute || !authPayload.quotaConfigured) return short ? "Connect" : "Connect GitHub";
     return short ? "Install" : "Install GitHub App";
   }
 
-  function primaryAuthTitle(): string {
-    if (!auth?.configured && !auth?.quotaConfigured) return "GitHub connection unavailable";
-    if (adminRoute || !auth?.quotaConfigured) return "Connect GitHub";
+  function primaryAuthTitle(authPayload: AuthPayload | null): string {
+    if (!authPayload?.configured && !authPayload?.quotaConfigured) {
+      return "GitHub connection unavailable";
+    }
+    if (adminRoute || !authPayload.quotaConfigured) return "Connect GitHub";
     return "Install GitHub App";
   }
 
@@ -758,17 +763,17 @@
     location.assign(logoutUrl.toString());
   }
 
-  function authStatus(): string {
-    if (!auth?.configured) return "GitHub connection is not configured.";
-    if (auth.user) {
+  function authStatus(authPayload: AuthPayload | null): string {
+    if (!authPayload?.configured) return "GitHub connection is not configured.";
+    if (authPayload.user) {
       return (
-        auth.installReason ??
-        (auth.quotaConfigured
-          ? `${auth.installations.length === 0 ? "Signed in." : `Connected to ${numberFormat.format(auth.installations.length)} GitHub App installation${auth.installations.length === 1 ? "" : "s"}.`}`
+        authPayload.installReason ??
+        (authPayload.quotaConfigured
+          ? `${authPayload.installations.length === 0 ? "Signed in." : `Connected to ${numberFormat.format(authPayload.installations.length)} GitHub App installation${authPayload.installations.length === 1 ? "" : "s"}.`}`
           : "Signed in. Dedicated app quota is not configured on this deployment.")
       );
     }
-    return auth.quotaConfigured
+    return authPayload.quotaConfigured
       ? "Install the GitHub App for dedicated API quota. ReleaseBar only reads public metadata."
       : "Connect GitHub to manage dashboard access.";
   }
@@ -2398,10 +2403,10 @@
           type="button"
           disabled={!auth?.configured && !auth?.quotaConfigured}
           onclick={primaryAuthAction}
-          title={primaryAuthTitle()}
+          title={primaryAuthTitle(auth)}
         >
-          <span class="account-label account-label-full">{primaryAuthLabel()}</span>
-          <span class="account-label account-label-short">{primaryAuthLabel(true)}</span>
+          <span class="account-label account-label-full">{primaryAuthLabel(auth)}</span>
+          <span class="account-label account-label-short">{primaryAuthLabel(auth, true)}</span>
           {#if auth?.configured || auth?.quotaConfigured}
             <span class="account-caret" aria-hidden="true"></span>
           {/if}
@@ -2790,7 +2795,7 @@
           <strong>{errorMessage}</strong>
           <small>ReleaseBar only reads public GitHub metadata. Connected GitHub App quota can make public repo refreshes more reliable.</small>
           {#if (auth?.configured || auth?.quotaConfigured) && !auth.user}
-            <button type="button" onclick={primaryAuthAction}>{primaryAuthLabel()}</button>
+            <button type="button" onclick={primaryAuthAction}>{primaryAuthLabel(auth)}</button>
           {/if}
         </div>
       {:else if !repoDetail}
@@ -3506,7 +3511,7 @@
           <strong>{errorMessage}</strong>
           <small>Unknown owners, cold caches, and GitHub rate limits can all land here. Connecting GitHub gives ReleaseBar dedicated App quota for dashboards you can access.</small>
           {#if (auth?.configured || auth?.quotaConfigured) && !auth.user}
-            <button type="button" onclick={primaryAuthAction}>{primaryAuthLabel()}</button>
+            <button type="button" onclick={primaryAuthAction}>{primaryAuthLabel(auth)}</button>
           {/if}
         </div>
       {:else if dashboardFetching}

@@ -257,8 +257,10 @@ const schedulerDormantRefreshMs = 24 * 60 * 60 * 1000;
 const schedulerRetryBaseMs = 30 * 60 * 1000;
 const sessionCookie = "rd_session";
 const installReturnCookie = "rd_install_return";
+const oauthStateCookiePrefix = "rd_oauth_state_";
 const sessionMaxAgeSeconds = 30 * 24 * 60 * 60;
 const stateMaxAgeSeconds = 10 * 60;
+const oauthReturnToMaxLength = 1024;
 const locks = new Map<string, Promise<DashboardPayload>>();
 const buildPending = Symbol("build-pending");
 const corsHeaders = {
@@ -1185,6 +1187,18 @@ function authCookie(value: string, maxAge = sessionMaxAgeSeconds): string {
 
 function installReturnCookieValue(value: string, maxAge = stateMaxAgeSeconds): string {
   return cookie(installReturnCookie, value, maxAge);
+}
+
+function oauthStateCookieName(nonce: string): string {
+  return `${oauthStateCookiePrefix}${nonce}`;
+}
+
+async function oauthStateBinding(secret: string, nonce: string): Promise<string> {
+  return hmac(secret, `oauth-state:${nonce}`);
+}
+
+function oauthStateCookieValue(nonce: string, value: string, maxAge = stateMaxAgeSeconds): string {
+  return cookie(oauthStateCookieName(nonce), value, maxAge);
 }
 
 function authUrls(
@@ -2134,30 +2148,30 @@ async function loginResponse(request: Request, env: Env): Promise<Response> {
     });
   }
   const url = new URL(request.url);
-  const returnTo = safeReturnTo(url.searchParams.get("returnTo"), url.origin);
+  const requestedReturnTo = safeReturnTo(url.searchParams.get("returnTo"), url.origin);
+  // Keep the GitHub authorize request below common request-line limits.
+  const returnTo = requestedReturnTo.length <= oauthReturnToMaxLength ? requestedReturnTo : "/";
+  const nonce = randomNonce();
   const state = await signedJson(env.AUTH_COOKIE_SECRET, {
     returnTo,
     iat: Math.floor(Date.now() / 1000),
-    nonce: randomNonce(),
+    nonce,
   });
   const github = new URL("https://github.com/login/oauth/authorize");
   github.searchParams.set("client_id", env.GITHUB_APP_CLIENT_ID);
   github.searchParams.set("redirect_uri", `${url.origin}/api/auth/callback`);
   github.searchParams.set("state", state);
-  return redirectResponse(github.toString());
+  return redirectResponse(github.toString(), {
+    "set-cookie": oauthStateCookieValue(
+      nonce,
+      await oauthStateBinding(env.AUTH_COOKIE_SECRET, nonce),
+    ),
+  });
 }
 
 async function exchangeCode(url: URL, env: Env): Promise<string> {
   const code = url.searchParams.get("code");
-  const stateToken = url.searchParams.get("state");
-  if (!code || !stateToken || !env.AUTH_COOKIE_SECRET) {
-    throw new Error("missing OAuth code or state");
-  }
-  const state = await verifySignedJson<AuthState>(env.AUTH_COOKIE_SECRET, stateToken);
-  const now = Math.floor(Date.now() / 1000);
-  if (!state || now - state.iat > stateMaxAgeSeconds) {
-    throw new Error("invalid OAuth state");
-  }
+  if (!code) throw new Error("missing OAuth code");
   const response = await workerFetch("https://github.com/login/oauth/access_token", {
     method: "POST",
     headers: {
@@ -3041,12 +3055,25 @@ async function callbackResponse(request: Request, env: Env): Promise<Response> {
   }
   const url = new URL(request.url);
   let validatedState = false;
+  let stateCookieName: string | null = null;
   try {
-    const state = await verifySignedJson<AuthState>(
-      env.AUTH_COOKIE_SECRET,
-      url.searchParams.get("state") ?? "",
-    );
-    if (!state || Math.floor(Date.now() / 1000) - state.iat > stateMaxAgeSeconds) {
+    const stateToken = url.searchParams.get("state") ?? "";
+    const state = await verifySignedJson<AuthState>(env.AUTH_COOKIE_SECRET, stateToken);
+    const stateNow = Math.floor(Date.now() / 1000);
+    if (
+      !state ||
+      typeof state.returnTo !== "string" ||
+      typeof state.iat !== "number" ||
+      typeof state.nonce !== "string" ||
+      state.iat > stateNow ||
+      stateNow - state.iat > stateMaxAgeSeconds
+    ) {
+      throw new Error("invalid OAuth state");
+    }
+    stateCookieName = oauthStateCookieName(state.nonce);
+    const browserBinding = parseCookies(request).get(stateCookieName);
+    const expectedBinding = await oauthStateBinding(env.AUTH_COOKIE_SECRET, state.nonce);
+    if (!browserBinding || !timingSafeEqual(browserBinding, expectedBinding)) {
       throw new Error("invalid OAuth state");
     }
     validatedState = true;
@@ -3088,10 +3115,16 @@ async function callbackResponse(request: Request, env: Env): Promise<Response> {
         nonce: randomNonce(),
       });
       return redirectResponse(`https://github.com/apps/${appSlug(env)}/installations/new`, {
-        "set-cookie": [sessionCookieValue, installReturnCookieValue(installReturn)],
+        "set-cookie": [
+          sessionCookieValue,
+          installReturnCookieValue(installReturn),
+          oauthStateCookieValue(state.nonce, "", 0),
+        ],
       });
     }
-    return redirectResponse(state.returnTo, { "set-cookie": sessionCookieValue });
+    return redirectResponse(state.returnTo, {
+      "set-cookie": [sessionCookieValue, oauthStateCookieValue(state.nonce, "", 0)],
+    });
   } catch (error) {
     if (validatedState) {
       await recordAuthFunnelEvent(env, {
@@ -3105,6 +3138,7 @@ async function callbackResponse(request: Request, env: Env): Promise<Response> {
     }
     return jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 400, {
       "cache-control": "no-store",
+      ...(stateCookieName ? { "set-cookie": cookie(stateCookieName, "", 0) } : {}),
     });
   }
 }

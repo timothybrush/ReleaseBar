@@ -4881,7 +4881,7 @@ test("worker manual dashboard refresh returns metadata before release hydration"
       ],
     },
   });
-  globalThis.fetch = async (input) => {
+  globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
     if (url.pathname === "/users/owner") {
       return Response.json({
@@ -4892,6 +4892,10 @@ test("worker manual dashboard refresh returns metadata before release hydration"
       });
     }
     if (url.pathname === "/graphql") {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        variables?: { first?: number };
+      };
+      assert.equal(body.variables?.first, 100);
       return Response.json({
         data: {
           repositoryOwner: {
@@ -4955,6 +4959,181 @@ test("worker manual dashboard refresh returns metadata before release hydration"
     assert.equal(hydrated.cache?.state, "fresh");
     assert.equal(hydrated.projects[0]?.version, "v1.0.0");
     assert.equal(hydrated.projects[0]?.commitsSinceRelease, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker manual dashboard refresh preserves repository cap metadata", async () => {
+  const originalFetch = globalThis.fetch;
+  const waits: Array<Promise<unknown>> = [];
+  const sentJobs: RefreshJob[] = [];
+  let graphqlCalls = 0;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/users/wide") {
+      return Response.json({ login: "wide", type: "User" });
+    }
+    if (url.pathname === "/graphql") {
+      graphqlCalls += 1;
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        variables?: { after?: string | null };
+      };
+      const offset = body.variables?.after ? 100 : 0;
+      const nodes = Array.from({ length: 100 }, (_, index) => {
+        const number = offset + index + 1;
+        const name = `repo-${number}`;
+        return {
+          owner: { login: "wide", __typename: "User" },
+          name,
+          nameWithOwner: `wide/${name}`,
+          description: null,
+          url: `https://github.com/wide/${name}`,
+          defaultBranchRef: { name: "main" },
+          primaryLanguage: null,
+          repositoryTopics: { nodes: [] },
+          stargazerCount: 0,
+          forkCount: 0,
+          issues: { totalCount: 0 },
+          pullRequests: { totalCount: 0 },
+          isArchived: false,
+          isFork: false,
+          isPrivate: false,
+          pushedAt: "2026-05-15T00:00:00Z",
+          updatedAt: "2026-05-15T00:00:00Z",
+        };
+      });
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "User",
+            repositories: {
+              pageInfo: {
+                hasNextPage: true,
+                endCursor: offset === 0 ? "page-2" : "page-3",
+              },
+              nodes,
+            },
+          },
+        },
+      });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/wide", { method: "POST" }),
+      {
+        DASHBOARD_CACHE: kvStore(),
+        GITHUB_TOKEN: "shared-token",
+        REFRESH_QUEUE: {
+          async send(job: RefreshJob) {
+            sentJobs.push(job);
+          },
+        },
+      },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    assert.equal(response.status, 202);
+    const body = (await response.json()) as DashboardPayload;
+    await Promise.all(waits);
+    assert.equal(graphqlCalls, 2);
+    assert.equal(body.projects.length, 200);
+    assert.equal(body.cache?.capped, true);
+    assert.equal(body.cache?.repoLimit, 200);
+    assert.equal(sentJobs.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker limits cold metadata to one small page before queue hydration", async () => {
+  const originalFetch = globalThis.fetch;
+  const waits: Array<Promise<unknown>> = [];
+  const sentJobs: RefreshJob[] = [];
+  let graphqlCalls = 0;
+  const nodes = Array.from({ length: 25 }, (_, index) => {
+    const name = `repo-${index + 1}`;
+    return {
+      owner: { login: "wide", __typename: "User" },
+      name,
+      nameWithOwner: `wide/${name}`,
+      description: null,
+      url: `https://github.com/wide/${name}`,
+      defaultBranchRef: { name: "main" },
+      primaryLanguage: { name: "TypeScript" },
+      repositoryTopics: { nodes: [] },
+      stargazerCount: index,
+      forkCount: 0,
+      issues: { totalCount: index + 1 },
+      pullRequests: { totalCount: index },
+      isArchived: false,
+      isFork: index === 0,
+      isPrivate: false,
+      pushedAt: "2026-05-15T00:00:00Z",
+      updatedAt: "2026-05-15T00:00:00Z",
+    };
+  });
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/users/wide") {
+      return Response.json({ login: "wide", type: "User" });
+    }
+    if (url.pathname === "/graphql") {
+      graphqlCalls += 1;
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        variables?: { first?: number; after?: string | null; includeReleases?: boolean };
+      };
+      assert.equal(body.variables?.first, 25);
+      assert.equal(body.variables?.after, null);
+      assert.equal(body.variables?.includeReleases, false);
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "User",
+            repositories: {
+              pageInfo: { hasNextPage: true, endCursor: "next-page" },
+              nodes,
+            },
+          },
+        },
+      });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/wide"),
+      {
+        DASHBOARD_CACHE: kvStore(),
+        GITHUB_TOKEN: "shared-token",
+        REFRESH_QUEUE: {
+          async send(job: RefreshJob) {
+            sentJobs.push(job);
+          },
+        },
+      },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as DashboardPayload;
+    await Promise.all(waits);
+    assert.equal(graphqlCalls, 1);
+    assert.equal(body.cache?.state, "partial");
+    assert.equal(body.cache?.progress?.done, false);
+    assert.equal(body.cache?.repoLimit, 200);
+    assert.equal(body.options?.repoLimit, 200);
+    assert.equal(body.projects.length, 24);
+    assert.equal(
+      body.projects.some((project) => project.name === "repo-1"),
+      false,
+    );
+    assert.equal(body.projects.find((project) => project.name === "repo-25")?.openIssues, 25);
+    assert.equal(body.projects.find((project) => project.name === "repo-25")?.openPullRequests, 24);
+    assert.equal(sentJobs.length, 1);
+    assert.equal(sentJobs[0]?.reason, "cold-metadata");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -8613,7 +8792,7 @@ test("worker uses registered source-owned app tokens for anonymous owner dashboa
       avatarUrl: "https://avatars.githubusercontent.com/u/2",
       repositorySelection: "all",
       repositories: [],
-      updatedAt: "2026-05-15T12:00:00Z",
+      updatedAt: new Date().toISOString(),
     }),
   });
   const env = {
@@ -8694,6 +8873,79 @@ test("worker uses registered source-owned app tokens for anonymous owner dashboa
     );
   } finally {
     console.log = originalLog;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker keeps stale source installation coverage when discovery fails", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs1", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const cache = kvStore({
+    "auth:installation:v1:openclaw": JSON.stringify({
+      id: 1,
+      accountLogin: "openclaw",
+      accountType: "org",
+      accountUrl: "https://github.com/openclaw",
+      avatarUrl: "https://avatars.githubusercontent.com/u/2",
+      repositorySelection: "all",
+      repositories: [],
+      updatedAt: "2026-05-15T12:00:00Z",
+    }),
+    "auth:installation-token:1": "installation-token",
+  });
+  const env = {
+    DASHBOARD_CACHE: cache,
+    GITHUB_APP_ID: "123",
+    GITHUB_APP_PRIVATE_KEY: privateKey,
+    GITHUB_TOKEN: "shared-token",
+  };
+  const originalFetch = globalThis.fetch;
+  const waits: Promise<unknown>[] = [];
+  let discoveryCalls = 0;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    const authorization = new Headers(init?.headers).get("authorization");
+    if (url.pathname === "/app/installations") {
+      discoveryCalls += 1;
+      return Response.json({ message: "temporarily unavailable" }, { status: 503 });
+    }
+    if (url.pathname === "/users/openclaw") {
+      assert.equal(authorization, "Bearer installation-token");
+      return Response.json({ login: "openclaw", type: "Organization" });
+    }
+    if (url.pathname === "/graphql") {
+      assert.equal(authorization, "Bearer installation-token");
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "Organization",
+            repositories: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [],
+            },
+          },
+        },
+      });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+
+  try {
+    const response = await worker.fetch(new Request("https://release.bar/api/openclaw"), env, {
+      waitUntil: (promise) => waits.push(promise),
+    });
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as DashboardPayload;
+    await Promise.all(waits);
+    assert.equal(discoveryCalls, 1);
+    assert.equal(body.cache?.quota?.source, "app");
+    assert.equal(body.cache?.quota?.account, "openclaw");
+    assert.equal(await cache.get("auth:installation-miss:v1:openclaw"), null);
+    assert.notEqual(await cache.get("auth:installation:v1:openclaw"), null);
+  } finally {
     globalThis.fetch = originalFetch;
   }
 });
@@ -12010,7 +12262,7 @@ test("safeReturnTo accepts the current request origin, including workers.dev", a
   assert.equal(evilOriginLogout.headers.get("location"), "/");
 });
 
-test("worker reuses cached installation tokens", async () => {
+test("worker refreshes stale installation coverage before using its cached token", async () => {
   const sessionId = "session-token-cache";
   const accountLogin = "cacheorg";
   const exp = Math.floor(Date.now() / 1000) + 600;
@@ -12030,6 +12282,16 @@ test("worker reuses cached installation tokens", async () => {
         iat: exp - 600,
         exp,
       }),
+      [`auth:installation:v1:${accountLogin}`]: JSON.stringify({
+        id: 1,
+        accountLogin,
+        accountType: "org",
+        accountUrl: `https://github.com/${accountLogin}`,
+        avatarUrl: "https://avatars.githubusercontent.com/u/2",
+        repositorySelection: "all",
+        repositories: [],
+        updatedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+      }),
       "auth:installation-token:1": "installation-token",
     }),
     GITHUB_APP_CLIENT_ID: "Iv123",
@@ -12037,12 +12299,15 @@ test("worker reuses cached installation tokens", async () => {
     GITHUB_APP_ID: "123",
     GITHUB_APP_PRIVATE_KEY: "unused",
     GITHUB_APP_SLUG: "releasebar-app",
+    REFRESH_QUEUE: { send: async () => undefined },
   };
   const originalFetch = globalThis.fetch;
   let tokenMintCalled = false;
-  globalThis.fetch = async (input) => {
+  let userInstallationsCalls = 0;
+  globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
     if (url.pathname === "/user/installations") {
+      userInstallationsCalls += 1;
       return Response.json({
         installations: [
           {
@@ -12065,9 +12330,14 @@ test("worker reuses cached installation tokens", async () => {
       throw new Error("cached installation token should be reused");
     }
     if (url.pathname === `/users/${accountLogin}`) {
+      assert.equal(new Headers(init?.headers).get("authorization"), "Bearer installation-token");
       return Response.json({ login: accountLogin, type: "Organization" });
     }
     if (url.pathname === "/graphql") {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        variables?: { first?: number };
+      };
+      assert.equal(body.variables?.first, 25);
       return Response.json({
         data: {
           repositoryOwner: {
@@ -12098,6 +12368,17 @@ test("worker reuses cached installation tokens", async () => {
     await first.arrayBuffer();
     await Promise.all(waits);
     assert.equal(tokenMintCalled, false);
+    assert.equal(userInstallationsCalls, 1);
+
+    const second = await worker.fetch(
+      new Request(`https://release.bar/api/${accountLogin}`, { headers }),
+      env,
+      context,
+    );
+    assert.equal(second.status, 200);
+    await second.arrayBuffer();
+    await Promise.all(waits);
+    assert.equal(userInstallationsCalls, 1);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -14593,6 +14874,7 @@ test("dashboard repo scan cap marks full page boundary truncation as capped", as
     private: false,
   });
   const pages: string[] = [];
+  const pageSizes: string[] = [];
 
   const payload = await buildDashboard({
     title: "ReleaseBar",
@@ -14602,13 +14884,15 @@ test("dashboard repo scan cap marks full page boundary truncation as capped", as
     includeForks: false,
     includeArchived: false,
     includeUnreleased: true,
-    repoLimit: 200,
+    repoLimit: 100,
     repoScanLimit: 100,
+    ownerPageSize: 200,
     fetch: async (url) => {
       const parsed = new URL(String(url));
       const path = parsed.pathname;
       if (path === "/users/owner/repos") {
         pages.push(parsed.searchParams.get("page") ?? "");
+        pageSizes.push(parsed.searchParams.get("per_page") ?? "");
         return Response.json(Array.from({ length: 100 }, (_, index) => repo(`empty-${index}`)));
       }
       if (path.endsWith("/releases")) {
@@ -14630,7 +14914,8 @@ test("dashboard repo scan cap marks full page boundary truncation as capped", as
     },
   });
 
-  assert.deepEqual(pages, ["1", "2"]);
+  assert.deepEqual(pages, ["1"]);
+  assert.deepEqual(pageSizes, ["100"]);
   assert.equal(payload.totals.repos, 100);
   assert.equal(payload.cache?.capped, true);
   assert.match(payload.cache?.message ?? "", /scanned 100 recently pushed repos/);

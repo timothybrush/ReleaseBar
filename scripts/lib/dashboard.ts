@@ -24,6 +24,8 @@ export type DashboardBuildOptions = {
   repoLimit?: number;
   repoScanLimit?: number;
   repoScanTarget?: number;
+  ownerPageSize?: number;
+  ownerPageLimit?: number;
   hydrateSort?: "issues" | "prs" | null;
   hydrateDirection?: "asc" | "desc";
   token?: string;
@@ -562,9 +564,14 @@ async function githubJsonBody<T>(response: Response, pathname: string): Promise<
   }
 }
 
-async function githubPage<T>(client: GitHubClient, pathname: string, page: number): Promise<T[]> {
+async function githubPage<T>(
+  client: GitHubClient,
+  pathname: string,
+  page: number,
+  perPage = 100,
+): Promise<T[]> {
   const joiner = pathname.includes("?") ? "&" : "?";
-  return (await github<T[]>(client, `${pathname}${joiner}per_page=100&page=${page}`)) ?? [];
+  return (await github<T[]>(client, `${pathname}${joiner}per_page=${perPage}&page=${page}`)) ?? [];
 }
 
 async function githubPages<T>(client: GitHubClient, pathname: string): Promise<T[]> {
@@ -759,6 +766,7 @@ async function ownerReposGraphqlPage(
   owner: Owner,
   page: number,
   includeReleaseData: boolean,
+  pageSize: number,
 ): Promise<OwnerReposPage | null> {
   const cursorKey = `${owner.type}:${slugOwner(owner.login)}`;
   const cursors = client.graphqlCursors.get(cursorKey) ?? [null];
@@ -768,7 +776,7 @@ async function ownerReposGraphqlPage(
   }
   const body = await githubGraphql<GraphQLRepoPage>(client, ownerReposQuery, {
     login: owner.login,
-    first: 100,
+    first: pageSize,
     after,
     includeReleases: includeReleaseData,
   });
@@ -949,14 +957,22 @@ async function ownerReposPage(
   owner: Owner,
   includeReleaseData: boolean,
   page: number,
+  requestedPageSize = 100,
 ): Promise<OwnerReposPage> {
-  const graphqlPage = await ownerReposGraphqlPage(client, owner, page, includeReleaseData);
+  const pageSize = Math.max(1, Math.min(100, Math.trunc(requestedPageSize)));
+  const graphqlPage = await ownerReposGraphqlPage(
+    client,
+    owner,
+    page,
+    includeReleaseData,
+    pageSize,
+  );
   if (graphqlPage) {
     return graphqlPage;
   }
   const base = owner.type === "org" ? `/orgs/${owner.login}/repos` : `/users/${owner.login}/repos`;
   const path = `${base}?type=public&sort=pushed&direction=desc`;
-  const repos = await githubPage<GitHubRepo>(client, path, page);
+  const repos = await githubPage<GitHubRepo>(client, path, page, pageSize);
   if (!client.headers.Authorization) {
     return {
       repos: repos.map((repo) =>
@@ -968,11 +984,11 @@ async function ownerReposPage(
             }
           : repo,
       ),
-      hasNextPage: repos.length === 100,
+      hasNextPage: repos.length === pageSize,
     };
   }
   if (includeReleaseData) {
-    return { repos, hasNextPage: repos.length === 100 };
+    return { repos, hasNextPage: repos.length === pageSize };
   }
   const splitRepos: GitHubRepo[] = [];
   for (let index = 0; index < repos.length; index += 12) {
@@ -982,7 +998,7 @@ async function ownerReposPage(
       )),
     );
   }
-  return { repos: splitRepos, hasNextPage: repos.length === 100 };
+  return { repos: splitRepos, hasNextPage: repos.length === pageSize };
 }
 
 async function ownerRepos(
@@ -1353,6 +1369,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
   );
   const projects: Project[] = [...(options.initialProjects ?? [])];
   const effectiveQuotaSource = client.quota.source;
+  const ownerPageSize = Math.max(1, Math.min(100, Math.trunc(options.ownerPageSize ?? 100)));
   let capped = false;
   let scanIncomplete = false;
   let scannedThisRun = 0;
@@ -1497,8 +1514,13 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
       let hydratedThisOwner = 0;
       let page = 1;
       const scanLimit = options.repoScanLimit ?? Number.POSITIVE_INFINITY;
-      const ownerPageLimit =
+      const configuredOwnerPageLimit =
+        options.ownerPageLimit === undefined
+          ? Number.POSITIVE_INFINITY
+          : Math.max(1, Math.trunc(options.ownerPageLimit));
+      const quotaOwnerPageLimit =
         effectiveQuotaSource === "shared" && includeReleaseData ? 3 : Number.POSITIVE_INFINITY;
+      const ownerPageLimit = Math.min(configuredOwnerPageLimit, quotaOwnerPageLimit);
       if (includeReleaseData && options.includeUnreleased) {
         const hydrateQueue: GitHubRepo[] = [];
         const hydrationQueued = new Set<string>();
@@ -1519,7 +1541,13 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
           (hasScanLimit && hydrateQueue.length < scanLimit) ||
           collectPriorityCandidates
         ) {
-          const ownerPage = await ownerReposPage(client, owner, includeReleaseData, page);
+          const ownerPage = await ownerReposPage(
+            client,
+            owner,
+            includeReleaseData,
+            page,
+            ownerPageSize,
+          );
           const repos = ownerPage.repos;
           const pageSignature =
             repos.length > 0
@@ -1579,7 +1607,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
               visibleForHydration = true;
               if (
                 ownerVisible >= options.repoLimit &&
-                (index < repos.length - 1 || repos.length === 100)
+                (index < repos.length - 1 || repos.length === ownerPageSize)
               ) {
                 capped = true;
               }
@@ -1711,7 +1739,13 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
       }
       const pageSignatures = new Set<string>();
       while (ownerVisible < options.repoLimit || hydratedThisOwner < scanLimit) {
-        const ownerPage = await ownerReposPage(client, owner, includeReleaseData, page);
+        const ownerPage = await ownerReposPage(
+          client,
+          owner,
+          includeReleaseData,
+          page,
+          ownerPageSize,
+        );
         const repos = ownerPage.repos;
         const pageSignature =
           repos.length > 0
@@ -1770,6 +1804,12 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             ownerVisible += 1;
             visibleAddedThisPage += 1;
             seededVisibleRow = true;
+            if (
+              ownerVisible >= options.repoLimit &&
+              (index < repos.length - 1 || ownerPage.hasNextPage)
+            ) {
+              capped = true;
+            }
           }
           if (skippedRepos.has(fullName)) {
             continue;
@@ -1797,7 +1837,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             ownerVisible += 1;
             visibleAddedThisPage += 1;
             if (ownerVisible >= options.repoLimit) {
-              if (index < repos.length - 1 || repos.length === 100) {
+              if (index < repos.length - 1 || repos.length === ownerPageSize) {
                 capped = true;
               }
               exhaustedPage = true;

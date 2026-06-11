@@ -174,7 +174,9 @@ const progressTtlSeconds = 7 * 24 * 60 * 60;
 const maxDisplayStaleMs = 30 * 24 * 60 * 60 * 1000;
 const installationTokenTtlSeconds = 50 * 60;
 const installationAcknowledgementGraceMs = 15 * 60 * 1000;
+const installationRegistryFastPathMaxAgeMs = 15 * 60 * 1000;
 const coldBuildWaitMs = 15 * 1000;
+const initialMetadataRepoLimit = 25;
 const progressiveBuildBudgetMs = 25 * 1000;
 const queuedProgressiveBuildBudgetMs = 12 * 60 * 1000;
 const progressWriteIntervalMs = 1100;
@@ -2592,7 +2594,9 @@ async function githubAppInstallationForAccount(
         },
       },
     );
-    if (!response.ok) break;
+    if (!response.ok) {
+      throw new Error(`GitHub App installation discovery failed: ${response.status}`);
+    }
     const result = parseGitHubResponse(
       v.array(gitHubInstallationSchema),
       await response.json(),
@@ -2619,9 +2623,12 @@ async function githubAppInstallationForAccount(
     }
     if (result.length < 100) break;
   }
-  await env.DASHBOARD_CACHE.put(installationMissKey(account), new Date().toISOString(), {
-    expirationTtl: 10 * 60,
-  });
+  await Promise.all([
+    env.DASHBOARD_CACHE.delete?.(installationRegistryKey(account)),
+    env.DASHBOARD_CACHE.put(installationMissKey(account), new Date().toISOString(), {
+      expirationTtl: 10 * 60,
+    }),
+  ]);
   return null;
 }
 
@@ -2954,17 +2961,34 @@ async function cachedInstallationToken(
 async function sourceInstallationToken(
   env: Env,
   sources: TokenSources,
-  options: { discover?: boolean; signal?: AbortSignal } = {},
+  options: { discover?: boolean; maxRegistryAgeMs?: number; signal?: AbortSignal } = {},
 ): Promise<RequestToken | null> {
   if (!appTokenConfigured(env)) return null;
   const accounts = sourceAccounts(sources);
   if (accounts.length !== 1) return null;
   const account = accounts[0]!;
-  let installation = await readInstallationRegistry(env, account);
+  const registryInstallation = await readInstallationRegistry(env, account);
+  let installation = registryInstallation;
+  let registryStale = false;
+  if (installation && options.maxRegistryAgeMs !== undefined) {
+    const updatedAt = Date.parse(installation.updatedAt ?? "");
+    if (!Number.isFinite(updatedAt) || Date.now() - updatedAt > options.maxRegistryAgeMs) {
+      registryStale = true;
+      installation = null;
+    }
+  }
   if (!installation && options.discover !== false) {
     installation =
       (await nullOnNonAbortError(githubAppInstallationForAccount(env, account, options.signal))) ??
       null;
+    if (
+      !installation &&
+      registryStale &&
+      registryInstallation &&
+      !(await env.DASHBOARD_CACHE?.get(installationMissKey(account)))
+    ) {
+      installation = registryInstallation;
+    }
   }
   if (!installation || !installationCoversSources(installation, sources)) return null;
   const token = await cachedInstallationToken(env, installation.id, options.signal);
@@ -3021,13 +3045,23 @@ async function bestInstallationToken(
   options: { discoverSourceInstallations?: boolean; signal?: AbortSignal } = {},
 ): Promise<RequestToken | null> {
   return (
-    (await nullOnNonAbortError(requestInstallationToken(request, env, sources, options.signal))) ??
     (await nullOnNonAbortError(
       sourceInstallationToken(env, sources, {
-        discover: options.discoverSourceInstallations,
+        discover: false,
+        maxRegistryAgeMs: installationRegistryFastPathMaxAgeMs,
         signal: options.signal,
       }),
-    ))
+    )) ??
+    (await nullOnNonAbortError(requestInstallationToken(request, env, sources, options.signal))) ??
+    (options.discoverSourceInstallations === false
+      ? null
+      : await nullOnNonAbortError(
+          sourceInstallationToken(env, sources, {
+            discover: true,
+            maxRegistryAgeMs: installationRegistryFastPathMaxAgeMs,
+            signal: options.signal,
+          }),
+        ))
   );
 }
 
@@ -10537,6 +10571,7 @@ async function refreshDashboardMetadataFirst(
   env: Env,
   signal?: AbortSignal,
   resetProgress = false,
+  boundedInitialPage = false,
 ): Promise<DashboardPayload | null> {
   const lock = await acquireBuildLock(env, dashboard.key);
   if (!lock) {
@@ -10585,9 +10620,15 @@ async function refreshDashboardMetadataFirst(
       includeRepos: dashboard.includeRepos,
       excludeRepos: dashboard.profile?.hiddenRepos,
       ...optionsFromUrl(dashboard.url),
-      repoLimit,
+      repoLimit: boundedInitialPage ? initialMetadataRepoLimit : repoLimit,
       repoScanLimit: 0,
       repoScanTarget: repoLimit,
+      ...(boundedInitialPage
+        ? {
+            ownerPageSize: initialMetadataRepoLimit,
+            ownerPageLimit: 1,
+          }
+        : {}),
       token: dashboard.token ?? env.GITHUB_TOKEN,
       includeReleaseData: false,
       hydrateSort: dashboard.hydrateSort,
@@ -10605,8 +10646,28 @@ async function refreshDashboardMetadataFirst(
       ),
       projectCache: env.DASHBOARD_CACHE,
     });
+    const metadataPayload: DashboardPayload = {
+      ...payload,
+      ...(payload.options
+        ? {
+            options: {
+              ...payload.options,
+              repoLimit,
+            },
+          }
+        : {}),
+      ...(payload.cache
+        ? {
+            cache: {
+              ...payload.cache,
+              capped: boundedInitialPage ? false : payload.cache.capped,
+              repoLimit,
+            },
+          }
+        : {}),
+    };
     const partial = withCacheState(
-      payload,
+      metadataPayload,
       "partial",
       "issue and PR counts refreshed; release data updating",
     );
@@ -11324,7 +11385,7 @@ async function ownerResponse(
   );
   const metadataFirst = options.includeUnreleased && dashboard.includeReleaseData;
   const build = metadataFirst
-    ? refreshDashboardMetadataFirst(dashboard, env, coldBuildController?.signal)
+    ? refreshDashboardMetadataFirst(dashboard, env, coldBuildController?.signal, false, true)
     : rebuildWithBuildLock(dashboard, env, coldBuildController?.signal);
   const buildReason = metadataFirst ? "cold-metadata" : "cold-build";
   try {

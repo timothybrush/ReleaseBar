@@ -1,5 +1,7 @@
 # Changelog
 
+## 0.1.1 - Unreleased
+
 ## 0.1.0 - 2026-06-11
 
 - Bound GitHub OAuth callbacks to the initiating browser and capped return targets to prevent session-swapping attacks and oversized authorization requests.

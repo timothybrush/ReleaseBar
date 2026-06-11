@@ -2,6 +2,8 @@
 
 ## 0.1.1 - Unreleased
 
+- Returned current issue and PR counts before deep release scans when authenticated GitHub quota provides an exact split, marked anonymous REST splits unavailable without per-repository fan-out, moved progressive dashboard hydration to deadline-bounded Queue consumers with Durable Object checkpoints and strongly consistent target backoff state, and removed stale cross-request build promises that could freeze scan progress.
+
 ## 0.1.0 - 2026-06-11
 
 - Bound GitHub OAuth callbacks to the initiating browser and capped return targets to prevent session-swapping attacks and oversized authorization requests.

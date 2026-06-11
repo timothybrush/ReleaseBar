@@ -30,10 +30,15 @@ queue = "releasebar-refresh"
 
 [[queues.consumers]]
 queue = "releasebar-refresh"
-max_batch_size = 5
-max_batch_timeout = 30
-max_retries = 3
+max_batch_size = 1
+max_batch_timeout = 0
+max_retries = 10
 dead_letter_queue = "releasebar-refresh-dlq"
+max_concurrency = 5
+
+[observability]
+enabled = true
+head_sampling_rate = 1
 
 [[durable_objects.bindings]]
 name = "DASHBOARD_LOCKS"

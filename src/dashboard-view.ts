@@ -72,10 +72,10 @@ export function attentionReasons(project: Project, now = Date.now()): string[] {
   if (project.ciState === "failure" || project.ciState === "cancelled") {
     reasons.push(`CI ${project.ciState === "failure" ? "failing" : "cancelled"}`);
   }
-  if (project.openPullRequests >= pullRequestPressure) {
+  if ((project.openPullRequests ?? 0) >= pullRequestPressure) {
     reasons.push(`${project.openPullRequests} open PRs`);
   }
-  if (project.openIssues >= issuePressure) {
+  if ((project.openIssues ?? 0) >= issuePressure) {
     reasons.push(`${project.openIssues} open issues`);
   }
   return reasons;
@@ -159,7 +159,7 @@ export function matchesProjectSearch(project: Project, query: string): boolean {
   return terms.every((term) => haystack.includes(term));
 }
 
-export function sortValue(project: Project, key: SortKey): string | number {
+export function sortValue(project: Project, key: SortKey): string | number | null {
   switch (key) {
     case "repo":
       return project.fullName.toLowerCase();
@@ -189,6 +189,8 @@ export function sortProjects(
   return [...projects].sort((a, b) => {
     const aValue = sortValue(a, activeSortKey);
     const bValue = sortValue(b, activeSortKey);
+    if (aValue === null) return bValue === null ? 0 : 1;
+    if (bValue === null) return -1;
     if (typeof aValue === "string" && typeof bValue === "string") {
       return aValue.localeCompare(bValue) * direction;
     }

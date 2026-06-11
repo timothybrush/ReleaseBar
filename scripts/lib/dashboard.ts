@@ -38,6 +38,7 @@ export type DashboardBuildOptions = {
       scanned: number;
       done: boolean;
       phase: "metadata" | "hydrate" | "complete";
+      removedRepos?: string[];
     },
   ) => Promise<void> | void;
   log?: (message: string) => void;
@@ -215,6 +216,12 @@ type GraphQLRepoPage = {
     };
   };
   errors?: Array<{ message?: string; type?: string }>;
+};
+
+type OwnerReposPage = {
+  repos: GitHubRepo[];
+  hasNextPage: boolean;
+  cursor?: string | null;
 };
 
 type GraphQLRepoDetailNode = {
@@ -404,7 +411,9 @@ export function freshness(project: Pick<Project, "commitsSinceRelease">): Freshn
 }
 
 function repoSearchProject(repo: GitHubRepo): Project {
-  const openPullRequests = repo.open_pull_requests_total ?? 0;
+  const hasSplitCounts =
+    repo.open_issues_total !== undefined && repo.open_pull_requests_total !== undefined;
+  const openPullRequests = hasSplitCounts ? (repo.open_pull_requests_total ?? 0) : null;
   return {
     owner: repo.owner.login,
     name: repo.name,
@@ -416,7 +425,10 @@ function repoSearchProject(repo: GitHubRepo): Project {
     topics: repo.topics ?? [],
     stars: repo.stargazers_count,
     forks: repo.forks_count,
-    openIssues: repo.open_issues_total ?? Math.max(repo.open_issues_count - openPullRequests, 0),
+    openIssues: hasSplitCounts
+      ? (repo.open_issues_total ??
+        Math.max(repo.open_issues_count - (repo.open_pull_requests_total ?? 0), 0))
+      : null,
     openPullRequests,
     issuesUrl: `${repo.html_url}/issues`,
     pullRequestsUrl: `${repo.html_url}/pulls`,
@@ -452,7 +464,7 @@ function mergeRepoMetadata(
 ): Project | Omit<Project, "freshness"> {
   const metadata = repoSearchProject(repo);
   const hasSplitCounts =
-    repo.open_issues_total !== undefined || repo.open_pull_requests_total !== undefined;
+    repo.open_issues_total !== undefined && repo.open_pull_requests_total !== undefined;
   return {
     ...project,
     owner: metadata.owner,
@@ -747,7 +759,7 @@ async function ownerReposGraphqlPage(
   owner: Owner,
   page: number,
   includeReleaseData: boolean,
-): Promise<GitHubRepo[] | null> {
+): Promise<OwnerReposPage | null> {
   const cursorKey = `${owner.type}:${slugOwner(owner.login)}`;
   const cursors = client.graphqlCursors.get(cursorKey) ?? [null];
   const after = cursors[page - 1];
@@ -771,7 +783,11 @@ async function ownerReposGraphqlPage(
     ? repositoryOwner.repositories.pageInfo.endCursor
     : undefined;
   client.graphqlCursors.set(cursorKey, cursors);
-  return repos;
+  return {
+    repos,
+    hasNextPage: repositoryOwner.repositories.pageInfo.hasNextPage,
+    cursor: after,
+  };
 }
 
 function repoDetailsQuery(repos: GitHubRepo[]): string {
@@ -903,21 +919,88 @@ async function githubCount(client: GitHubClient, pathname: string): Promise<numb
   return items.length;
 }
 
+async function repoWithSplitIssueCounts(
+  client: GitHubClient,
+  repo: GitHubRepo,
+): Promise<GitHubRepo> {
+  if (repo.open_issues_total !== undefined && repo.open_pull_requests_total !== undefined) {
+    return repo;
+  }
+  if (repo.open_issues_count === 0) {
+    return {
+      ...repo,
+      open_issues_total: 0,
+      open_pull_requests_total: 0,
+    };
+  }
+  const openPullRequests =
+    repo.open_pull_requests_total ??
+    (await githubCount(client, `/repos/${repo.full_name}/pulls?state=open`));
+  return {
+    ...repo,
+    open_issues_total:
+      repo.open_issues_total ?? Math.max(repo.open_issues_count - openPullRequests, 0),
+    open_pull_requests_total: openPullRequests,
+  };
+}
+
+async function ownerReposPage(
+  client: GitHubClient,
+  owner: Owner,
+  includeReleaseData: boolean,
+  page: number,
+): Promise<OwnerReposPage> {
+  const graphqlPage = await ownerReposGraphqlPage(client, owner, page, includeReleaseData);
+  if (graphqlPage) {
+    return graphqlPage;
+  }
+  const base = owner.type === "org" ? `/orgs/${owner.login}/repos` : `/users/${owner.login}/repos`;
+  const path = `${base}?type=public&sort=pushed&direction=desc`;
+  const repos = await githubPage<GitHubRepo>(client, path, page);
+  if (!client.headers.Authorization) {
+    return {
+      repos: repos.map((repo) =>
+        repo.open_issues_count === 0
+          ? {
+              ...repo,
+              open_issues_total: 0,
+              open_pull_requests_total: 0,
+            }
+          : repo,
+      ),
+      hasNextPage: repos.length === 100,
+    };
+  }
+  if (includeReleaseData) {
+    return { repos, hasNextPage: repos.length === 100 };
+  }
+  const splitRepos: GitHubRepo[] = [];
+  for (let index = 0; index < repos.length; index += 12) {
+    splitRepos.push(
+      ...(await Promise.all(
+        repos.slice(index, index + 12).map((repo) => repoWithSplitIssueCounts(client, repo)),
+      )),
+    );
+  }
+  return { repos: splitRepos, hasNextPage: repos.length === 100 };
+}
+
 async function ownerRepos(
   client: GitHubClient,
   owner: Owner,
   includeReleaseData: boolean,
-  page?: number,
 ): Promise<GitHubRepo[]> {
-  if (page) {
-    const graphqlRepos = await ownerReposGraphqlPage(client, owner, page, includeReleaseData);
-    if (graphqlRepos) {
-      return graphqlRepos;
-    }
-  }
   const base = owner.type === "org" ? `/orgs/${owner.login}/repos` : `/users/${owner.login}/repos`;
   const path = `${base}?type=public&sort=pushed&direction=desc`;
-  return page ? githubPage<GitHubRepo>(client, path, page) : githubPages<GitHubRepo>(client, path);
+  if (!client.headers.Authorization) {
+    return githubPages<GitHubRepo>(client, path);
+  }
+  const repos: GitHubRepo[] = [];
+  for (let page = 1; ; page += 1) {
+    const next = await ownerReposPage(client, owner, includeReleaseData, page);
+    repos.push(...next.repos);
+    if (!next.hasNextPage) return repos;
+  }
 }
 
 async function repoByFullName(client: GitHubClient, fullName: string): Promise<GitHubRepo | null> {
@@ -1146,7 +1229,7 @@ function projectCacheKey(
   includeUnreleased: boolean,
   includeReleaseData: boolean,
 ): string {
-  return `repo:v1:${repo.full_name.toLowerCase()}:${includeUnreleased ? "unreleased" : "released"}:${includeReleaseData ? "release" : "metadata"}`;
+  return `repo:v2:${repo.full_name.toLowerCase()}:${includeUnreleased ? "unreleased" : "released"}:${includeReleaseData ? "release" : "metadata"}`;
 }
 
 function projectCacheSignature(repo: GitHubRepo): string {
@@ -1418,23 +1501,68 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
         effectiveQuotaSource === "shared" && includeReleaseData ? 3 : Number.POSITIVE_INFINITY;
       if (includeReleaseData && options.includeUnreleased) {
         const hydrateQueue: GitHubRepo[] = [];
+        const hydrationQueued = new Set<string>();
+        const liveOwnerRepos = new Set<string>();
+        const removedRepos: string[] = [];
+        const explicitRepos = new Set(
+          (options.includeRepos ?? []).map((repo) => repo.toLowerCase()),
+        );
+        const pageSignatures = new Set<string>();
         let metadataChanged = false;
+        let liveOwnerVisible = 0;
+        let enumerationComplete = false;
         const hasScanLimit = Number.isFinite(scanLimit);
+        const collectPriorityCandidates =
+          options.hydrateSort === "issues" || options.hydrateSort === "prs";
         while (
           ownerVisible < options.repoLimit ||
-          (hasScanLimit && hydrateQueue.length < scanLimit)
+          (hasScanLimit && hydrateQueue.length < scanLimit) ||
+          collectPriorityCandidates
         ) {
-          const repos = await ownerRepos(client, owner, includeReleaseData, page);
-          if (repos.length === 0) {
+          const ownerPage = await ownerReposPage(client, owner, includeReleaseData, page);
+          const repos = ownerPage.repos;
+          const pageSignature =
+            repos.length > 0
+              ? repos.map((repo) => repo.full_name.toLowerCase()).join("\n")
+              : ownerPage.cursor !== undefined
+                ? `empty:graphql:${ownerPage.cursor ?? "root"}`
+                : `empty:rest:${page}`;
+          if (pageSignatures.has(pageSignature)) {
+            capped = true;
+            if (
+              options.repoScanTarget &&
+              skippedRepos.size + scannedThisRun + hydrateQueue.length < options.repoScanTarget
+            ) {
+              scanIncomplete = true;
+            }
             break;
           }
+          pageSignatures.add(pageSignature);
+          if (repos.length === 0) {
+            if (!ownerPage.hasNextPage) {
+              enumerationComplete = true;
+              break;
+            }
+            if (page >= ownerPageLimit) {
+              capped = true;
+              break;
+            }
+            page += 1;
+            continue;
+          }
           let exhaustedPage = false;
-          let visibleAddedThisPage = 0;
           for (const [index, repo] of repos.entries()) {
             const fullName = repo.full_name.toLowerCase();
             if (!filterRepo(repo, options)) {
               continue;
             }
+            if (liveOwnerVisible >= options.repoLimit) {
+              capped = true;
+              exhaustedPage = true;
+              break;
+            }
+            liveOwnerVisible += 1;
+            liveOwnerRepos.add(fullName);
             const existingIndex = projects.findIndex(
               (project) => project.fullName.toLowerCase() === fullName,
             );
@@ -1447,7 +1575,6 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
               projects.push(repoSearchProject(repo));
               seen.add(fullName);
               ownerVisible += 1;
-              visibleAddedThisPage += 1;
               metadataChanged = true;
               visibleForHydration = true;
               if (
@@ -1457,16 +1584,32 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
                 capped = true;
               }
             } else {
-              capped = true;
-              if (ownerVisible >= options.repoLimit) {
-                exhaustedPage = true;
-              }
-            }
-            if (visibleForHydration && !skippedRepos.has(fullName)) {
-              hydrateQueue.push(repo);
-            }
-            if (ownerVisible >= options.repoLimit) {
-              if (index < repos.length - 1 || repos.length === 100) {
+              const replaceIndex = projects.reduce((oldestIndex, project, projectIndex) => {
+                if (
+                  project.owner.toLowerCase() !== owner.login.toLowerCase() ||
+                  explicitRepos.has(project.fullName.toLowerCase()) ||
+                  liveOwnerRepos.has(project.fullName.toLowerCase())
+                ) {
+                  return oldestIndex;
+                }
+                if (oldestIndex < 0) return projectIndex;
+                const oldest = projects[oldestIndex]!;
+                const projectDate = Date.parse(project.pushedAt ?? project.updatedAt ?? "") || 0;
+                const oldestDate = Date.parse(oldest.pushedAt ?? oldest.updatedAt ?? "") || 0;
+                return projectDate <= oldestDate ? projectIndex : oldestIndex;
+              }, -1);
+              if (replaceIndex >= 0) {
+                const [removed] = projects.splice(replaceIndex, 1);
+                const removedFullName = removed!.fullName.toLowerCase();
+                seen.delete(removedFullName);
+                skippedRepos.delete(removedFullName);
+                removedRepos.push(removedFullName);
+                projects.push(repoSearchProject(repo));
+                seen.add(fullName);
+                metadataChanged = true;
+                visibleForHydration = true;
+                capped = true;
+              } else {
                 capped = true;
                 if (
                   options.repoScanTarget &&
@@ -1474,25 +1617,52 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
                 ) {
                   scanIncomplete = true;
                 }
+                exhaustedPage = true;
               }
-              exhaustedPage = true;
-              break;
+            }
+            if (
+              visibleForHydration &&
+              !skippedRepos.has(fullName) &&
+              !hydrationQueued.has(fullName)
+            ) {
+              hydrateQueue.push(repo);
+              hydrationQueued.add(fullName);
             }
             if (exhaustedPage) {
               break;
             }
           }
-          if (repos.length < 100 || exhaustedPage) {
+          if (!ownerPage.hasNextPage) {
+            enumerationComplete = !exhaustedPage;
+            break;
+          }
+          if (exhaustedPage) {
             break;
           }
           if (page >= ownerPageLimit) {
             capped = true;
             break;
           }
-          if (hasScanLimit && hydrateQueue.length >= scanLimit && visibleAddedThisPage === 0) {
-            break;
-          }
           page += 1;
+        }
+        if (enumerationComplete) {
+          for (let index = projects.length - 1; index >= 0; index -= 1) {
+            const project = projects[index]!;
+            const fullName = project.fullName.toLowerCase();
+            if (
+              project.owner.toLowerCase() !== owner.login.toLowerCase() ||
+              explicitRepos.has(fullName) ||
+              liveOwnerRepos.has(fullName)
+            ) {
+              continue;
+            }
+            projects.splice(index, 1);
+            seen.delete(fullName);
+            skippedRepos.delete(fullName);
+            removedRepos.push(fullName);
+            ownerVisible -= 1;
+            metadataChanged = true;
+          }
         }
         if (metadataChanged) {
           const progressPayload = payload("partial");
@@ -1504,12 +1674,15 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             scanned: skippedRepos.size + scannedThisRun,
             done: false,
             phase: "metadata",
+            removedRepos,
           });
         }
         const prioritized = prioritizedHydrationQueue(hydrateQueue, options);
         const hydrationBatch = hasScanLimit ? prioritized.slice(0, scanLimit) : prioritized;
         if (hydrationBatch.length < prioritized.length) {
-          capped = true;
+          if (scanLimit > 0) {
+            capped = true;
+          }
           if (
             options.repoScanTarget &&
             skippedRepos.size + scannedThisRun + hydrationBatch.length < options.repoScanTarget
@@ -1536,9 +1709,29 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
         }
         continue;
       }
+      const pageSignatures = new Set<string>();
       while (ownerVisible < options.repoLimit || hydratedThisOwner < scanLimit) {
-        const repos = await ownerRepos(client, owner, includeReleaseData, page);
+        const ownerPage = await ownerReposPage(client, owner, includeReleaseData, page);
+        const repos = ownerPage.repos;
+        const pageSignature =
+          repos.length > 0
+            ? repos.map((repo) => repo.full_name.toLowerCase()).join("\n")
+            : ownerPage.cursor !== undefined
+              ? `empty:graphql:${ownerPage.cursor ?? "root"}`
+              : `empty:rest:${page}`;
+        if (pageSignatures.has(pageSignature)) {
+          capped = true;
+          break;
+        }
+        pageSignatures.add(pageSignature);
         if (repos.length === 0) {
+          if (ownerPage.hasNextPage && page < ownerPageLimit) {
+            page += 1;
+            continue;
+          }
+          if (ownerPage.hasNextPage) {
+            capped = true;
+          }
           break;
         }
         const detailLimit = Number.isFinite(scanLimit)
@@ -1582,7 +1775,9 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             continue;
           }
           if (hydratedThisOwner >= scanLimit) {
-            capped = true;
+            if (scanLimit > 0) {
+              capped = true;
+            }
             if (options.repoScanTarget) {
               scanIncomplete = true;
             }
@@ -1622,7 +1817,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             break;
           }
         }
-        if (repos.length < 100) {
+        if (!ownerPage.hasNextPage) {
           break;
         }
         if (exhaustedPage) {
@@ -1656,7 +1851,10 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
   }
 
   for (const fullName of options.includeRepos ?? []) {
-    const repo = await repoByFullName(client, fullName);
+    let repo = await repoByFullName(client, fullName);
+    if (repo && !includeReleaseData && options.includeUnreleased) {
+      repo = await repoWithSplitIssueCounts(client, repo);
+    }
     if (repo) {
       await addRepo(repo, `custom`, true);
     }

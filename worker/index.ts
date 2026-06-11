@@ -113,10 +113,16 @@ type Queue<Message = unknown> = {
 };
 
 type MessageBatch<Message = unknown> = {
-  messages: Array<{ body: Message; ack(): void; retry(options?: { delaySeconds?: number }): void }>;
+  messages: Array<{
+    body: Message;
+    attempts?: number;
+    ack(): void;
+    retry(options?: { delaySeconds?: number }): void;
+  }>;
 };
 
 type DurableObjectState = {
+  blockConcurrencyWhile?<T>(callback: () => Promise<T>): Promise<T>;
   storage: {
     get<T>(key: string): Promise<T | undefined>;
     put<T>(key: string, value: T): Promise<void>;
@@ -170,9 +176,18 @@ const installationTokenTtlSeconds = 50 * 60;
 const installationAcknowledgementGraceMs = 15 * 60 * 1000;
 const coldBuildWaitMs = 15 * 1000;
 const progressiveBuildBudgetMs = 25 * 1000;
+const queuedProgressiveBuildBudgetMs = 12 * 60 * 1000;
 const progressWriteIntervalMs = 1100;
 const buildLockTtlMs = 2 * 60 * 1000;
 const buildLockRefreshMs = 30 * 1000;
+const buildLockRetrySeconds = 60;
+const refreshJobReservationTtlMs = 2 * 60 * 60 * 1000;
+const incompleteBuildRetrySeconds = 2;
+const refreshQueueDeliveryDelaySeconds = 2;
+const refreshQueueMaxRetries = 10;
+// Push consumers receive one initial delivery plus max_retries redeliveries.
+const refreshQueueMaxAttempts = refreshQueueMaxRetries + 1;
+const refreshJobActiveGraceMs = 60 * 1000;
 const repoLimit = 200;
 const repoScanBatchSize = 12;
 const hotLimit = 50;
@@ -180,6 +195,9 @@ const hotOwnerLimit = 3;
 const hotSourceLimit = 24;
 const hotIndexLimit = 100;
 const hotCacheTtlMs = 5 * 60 * 1000;
+const localBuildLocks = new Map<string, StoredBuildLock>();
+const localRefreshReservationFallbackScope = {};
+const localRefreshJobReservations = new WeakMap<object, Map<string, StoredRefreshJobReservation>>();
 const discoverLimit = 40;
 const discoverHydrateLimit = 24;
 const discoverHydrateBatchSize = 8;
@@ -205,13 +223,11 @@ const activitySummaryPromptVersion = 2;
 const activityEventPageLimit = 3;
 const activitySummaryInputLimit = 120;
 const maxCustomSources = 8;
-const dashboardSchemaVersion = 5;
-const previousDashboardSchemaVersion = 4;
+const dashboardSchemaVersion = 6;
 const auxiliaryCacheSchemaVersion = 3;
 const discoverCacheSchemaVersion = 4;
 const dashboardCachePrefix = `dashboard:v${dashboardSchemaVersion}:`;
-const previousDashboardCachePrefix = `dashboard:v${previousDashboardSchemaVersion}:`;
-const dashboardCachePrefixes = [dashboardCachePrefix, previousDashboardCachePrefix];
+const dashboardCachePrefixes = [dashboardCachePrefix];
 const hotCacheKey = `hot:v${auxiliaryCacheSchemaVersion}`;
 const hotIndexKey = `hot:index:v${auxiliaryCacheSchemaVersion}`;
 const socialRepoCachePrefix = `social-repo:v${auxiliaryCacheSchemaVersion}:`;
@@ -239,8 +255,11 @@ const sharedQuotaMinimumRemaining: Record<string, number> = {
   _: 250,
 };
 const refreshTargetPrefix = `refresh:target:v1:`;
+const refreshProfileSnapshotPrefix = `refresh:profile-snapshot:v1:`;
 const refreshJobPrefix = `refresh:job:v1:`;
-const refreshJobIndexKey = `refresh:jobs:index:v1`;
+const refreshJobIndexPrefix = `refresh:jobs:v2:`;
+const refreshJobDeliveryPrefix = `refresh:job-deliveries:v1:`;
+const legacyRefreshJobIndexKey = `refresh:jobs:index:v1`;
 const refreshAuditPrefix = `refresh:audit:v2:`;
 const refreshStateKey = `refresh:state:v1`;
 const manualRefreshCooldownPrefix = `refresh:manual:v1:`;
@@ -261,7 +280,6 @@ const oauthStateCookiePrefix = "rd_oauth_state_";
 const sessionMaxAgeSeconds = 30 * 24 * 60 * 60;
 const stateMaxAgeSeconds = 10 * 60;
 const oauthReturnToMaxLength = 1024;
-const locks = new Map<string, Promise<DashboardPayload>>();
 const buildPending = Symbol("build-pending");
 const corsHeaders = {
   "access-control-allow-origin": "*",
@@ -402,10 +420,50 @@ type StoredBuildLock = {
   expiresAt: number;
 };
 
+type StoredRefreshJobReservation = {
+  jobId: string;
+  expiresAt: number;
+};
+
+type RefreshTargetMutation =
+  | {
+      kind: "observe";
+      input: Pick<
+        RefreshTarget,
+        "key" | "owner" | "owners" | "repos" | "includeReleaseData" | "path" | "priority"
+      >;
+      observedAt: string;
+      profileProvided: boolean;
+      profileSnapshotKey?: string | null;
+    }
+  | {
+      kind: "defer";
+      at: string;
+      nextDueAt: string;
+      message: string;
+    }
+  | {
+      kind: "success";
+      at: string;
+      message?: string;
+    }
+  | {
+      kind: "failure";
+      at: string;
+      message: string;
+      terminal: boolean;
+    };
+
 type StoredBuildProgress = {
   scannedRepos: string[];
   projects: Project[];
+  generationStartedAt?: string;
   updatedAt: string;
+  durableFallback?: true;
+};
+
+type StoredBuildProgressTombstone = {
+  clearedAt: string;
 };
 
 type StoredSocialRepo = {
@@ -964,6 +1022,7 @@ function auditGitHubFetch(
   quotaAccount: string | null,
   env?: Env,
   context?: ExecutionContext,
+  signal?: AbortSignal,
 ): typeof fetch {
   return async (input, init) => {
     const url = new URL(String(input));
@@ -987,7 +1046,7 @@ function auditGitHubFetch(
         { "cache-control": "no-store", "x-releasebar-github-backoff": "graphql" },
       );
     }
-    const response = await workerFetch(input, init);
+    const response = await workerFetch(input, signal ? { ...init, signal } : init);
     if (url.hostname === "api.github.com") {
       const path = `${url.pathname}${url.search}`;
       const quota = quotaFromGitHubResponse(response, quotaSource, quotaAccount);
@@ -1331,6 +1390,7 @@ async function resolveOwners(
   token?: string | null,
   quotaSource: ApiQuota["source"] = token || env.GITHUB_TOKEN ? "shared" : "anonymous",
   quotaAccount: string | null = null,
+  signal?: AbortSignal,
 ): Promise<Owner[] | null> {
   const owners: Owner[] = [];
   for (const owner of ownerSlugs) {
@@ -1340,7 +1400,7 @@ async function resolveOwners(
       continue;
     }
     const resolved = await resolveOwnerType(owner, {
-      fetch: auditGitHubFetch("dashboard", quotaSource, quotaAccount, env),
+      fetch: auditGitHubFetch("dashboard", quotaSource, quotaAccount, env, undefined, signal),
       token: token ?? env.GITHUB_TOKEN,
     });
     if (!resolved) {
@@ -2219,8 +2279,10 @@ async function githubJson<TSchema extends GenericSchema>(
   pathname: string,
   schema: TSchema,
   context: string,
+  signal?: AbortSignal,
 ): Promise<InferOutput<TSchema>> {
   const response = await workerFetch(`https://api.github.com${pathname}`, {
+    signal,
     headers: {
       accept: "application/vnd.github+json",
       authorization: `Bearer ${accessToken}`,
@@ -2234,12 +2296,16 @@ async function githubJson<TSchema extends GenericSchema>(
   return parseGitHubResponse(schema, await response.json(), context);
 }
 
-async function githubInstallations(accessToken: string): Promise<AuthInstallation[]> {
+async function githubInstallations(
+  accessToken: string,
+  signal?: AbortSignal,
+): Promise<AuthInstallation[]> {
   const result = await githubJson(
     accessToken,
     "/user/installations?per_page=100",
     gitHubInstallationListSchema,
     "installation list",
+    signal,
   );
   const installations = result.installations ?? [];
   return Promise.all(
@@ -2252,7 +2318,7 @@ async function githubInstallations(accessToken: string): Promise<AuthInstallatio
         }
         const repositories =
           installation.repository_selection === "selected"
-            ? await githubInstallationRepositories(accessToken, installation.id)
+            ? await githubInstallationRepositories(accessToken, installation.id, signal)
             : [];
         return {
           id: installation.id,
@@ -2271,6 +2337,7 @@ async function githubAppInstallations(
   env: Env,
   accountFilter: string | null = null,
   strict = false,
+  signal?: AbortSignal,
 ): Promise<AuthInstallation[]> {
   if (!appTokenConfigured(env)) {
     if (strict) throw new Error("GitHub App credentials are not configured");
@@ -2283,6 +2350,7 @@ async function githubAppInstallations(
     const response = await workerFetch(
       `https://api.github.com/app/installations?per_page=100&page=${page}`,
       {
+        signal,
         headers: {
           accept: "application/vnd.github+json",
           authorization: `Bearer ${jwt}`,
@@ -2308,7 +2376,7 @@ async function githubAppInstallations(
       if (normalizedAccountFilter && accountLogin !== normalizedAccountFilter) continue;
       const repositories =
         installation.repository_selection === "selected"
-          ? await githubAppInstallationRepositories(env, installation.id, strict)
+          ? await githubAppInstallationRepositories(env, installation.id, strict, signal)
           : [];
       installations.push({
         id: installation.id,
@@ -2331,8 +2399,9 @@ async function githubAppInstallations(
 async function githubAppInstallationsForSession(
   env: Env,
   session: StoredAuthSession,
+  signal?: AbortSignal,
 ): Promise<AuthInstallation[]> {
-  return githubAppInstallations(env, session.user.login);
+  return githubAppInstallations(env, session.user.login, false, signal);
 }
 
 async function syncGithubAppInstallations(env: Env): Promise<AuthInstallationRecord[]> {
@@ -2369,6 +2438,7 @@ async function syncGithubAppInstallations(env: Env): Promise<AuthInstallationRec
 async function githubInstallationRepositories(
   accessToken: string,
   installationId: number,
+  signal?: AbortSignal,
 ): Promise<string[]> {
   const repositories: string[] = [];
   for (let page = 1; page <= 10; page += 1) {
@@ -2377,6 +2447,7 @@ async function githubInstallationRepositories(
       `/user/installations/${installationId}/repositories?per_page=100&page=${page}`,
       gitHubInstallationRepositoryListSchema,
       "installation repositories",
+      signal,
     );
     const batch = result.repositories ?? [];
     repositories.push(
@@ -2424,6 +2495,7 @@ async function resolvedInstallations(
   session: StoredAuthSession,
   liveInstallations: AuthInstallation[] | null,
   acknowledgedInstallations = fallbackInstallations(session, liveInstallations),
+  signal?: AbortSignal,
 ): Promise<AuthInstallation[]> {
   const appInstallations =
     liveInstallations &&
@@ -2431,7 +2503,7 @@ async function resolvedInstallations(
       (installation) => installation.accountLogin === session.user.login.toLowerCase(),
     )
       ? []
-      : await githubAppInstallationsForSession(env, session).catch(() => []);
+      : ((await nullOnNonAbortError(githubAppInstallationsForSession(env, session, signal))) ?? []);
   const installations = mergeInstallations(liveInstallations ?? [], [
     ...acknowledgedInstallations,
     ...appInstallations,
@@ -2500,6 +2572,7 @@ async function githubAppInstallation(
 async function githubAppInstallationForAccount(
   env: Env,
   accountLogin: string,
+  signal?: AbortSignal,
 ): Promise<AuthInstallation | null> {
   if (!appTokenConfigured(env) || !env.DASHBOARD_CACHE) return null;
   const account = slugOwner(accountLogin);
@@ -2510,6 +2583,7 @@ async function githubAppInstallationForAccount(
     const response = await workerFetch(
       `https://api.github.com/app/installations?per_page=100&page=${page}`,
       {
+        signal,
         headers: {
           accept: "application/vnd.github+json",
           authorization: `Bearer ${jwt}`,
@@ -2529,7 +2603,7 @@ async function githubAppInstallationForAccount(
       if (!installationAccount || installationAccount.login.toLowerCase() !== account) continue;
       const repositories =
         installation.repository_selection === "selected"
-          ? await githubAppInstallationRepositories(env, installation.id)
+          ? await githubAppInstallationRepositories(env, installation.id, false, signal)
           : [];
       const record: AuthInstallation = {
         id: installation.id,
@@ -2555,8 +2629,9 @@ async function githubAppInstallationRepositories(
   env: Env,
   installationId: number,
   strict = false,
+  signal?: AbortSignal,
 ): Promise<string[]> {
-  const token = await cachedInstallationToken(env, installationId);
+  const token = await cachedInstallationToken(env, installationId, signal);
   if (!token) {
     if (strict) throw new Error(`GitHub App installation token unavailable: ${installationId}`);
     return [];
@@ -2566,6 +2641,7 @@ async function githubAppInstallationRepositories(
     const response = await workerFetch(
       `https://api.github.com/installation/repositories?per_page=100&page=${page}`,
       {
+        signal,
         headers: {
           accept: "application/vnd.github+json",
           authorization: `Bearer ${token}`,
@@ -2781,12 +2857,17 @@ async function githubAppJwt(env: Env): Promise<string> {
   return `${unsigned}.${base64Url(new Uint8Array(signature))}`;
 }
 
-async function githubInstallationToken(env: Env, installationId: number): Promise<string | null> {
+async function githubInstallationToken(
+  env: Env,
+  installationId: number,
+  signal?: AbortSignal,
+): Promise<string | null> {
   const jwt = await githubAppJwt(env);
   const response = await workerFetch(
     `https://api.github.com/app/installations/${installationId}/access_tokens`,
     {
       method: "POST",
+      signal,
       headers: {
         accept: "application/vnd.github+json",
         authorization: `Bearer ${jwt}`,
@@ -2853,11 +2934,15 @@ function matchingInstallation(
   );
 }
 
-async function cachedInstallationToken(env: Env, installationId: number): Promise<string | null> {
+async function cachedInstallationToken(
+  env: Env,
+  installationId: number,
+  signal?: AbortSignal,
+): Promise<string | null> {
   const cacheKey = `auth:installation-token:${installationId}`;
   const cached = await env.DASHBOARD_CACHE?.get(cacheKey);
   if (cached) return cached;
-  const token = await githubInstallationToken(env, installationId);
+  const token = await githubInstallationToken(env, installationId, signal);
   if (token) {
     await env.DASHBOARD_CACHE?.put(cacheKey, token, {
       expirationTtl: installationTokenTtlSeconds,
@@ -2869,7 +2954,7 @@ async function cachedInstallationToken(env: Env, installationId: number): Promis
 async function sourceInstallationToken(
   env: Env,
   sources: TokenSources,
-  options: { discover?: boolean } = {},
+  options: { discover?: boolean; signal?: AbortSignal } = {},
 ): Promise<RequestToken | null> {
   if (!appTokenConfigured(env)) return null;
   const accounts = sourceAccounts(sources);
@@ -2877,10 +2962,12 @@ async function sourceInstallationToken(
   const account = accounts[0]!;
   let installation = await readInstallationRegistry(env, account);
   if (!installation && options.discover !== false) {
-    installation = await githubAppInstallationForAccount(env, account).catch(() => null);
+    installation =
+      (await nullOnNonAbortError(githubAppInstallationForAccount(env, account, options.signal))) ??
+      null;
   }
   if (!installation || !installationCoversSources(installation, sources)) return null;
-  const token = await cachedInstallationToken(env, installation.id);
+  const token = await cachedInstallationToken(env, installation.id, options.signal);
   return token
     ? {
         token,
@@ -2902,14 +2989,22 @@ async function requestInstallationToken(
   request: Request,
   env: Env,
   sources: TokenSources,
+  signal?: AbortSignal,
 ): Promise<RequestToken | null> {
   if (!appTokenConfigured(env)) return null;
   const session = await currentSession(request, env);
   if (!session) return null;
-  const liveInstallations = await githubInstallations(session.accessToken).catch(() => null);
-  const installations = await resolvedInstallations(env, session, liveInstallations);
+  const liveInstallations =
+    (await nullOnNonAbortError(githubInstallations(session.accessToken, signal))) ?? null;
+  const installations = await resolvedInstallations(
+    env,
+    session,
+    liveInstallations,
+    undefined,
+    signal,
+  );
   const installation = matchingInstallation(installations, sources);
-  const token = installation ? await cachedInstallationToken(env, installation.id) : null;
+  const token = installation ? await cachedInstallationToken(env, installation.id, signal) : null;
   return token
     ? {
         token,
@@ -2923,14 +3018,26 @@ async function bestInstallationToken(
   request: Request,
   env: Env,
   sources: TokenSources,
-  options: { discoverSourceInstallations?: boolean } = {},
+  options: { discoverSourceInstallations?: boolean; signal?: AbortSignal } = {},
 ): Promise<RequestToken | null> {
   return (
-    (await requestInstallationToken(request, env, sources).catch(() => null)) ??
-    (await sourceInstallationToken(env, sources, {
-      discover: options.discoverSourceInstallations,
-    }).catch(() => null))
+    (await nullOnNonAbortError(requestInstallationToken(request, env, sources, options.signal))) ??
+    (await nullOnNonAbortError(
+      sourceInstallationToken(env, sources, {
+        discover: options.discoverSourceInstallations,
+        signal: options.signal,
+      }),
+    ))
   );
+}
+
+async function nullOnNonAbortError<T>(operation: Promise<T>): Promise<T | null> {
+  try {
+    return await operation;
+  } catch (error) {
+    if (isAbortError(error)) throw error;
+    return null;
+  }
 }
 
 function sourceAccounts(sources: TokenSources): string[] {
@@ -3316,6 +3423,10 @@ function dashboardErrorMessage(error: unknown): string {
   return message;
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
 function errorStatus(error: unknown): number {
   const message = errorMessage(error);
   const githubStatus = message.match(/^GitHub API (\d+)/)?.[1];
@@ -3356,6 +3467,10 @@ function profileKey(owner: string): string {
   return `profile:v1:${slugOwner(owner)}`;
 }
 
+function profileSnapshotStorageKey(profile: DashboardProfile): string {
+  return `${refreshProfileSnapshotPrefix}${slugOwner(profile.owner)}:${encodeURIComponent(profile.updatedAt)}`;
+}
+
 async function readProfile(env: Env, owner: string): Promise<DashboardProfile | null> {
   const raw = await env.DASHBOARD_CACHE?.get(profileKey(owner));
   if (!raw) return null;
@@ -3363,8 +3478,31 @@ async function readProfile(env: Env, owner: string): Promise<DashboardProfile | 
   return parsed?.owner === slugOwner(owner) ? parsed : null;
 }
 
+async function readProfileSnapshot(env: Env, key: string): Promise<DashboardProfile | null> {
+  if (!key.startsWith(refreshProfileSnapshotPrefix)) return null;
+  const raw = await env.DASHBOARD_CACHE?.get(key);
+  if (!raw) return null;
+  const parsed = tryJsonParse<DashboardProfile>(raw, `profile snapshot ${key}`);
+  return parsed?.owner ? parsed : null;
+}
+
+async function ensureProfileSnapshot(env: Env, profile: DashboardProfile): Promise<string> {
+  const key = profileSnapshotStorageKey(profile);
+  if (!(await env.DASHBOARD_CACHE?.get(key))) {
+    await env.DASHBOARD_CACHE?.put(key, JSON.stringify(profile), {
+      expirationTtl: dashboardStorageTtlSeconds,
+    });
+  }
+  return key;
+}
+
 async function writeProfile(env: Env, profile: DashboardProfile): Promise<void> {
-  await env.DASHBOARD_CACHE?.put(profileKey(profile.owner), JSON.stringify(profile));
+  await Promise.all([
+    env.DASHBOARD_CACHE?.put(profileKey(profile.owner), JSON.stringify(profile)),
+    env.DASHBOARD_CACHE?.put(profileSnapshotStorageKey(profile), JSON.stringify(profile), {
+      expirationTtl: dashboardStorageTtlSeconds,
+    }),
+  ]);
 }
 
 async function deleteProfile(env: Env, owner: string): Promise<void> {
@@ -3418,8 +3556,24 @@ function refreshTargetStorageKey(key: string): string {
   return `${refreshTargetPrefix}${key}`;
 }
 
+function currentDashboardCacheKey(key: string): boolean {
+  return key.startsWith(dashboardCachePrefix);
+}
+
 function refreshJobStorageKey(id: string): string {
   return `${refreshJobPrefix}${id}`;
+}
+
+function refreshJobIndexStorageKey(job: Pick<RefreshJob, "id" | "createdAt">): string {
+  const timestamp = safeIso(job.createdAt) || Date.now();
+  const reverseTimestamp = String(Number.MAX_SAFE_INTEGER - timestamp).padStart(16, "0");
+  return `${refreshJobIndexPrefix}${reverseTimestamp}:${job.id}`;
+}
+
+function refreshJobDeliveryStorageKey(job: RefreshJob): string {
+  const timestamp = safeIso(job.updatedAt) || Date.now();
+  const reverseTimestamp = String(Number.MAX_SAFE_INTEGER - timestamp).padStart(16, "0");
+  return `${refreshJobDeliveryPrefix}${reverseTimestamp}:${job.id}:${job.attempts}`;
 }
 
 function jitterMs(seed: string, windowMs: number): number {
@@ -3455,6 +3609,35 @@ function isRefreshTarget(value: unknown): value is RefreshTarget {
   );
 }
 
+function isRefreshTargetMutation(value: unknown): value is RefreshTargetMutation {
+  const mutation = value as RefreshTargetMutation | null;
+  if (!mutation || typeof mutation !== "object" || typeof mutation.kind !== "string") return false;
+  if (mutation.kind === "observe") {
+    return Boolean(
+      mutation.input &&
+      typeof mutation.input.key === "string" &&
+      typeof mutation.observedAt === "string" &&
+      typeof mutation.profileProvided === "boolean",
+    );
+  }
+  if (mutation.kind === "defer") {
+    return (
+      typeof mutation.at === "string" &&
+      typeof mutation.nextDueAt === "string" &&
+      typeof mutation.message === "string"
+    );
+  }
+  if (mutation.kind === "success") {
+    return typeof mutation.at === "string";
+  }
+  return (
+    mutation.kind === "failure" &&
+    typeof mutation.at === "string" &&
+    typeof mutation.message === "string" &&
+    typeof mutation.terminal === "boolean"
+  );
+}
+
 function isRefreshJob(value: unknown): value is RefreshJob {
   const job = value as RefreshJob | null;
   return Boolean(
@@ -3464,6 +3647,25 @@ function isRefreshJob(value: unknown): value is RefreshJob {
     typeof job.targetKey === "string" &&
     typeof job.status === "string",
   );
+}
+
+function refreshJobActive(job: RefreshJob, now = Date.now()): boolean {
+  return (
+    (job.status === "queued" || job.status === "running") &&
+    now - safeIso(job.updatedAt) <= refreshJobReservationTtlMs + refreshJobActiveGraceMs
+  );
+}
+
+function localRefreshJobReservationStore(env: Env): Map<string, StoredRefreshJobReservation> {
+  const scope =
+    (env.DASHBOARD_CACHE as object | undefined) ??
+    (env.DASHBOARD_LOCKS as object | undefined) ??
+    localRefreshReservationFallbackScope;
+  const existing = localRefreshJobReservations.get(scope);
+  if (existing) return existing;
+  const created = new Map<string, StoredRefreshJobReservation>();
+  localRefreshJobReservations.set(scope, created);
+  return created;
 }
 
 function isAuditEvent(value: unknown): value is SchedulerAuditEvent {
@@ -3484,28 +3686,149 @@ async function writeRefreshTarget(env: Env, target: RefreshTarget): Promise<void
   });
 }
 
+function newerIso<T extends string | null>(left: T, right: T): T {
+  return safeIso(right) > safeIso(left) ? right : left;
+}
+
+function mergeRefreshTargetState(
+  snapshot: RefreshTarget,
+  current: RefreshTarget | null,
+): RefreshTarget {
+  if (!current) return snapshot;
+  return {
+    ...current,
+    lastSeenAt: newerIso(snapshot.lastSeenAt, current.lastSeenAt),
+    lastAttemptAt: newerIso(snapshot.lastAttemptAt, current.lastAttemptAt),
+    lastSuccessAt: newerIso(snapshot.lastSuccessAt, current.lastSuccessAt),
+  };
+}
+
+function applyRefreshTargetMutation(
+  snapshot: RefreshTarget | null,
+  current: RefreshTarget | null,
+  mutation: RefreshTargetMutation,
+): RefreshTarget {
+  if (mutation.kind === "observe") {
+    const existing = current ?? snapshot;
+    return {
+      ...mutation.input,
+      kind: "dashboard",
+      profileSnapshotKey: mutation.profileProvided
+        ? mutation.profileSnapshotKey
+        : existing?.profileSnapshotKey,
+      lastSeenAt: mutation.observedAt,
+      lastAttemptAt: existing?.lastAttemptAt ?? null,
+      lastSuccessAt: existing?.lastSuccessAt ?? null,
+      nextDueAt:
+        existing?.nextDueAt ??
+        new Date(Date.now() + jitterMs(mutation.input.key, 60 * 60 * 1000)).toISOString(),
+      failureCount: existing?.failureCount ?? 0,
+      terminalBackoffUntil: existing?.terminalBackoffUntil ?? null,
+      message: existing?.message,
+    };
+  }
+  if (!snapshot) {
+    throw new Error("refresh target snapshot required");
+  }
+  const target = mergeRefreshTargetState(snapshot, current);
+  if (mutation.kind === "defer") {
+    return {
+      ...target,
+      lastAttemptAt: mutation.at,
+      nextDueAt: mutation.nextDueAt,
+      message: mutation.message,
+    };
+  }
+  if (mutation.kind === "success") {
+    return {
+      ...target,
+      lastAttemptAt: mutation.at,
+      lastSuccessAt: mutation.at,
+      nextDueAt: nextRefreshAt(target, true),
+      failureCount: 0,
+      terminalBackoffUntil: null,
+      message: mutation.message,
+    };
+  }
+  const nextDueAt = nextRefreshAt(target, false);
+  return {
+    ...target,
+    lastAttemptAt: mutation.at,
+    nextDueAt,
+    failureCount: target.failureCount + 1,
+    terminalBackoffUntil: mutation.terminal ? nextDueAt : target.terminalBackoffUntil,
+    message: mutation.message,
+  };
+}
+
+async function mutateRefreshTargetState(
+  env: Env,
+  snapshot: RefreshTarget | null,
+  mutation: RefreshTargetMutation,
+): Promise<RefreshTarget> {
+  const key = mutation.kind === "observe" ? mutation.input.key : snapshot?.key;
+  if (!key) {
+    throw new Error("refresh target key required");
+  }
+  if (env.DASHBOARD_LOCKS) {
+    try {
+      const id = env.DASHBOARD_LOCKS.idFromName(key);
+      const response = await env.DASHBOARD_LOCKS.get(id).fetch(
+        new Request("https://releasebar.internal/target/mutate", {
+          method: "POST",
+          body: JSON.stringify({ snapshot, mutation }),
+        }),
+      );
+      if (response.ok) {
+        const updated = (await response.json()) as RefreshTarget;
+        if (isRefreshTarget(updated)) return updated;
+      }
+    } catch {
+      // KV fallback keeps preview and degraded Durable Object paths operational.
+    }
+  }
+  const current = await readRefreshTarget(env, key);
+  const updated = applyRefreshTargetMutation(snapshot, current, mutation);
+  await writeRefreshTarget(env, updated);
+  return updated;
+}
+
 async function rememberRefreshTarget(
   env: Env,
   input: Pick<
     RefreshTarget,
     "key" | "owner" | "owners" | "repos" | "includeReleaseData" | "path" | "priority"
-  >,
-): Promise<void> {
-  if (!env.DASHBOARD_CACHE) return;
+  > & { profile?: DashboardProfile | null },
+): Promise<RefreshTarget | null> {
+  if (!env.DASHBOARD_CACHE) return null;
   const now = new Date().toISOString();
-  const existing = await readRefreshTarget(env, input.key);
-  await writeRefreshTarget(env, {
-    ...input,
-    kind: "dashboard",
-    lastSeenAt: now,
-    lastAttemptAt: existing?.lastAttemptAt ?? null,
-    lastSuccessAt: existing?.lastSuccessAt ?? null,
-    nextDueAt:
-      existing?.nextDueAt ??
-      new Date(Date.now() + jitterMs(input.key, 60 * 60 * 1000)).toISOString(),
-    failureCount: existing?.failureCount ?? 0,
-    message: existing?.message,
+  const { profile, ...targetInput } = input;
+  const profileSnapshotKey =
+    profile === undefined ? undefined : profile ? await ensureProfileSnapshot(env, profile) : null;
+  return mutateRefreshTargetState(env, null, {
+    kind: "observe",
+    input: targetInput,
+    observedAt: now,
+    profileProvided: profile !== undefined,
+    profileSnapshotKey,
   });
+}
+
+async function refreshTargetProfile(
+  env: Env,
+  target: RefreshTarget,
+  cached: DashboardPayload | null,
+): Promise<DashboardProfile | null | undefined> {
+  if (target.profileSnapshotKey === null) return null;
+  if (!target.profileSnapshotKey) return cached?.profile ?? null;
+  const snapshot = await readProfileSnapshot(env, target.profileSnapshotKey);
+  if (snapshot) return snapshot;
+  const current = await readProfile(env, target.owner);
+  if (current && profileSnapshotStorageKey(current) === target.profileSnapshotKey) {
+    await ensureProfileSnapshot(env, current).catch(() => undefined);
+    return current;
+  }
+  return undefined;
 }
 
 async function listRefreshTargets(
@@ -3525,7 +3848,7 @@ async function listRefreshTargets(
       const raw = await env.DASHBOARD_CACHE.get(key.name);
       if (!raw) continue;
       const target = tryJsonParse<RefreshTarget>(raw, `refresh target ${key.name}`);
-      if (isRefreshTarget(target)) targets.push(target);
+      if (isRefreshTarget(target) && currentDashboardCacheKey(target.key)) targets.push(target);
       if (targets.length >= limit) break;
     }
     cursor = page.list_complete ? undefined : page.cursor;
@@ -3542,28 +3865,30 @@ async function readStringList(env: Env, key: string): Promise<string[]> {
     : [];
 }
 
-async function writeStringList(
-  env: Env,
-  key: string,
-  values: string[],
-  limit: number,
-): Promise<void> {
-  await env.DASHBOARD_CACHE?.put(key, JSON.stringify([...new Set(values)].slice(0, limit)), {
-    expirationTtl: dashboardStorageTtlSeconds,
-  });
-}
-
 async function writeRefreshJob(env: Env, job: RefreshJob): Promise<void> {
   await env.DASHBOARD_CACHE?.put(refreshJobStorageKey(job.id), JSON.stringify(job), {
     expirationTtl: 14 * 24 * 60 * 60,
   });
-  const ids = await readStringList(env, refreshJobIndexKey);
-  await writeStringList(
-    env,
-    refreshJobIndexKey,
-    [job.id, ...ids.filter((id) => id !== job.id)],
-    refreshJobListLimit,
-  );
+}
+
+async function writeRefreshJobDelivery(env: Env, job: RefreshJob): Promise<void> {
+  await env.DASHBOARD_CACHE?.put(refreshJobDeliveryStorageKey(job), JSON.stringify(job), {
+    expirationTtl: 14 * 24 * 60 * 60,
+  });
+}
+
+async function indexRefreshJob(env: Env, job: RefreshJob): Promise<void> {
+  await env.DASHBOARD_CACHE?.put(refreshJobIndexStorageKey(job), JSON.stringify(job), {
+    expirationTtl: 14 * 24 * 60 * 60,
+  });
+}
+
+async function readRefreshJobSnapshot(env: Env, key: string): Promise<RefreshJob | null> {
+  if (!key.startsWith(refreshJobIndexPrefix)) return null;
+  const raw = await env.DASHBOARD_CACHE?.get(key);
+  if (!raw) return null;
+  const parsed = tryJsonParse<RefreshJob>(raw, `refresh job snapshot ${key}`);
+  return isRefreshJob(parsed) ? parsed : null;
 }
 
 async function readRefreshJob(env: Env, id: string): Promise<RefreshJob | null> {
@@ -3574,11 +3899,52 @@ async function readRefreshJob(env: Env, id: string): Promise<RefreshJob | null> 
 }
 
 async function listRefreshJobs(env: Env): Promise<RefreshJob[]> {
-  const ids = await readStringList(env, refreshJobIndexKey);
-  const jobs = (await Promise.all(ids.map((id) => readRefreshJob(env, id)))).filter(
-    (job): job is RefreshJob => Boolean(job),
-  );
-  return jobs.sort((a, b) => safeIso(b.updatedAt) - safeIso(a.updatedAt));
+  const jobs = new Map<string, RefreshJob>();
+  if (env.DASHBOARD_CACHE?.list) {
+    const [page, deliveryPage] = await Promise.all([
+      env.DASHBOARD_CACHE.list({
+        prefix: refreshJobIndexPrefix,
+        limit: refreshJobListLimit,
+      }),
+      env.DASHBOARD_CACHE.list({
+        prefix: refreshJobDeliveryPrefix,
+        limit: refreshJobListLimit,
+      }),
+    ]);
+    await Promise.all(
+      page.keys.slice(0, refreshJobListLimit).map(async (key) => {
+        const indexedRaw = await env.DASHBOARD_CACHE?.get(key.name);
+        if (!indexedRaw) return;
+        const indexed = tryJsonParse<RefreshJob>(indexedRaw, `refresh job index ${key.name}`);
+        if (!isRefreshJob(indexed)) return;
+        jobs.set(indexed.id, (await readRefreshJob(env, indexed.id)) ?? indexed);
+      }),
+    );
+    await Promise.all(
+      deliveryPage.keys.slice(0, refreshJobListLimit).map(async (key) => {
+        const raw = await env.DASHBOARD_CACHE?.get(key.name);
+        if (!raw) return;
+        const delivery = tryJsonParse<RefreshJob>(raw, `refresh job delivery ${key.name}`);
+        if (!isRefreshJob(delivery)) return;
+        const current = jobs.get(delivery.id);
+        if (!current || safeIso(delivery.updatedAt) > safeIso(current.updatedAt)) {
+          jobs.set(delivery.id, delivery);
+        }
+      }),
+    );
+  }
+  if (jobs.size < refreshJobListLimit) {
+    const legacyIds = await readStringList(env, legacyRefreshJobIndexKey);
+    await Promise.all(
+      legacyIds.slice(0, refreshJobListLimit - jobs.size).map(async (id) => {
+        const job = await readRefreshJob(env, id);
+        if (job) jobs.set(job.id, job);
+      }),
+    );
+  }
+  return [...jobs.values()]
+    .sort((a, b) => safeIso(b.updatedAt) - safeIso(a.updatedAt))
+    .slice(0, refreshJobListLimit);
 }
 
 async function auditScheduler(
@@ -3925,9 +4291,10 @@ async function githubAccessSummary(
 
 function refreshJob(target: RefreshTarget, reason: string): RefreshJob {
   const now = new Date().toISOString();
-  return {
+  const job: RefreshJob = {
     id: randomNonce(),
     targetKey: target.key,
+    target,
     kind: target.kind,
     status: "queued",
     reason,
@@ -3938,6 +4305,110 @@ function refreshJob(target: RefreshTarget, reason: string): RefreshJob {
     attempts: 0,
     durationMs: null,
   };
+  job.targetSnapshotKey = refreshJobIndexStorageKey(job);
+  return job;
+}
+
+function refreshQueueMessage(job: RefreshJob): RefreshJob {
+  const { target: _target, ...message } = job;
+  return message;
+}
+
+async function reserveRefreshJob(env: Env, targetKey: string, jobId: string): Promise<boolean> {
+  const reserveFallback = async (): Promise<boolean> => {
+    const reservations = localRefreshJobReservationStore(env);
+    const now = Date.now();
+    const local = reservations.get(targetKey);
+    if (local && local.jobId !== jobId && local.expiresAt > now) {
+      return false;
+    }
+    reservations.set(targetKey, {
+      jobId,
+      expiresAt: now + refreshJobReservationTtlMs,
+    });
+    try {
+      const active = (await listRefreshJobs(env)).find(
+        (job) => job.targetKey === targetKey && job.id !== jobId && refreshJobActive(job),
+      );
+      if (!active) return true;
+      if (reservations.get(targetKey)?.jobId === jobId) {
+        reservations.delete(targetKey);
+      }
+      return false;
+    } catch (error) {
+      if (reservations.get(targetKey)?.jobId === jobId) {
+        reservations.delete(targetKey);
+      }
+      throw error;
+    }
+  };
+  if (!env.DASHBOARD_LOCKS) {
+    return reserveFallback();
+  }
+  try {
+    const id = env.DASHBOARD_LOCKS.idFromName(targetKey);
+    const response = await env.DASHBOARD_LOCKS.get(id).fetch(
+      new Request("https://releasebar.internal/job/reserve", {
+        method: "POST",
+        body: JSON.stringify({ jobId }),
+      }),
+    );
+    if (response.status === 409) return false;
+    if (response.ok) return true;
+    await auditSyncEvent(env, {
+      event: "job_reservation_fallback",
+      targetKey,
+      jobId,
+      status: "fallback",
+      reason: `durable reservation status ${response.status}`,
+    }).catch(() => undefined);
+  } catch (error) {
+    await auditSyncEvent(env, {
+      event: "job_reservation_fallback",
+      targetKey,
+      jobId,
+      status: "fallback",
+      reason: errorMessage(error),
+    }).catch(() => undefined);
+  }
+  return reserveFallback();
+}
+
+async function releaseRefreshJobReservation(
+  env: Env,
+  targetKey: string,
+  jobId: string,
+): Promise<void> {
+  const reservations = localRefreshJobReservationStore(env);
+  if (reservations.get(targetKey)?.jobId === jobId) {
+    reservations.delete(targetKey);
+  }
+  if (!env.DASHBOARD_LOCKS) return;
+  try {
+    const id = env.DASHBOARD_LOCKS.idFromName(targetKey);
+    const response = await env.DASHBOARD_LOCKS.get(id).fetch(
+      new Request("https://releasebar.internal/job/release", {
+        method: "POST",
+        body: JSON.stringify({ jobId }),
+      }),
+    );
+    if (response.ok) return;
+    await auditSyncEvent(env, {
+      event: "job_reservation_release_failed",
+      targetKey,
+      jobId,
+      status: "failed",
+      reason: `durable reservation release status ${response.status}`,
+    }).catch(() => undefined);
+  } catch (error) {
+    await auditSyncEvent(env, {
+      event: "job_reservation_release_failed",
+      targetKey,
+      jobId,
+      status: "failed",
+      reason: errorMessage(error),
+    }).catch(() => undefined);
+  }
 }
 
 async function enqueueRefreshJob(
@@ -3945,10 +4416,30 @@ async function enqueueRefreshJob(
   context: ExecutionContext,
   target: RefreshTarget,
   reason: string,
-): Promise<RefreshJob> {
+  delaySeconds = refreshQueueDeliveryDelaySeconds,
+): Promise<RefreshJob | null> {
+  if (reason !== "manual-refresh" && refreshTargetBackoffActive(target)) {
+    await auditSyncEvent(env, {
+      event: "job_enqueue_skip",
+      targetKey: target.key,
+      status: "backoff",
+      reason,
+      detail: `nextDueAt=${target.nextDueAt} failureCount=${target.failureCount}`,
+    });
+    return null;
+  }
   const job = refreshJob(target, reason);
-  await writeRefreshJob(env, job);
+  if (!(await reserveRefreshJob(env, target.key, job.id))) {
+    await auditSyncEvent(env, {
+      event: "job_enqueue_skip",
+      targetKey: target.key,
+      status: "reserved",
+      reason,
+    });
+    return null;
+  }
   try {
+    await indexRefreshJob(env, job);
     await auditScheduler(env, {
       event: "job_enqueue",
       targetKey: target.key,
@@ -3956,9 +4447,15 @@ async function enqueueRefreshJob(
       reason,
     });
     if (env.REFRESH_QUEUE) {
-      await env.REFRESH_QUEUE.send(job);
+      await env.REFRESH_QUEUE.send(refreshQueueMessage(job), {
+        delaySeconds,
+      });
     } else {
-      context.waitUntil(processRefreshJob(job, env));
+      context.waitUntil(
+        processRefreshJobFallback(job, env).finally(() =>
+          releaseRefreshJobReservation(env, target.key, job.id),
+        ),
+      );
     }
   } catch (error) {
     const now = new Date().toISOString();
@@ -3969,15 +4466,26 @@ async function enqueueRefreshJob(
       updatedAt: now,
       error: errorMessage(error),
     }).catch(() => undefined);
+    await releaseRefreshJobReservation(env, target.key, job.id).catch(() => undefined);
     throw error;
   }
   return job;
 }
 
-function refreshTargetDue(target: RefreshTarget, cached: DashboardPayload | null): boolean {
+function refreshTargetDue(
+  target: RefreshTarget,
+  cached: DashboardPayload | null,
+  now = Date.now(),
+): boolean {
+  if (refreshTargetBackoffActive(target, now)) return false;
+  if (target.failureCount > 0 && now < safeIso(target.nextDueAt)) return false;
   if (!cached || !canDisplayCached(cached)) return true;
   if (cached.cache?.state === "error" || cached.cache?.progress?.done === false) return true;
-  return Date.now() >= safeIso(target.nextDueAt);
+  return now >= safeIso(target.nextDueAt);
+}
+
+function refreshTargetBackoffActive(target: RefreshTarget, now = Date.now()): boolean {
+  return now < safeIso(target.terminalBackoffUntil ?? "");
 }
 
 function refreshReason(target: RefreshTarget, cached: DashboardPayload | null): string {
@@ -4040,7 +4548,7 @@ async function schedulerTargetDue(
   ) {
     return false;
   }
-  if (!refreshTargetDue(target, cached)) return false;
+  if (!refreshTargetDue(target, cached, options.now)) return false;
   const hasHealthyCache =
     cached &&
     canDisplayCached(cached) &&
@@ -4081,9 +4589,7 @@ async function schedulerTick(
     schedulerDueOptions(env),
   ]);
   const activeTargetKeys = new Set(
-    jobs
-      .filter((job) => job.status === "queued" || job.status === "running")
-      .map((job) => job.targetKey),
+    jobs.filter((job) => refreshJobActive(job)).map((job) => job.targetKey),
   );
   const pairs = await Promise.all(
     targets.map(async (target) => ({ target, cached: await readCached(env, target.key) })),
@@ -4103,8 +4609,11 @@ async function schedulerTick(
         safeIso(a.target.nextDueAt) - safeIso(b.target.nextDueAt),
     );
   const picked = due.slice(0, limit);
+  let enqueued = 0;
   for (const { target, cached } of picked) {
-    await enqueueRefreshJob(env, context, target, refreshReason(target, cached));
+    if (await enqueueRefreshJob(env, context, target, refreshReason(target, cached))) {
+      enqueued += 1;
+    }
   }
   await env.DASHBOARD_CACHE?.put(
     refreshStateKey,
@@ -4113,7 +4622,7 @@ async function schedulerTick(
       cause,
       considered: targets.length,
       due: due.length,
-      enqueued: picked.length,
+      enqueued,
     }),
     { expirationTtl: dashboardStorageTtlSeconds },
   );
@@ -4121,22 +4630,93 @@ async function schedulerTick(
     event: "scheduler_tick",
     status: "ok",
     reason: cause,
-    detail: `considered=${targets.length} active=${activeTargetKeys.size} due=${due.length} enqueued=${picked.length}`,
+    detail: `considered=${targets.length} active=${activeTargetKeys.size} due=${due.length} enqueued=${enqueued}`,
   });
-  return { enqueued: picked.length, considered: targets.length, due: due.length };
+  return { enqueued, considered: targets.length, due: due.length };
 }
 
-async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJob> {
+async function processRefreshJob(
+  input: RefreshJob,
+  env: Env,
+  persistRetryState = true,
+  progressiveBudgetMs = queuedProgressiveBuildBudgetMs,
+): Promise<RefreshJob> {
   const startedAt = Date.now();
-  let job = (await readRefreshJob(env, input.id)) ?? input;
+  const [storedJob, snapshotJob] = await Promise.all([
+    readRefreshJob(env, input.id),
+    input.targetSnapshotKey
+      ? readRefreshJobSnapshot(env, input.targetSnapshotKey)
+      : Promise.resolve(null),
+  ]);
+  let job: RefreshJob = {
+    ...(snapshotJob ?? input),
+    ...storedJob,
+    target: storedJob?.target ?? snapshotJob?.target ?? input.target,
+    targetSnapshotKey:
+      storedJob?.targetSnapshotKey ?? snapshotJob?.targetSnapshotKey ?? input.targetSnapshotKey,
+  };
+  if (job.status === "succeeded" || job.status === "failed" || job.status === "skipped") {
+    return job;
+  }
+  if (!currentDashboardCacheKey(job.targetKey)) {
+    const skipped = {
+      ...job,
+      status: "skipped" as const,
+      finishedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      durationMs: 0,
+      error: "obsolete dashboard schema",
+    };
+    await writeRefreshJob(env, skipped);
+    return skipped;
+  }
+  if (input.targetSnapshotKey && !snapshotJob?.target && !storedJob?.target && !input.target) {
+    const now = new Date().toISOString();
+    const retrying = {
+      ...job,
+      status: "queued" as const,
+      startedAt: null,
+      finishedAt: null,
+      updatedAt: now,
+      attempts: job.attempts + 1,
+      durationMs: null,
+      error: "target snapshot unavailable",
+    };
+    if (persistRetryState) {
+      await writeRefreshJob(env, retrying);
+    }
+    await auditSyncEvent(env, {
+      event: "job_retry",
+      targetKey: retrying.targetKey,
+      jobId: retrying.id,
+      status: "queued",
+      reason: retrying.error,
+    });
+    return retrying;
+  }
+  if (!(await reserveRefreshJob(env, job.targetKey, job.id))) {
+    const skipped = {
+      ...job,
+      status: "skipped" as const,
+      finishedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      durationMs: 0,
+      error: "newer refresh job active",
+    };
+    await writeRefreshJob(env, skipped);
+    return skipped;
+  }
   job = {
     ...job,
     status: "running",
     startedAt: new Date(startedAt).toISOString(),
+    finishedAt: null,
     updatedAt: new Date(startedAt).toISOString(),
     attempts: job.attempts + 1,
+    durationMs: null,
+    error: undefined,
   };
-  await writeRefreshJob(env, job);
+  await writeRefreshJobDelivery(env, job);
   await auditSyncEvent(env, {
     event: "job_start",
     targetKey: job.targetKey,
@@ -4145,7 +4725,11 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
     reason: job.reason,
   });
 
-  const target = await readRefreshTarget(env, job.targetKey);
+  const targetSnapshot = job.target ?? input.target;
+  const storedTarget = await readRefreshTarget(env, job.targetKey);
+  const target = targetSnapshot
+    ? mergeRefreshTargetState(targetSnapshot, storedTarget)
+    : storedTarget;
   if (!target) {
     const skipped = {
       ...job,
@@ -4166,18 +4750,24 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
     return skipped;
   }
 
+  const deadlineController = new AbortController();
+  const deadlineTimer = globalThis.setTimeout(
+    () => deadlineController.abort(),
+    progressiveBudgetMs,
+  );
   try {
     const sources = { owners: target.owners, repos: target.repos };
-    const token = await sourceInstallationToken(env, sources);
+    const token = await sourceInstallationToken(env, sources, {
+      signal: deadlineController.signal,
+    });
     const sharedCooldown = !token && env.GITHUB_TOKEN ? await sharedQuotaCooldown(env) : null;
     if (sharedCooldown?.active) {
       const nextDueAt = sharedQuotaDeferUntil(sharedCooldown);
       const now = new Date().toISOString();
-      await writeRefreshTarget(env, {
-        ...target,
-        lastAttemptAt: now,
+      await mutateRefreshTargetState(env, target, {
+        kind: "defer",
+        at: now,
         nextDueAt,
-        failureCount: target.failureCount,
         message: `shared GitHub quota paused until ${nextDueAt}`,
       });
       const skipped = {
@@ -4204,11 +4794,10 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
     if (await graphqlBackoffActive(env, quotaSource, quotaAccount)) {
       const nextDueAt = githubGraphqlBackoffDeferUntil();
       const now = new Date().toISOString();
-      await writeRefreshTarget(env, {
-        ...target,
-        lastAttemptAt: now,
+      await mutateRefreshTargetState(env, target, {
+        kind: "defer",
+        at: now,
         nextDueAt,
-        failureCount: target.failureCount,
         message: `GitHub GraphQL paused until ${nextDueAt}`,
       });
       const skipped = {
@@ -4232,6 +4821,31 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
     }
 
     const cached = await readCached(env, target.key);
+    const profile = await refreshTargetProfile(env, target, cached);
+    if (profile === undefined) {
+      const now = new Date().toISOString();
+      const retrying = {
+        ...job,
+        status: "queued" as const,
+        startedAt: null,
+        finishedAt: null,
+        updatedAt: now,
+        durationMs: null,
+        error: "profile snapshot unavailable",
+      };
+      if (persistRetryState) {
+        await writeRefreshJob(env, retrying);
+      }
+      await auditSyncEvent(env, {
+        event: "job_retry",
+        targetKey: target.key,
+        jobId: job.id,
+        status: "queued",
+        reason: retrying.error,
+      });
+      return retrying;
+    }
+    const scannedBefore = cached?.cache?.progress?.scanned ?? 0;
     const owners =
       cached?.owners ??
       (await resolveOwners(
@@ -4240,6 +4854,7 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
         token?.token ?? env.GITHUB_TOKEN,
         token?.quotaSource ?? (env.GITHUB_TOKEN ? "shared" : "anonymous"),
         token?.quotaAccount ?? null,
+        deadlineController.signal,
       ));
     if (!owners) {
       throw new Error("owner not found");
@@ -4251,56 +4866,71 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
     const dashboard = dashboardRequest(
       owners,
       target.repos,
-      cached?.profile ?? null,
+      profile,
       target.key,
       url,
       target.includeReleaseData,
       token,
     );
-    const payload = await rebuildWithBuildLock(dashboard, env);
+    const payload = await continueProgressiveBuild(
+      dashboard,
+      env,
+      Math.max(1, progressiveBudgetMs - (Date.now() - startedAt)),
+      deadlineController.signal,
+    );
     const now = new Date().toISOString();
     if (!payload) {
-      const skipped = {
+      const retrying = {
         ...job,
-        status: "skipped" as const,
-        finishedAt: now,
+        status: "queued" as const,
+        startedAt: null,
+        finishedAt: null,
         updatedAt: now,
-        durationMs: Date.now() - startedAt,
+        durationMs: null,
         error: "dashboard locked",
       };
-      await writeRefreshJob(env, skipped);
+      if (persistRetryState) {
+        await writeRefreshJob(env, retrying);
+      }
       await auditSyncEvent(env, {
-        event: "job_skipped",
+        event: "job_retry",
         targetKey: target.key,
         jobId: job.id,
-        status: "skipped",
+        status: "queued",
         reason: "dashboard locked",
       });
-      return skipped;
+      return retrying;
     }
-    await writeRefreshTarget(env, {
-      ...target,
-      lastAttemptAt: now,
-      lastSuccessAt: payload.cache?.progress?.done === false ? target.lastSuccessAt : now,
-      nextDueAt: nextRefreshAt(target, payload.cache?.progress?.done !== false),
-      failureCount: payload.cache?.progress?.done === false ? target.failureCount : 0,
-      message: payload.cache?.message,
-    });
+    const scannedAfter = payload.cache?.progress?.scanned ?? 0;
+    const incomplete = payload.cache?.progress?.done === false;
+    const shouldContinue = incomplete;
+    const retryError = scannedAfter > scannedBefore ? "dashboard incomplete" : "dashboard stalled";
+    if (!shouldContinue) {
+      await mutateRefreshTargetState(env, target, {
+        kind: "success",
+        at: now,
+        message: payload.cache?.message,
+      });
+    }
     const done = {
       ...job,
-      status: "succeeded" as const,
-      finishedAt: now,
+      status: shouldContinue ? ("queued" as const) : ("succeeded" as const),
+      startedAt: shouldContinue ? null : job.startedAt,
+      finishedAt: shouldContinue ? null : now,
       updatedAt: now,
-      durationMs: Date.now() - startedAt,
+      durationMs: shouldContinue ? null : Date.now() - startedAt,
+      error: shouldContinue ? retryError : undefined,
     };
-    await writeRefreshJob(env, done);
-    await auditScheduler(env, {
-      event: "job_done",
+    if (!shouldContinue || persistRetryState) {
+      await writeRefreshJob(env, done);
+    }
+    await auditSyncEvent(env, {
+      event: shouldContinue ? "job_retry" : "job_done",
       targetKey: target.key,
       jobId: job.id,
-      status: "succeeded",
+      status: done.status,
       account: token?.quotaAccount ?? null,
-      durationMs: done.durationMs ?? undefined,
+      durationMs: Date.now() - startedAt,
       projects: payload.projects.length,
       scanned: payload.cache?.progress?.scanned,
       limit: payload.cache?.progress?.limit,
@@ -4311,12 +4941,34 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
   } catch (error) {
     const message = errorMessage(error);
     const now = new Date().toISOString();
-    await writeRefreshTarget(env, {
-      ...target,
-      lastAttemptAt: now,
-      nextDueAt: nextRefreshAt(target, false),
-      failureCount: target.failureCount + 1,
+    if (deadlineController.signal.aborted && isAbortError(error)) {
+      const retrying = {
+        ...job,
+        status: "queued" as const,
+        startedAt: null,
+        finishedAt: null,
+        updatedAt: now,
+        durationMs: null,
+        error: "dashboard deadline reached",
+      };
+      if (persistRetryState) {
+        await writeRefreshJob(env, retrying);
+      }
+      await auditSyncEvent(env, {
+        event: "job_retry",
+        targetKey: target.key,
+        jobId: job.id,
+        status: "queued",
+        reason: retrying.error,
+        durationMs: Date.now() - startedAt,
+      });
+      return retrying;
+    }
+    await mutateRefreshTargetState(env, target, {
+      kind: "failure",
+      at: now,
       message,
+      terminal: false,
     });
     const failed = {
       ...job,
@@ -4327,7 +4979,7 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
       error: message,
     };
     await writeRefreshJob(env, failed);
-    await auditScheduler(env, {
+    await auditSyncEvent(env, {
       event: "job_failed",
       targetKey: target.key,
       jobId: job.id,
@@ -4336,7 +4988,67 @@ async function processRefreshJob(input: RefreshJob, env: Env): Promise<RefreshJo
       durationMs: failed.durationMs ?? undefined,
     });
     return failed;
+  } finally {
+    globalThis.clearTimeout(deadlineTimer);
   }
+}
+
+async function failExhaustedRefreshJob(
+  job: RefreshJob,
+  env: Env,
+  attempts = job.attempts,
+): Promise<RefreshJob> {
+  const now = new Date().toISOString();
+  const failed = {
+    ...job,
+    status: "failed" as const,
+    finishedAt: now,
+    updatedAt: now,
+    attempts: Math.max(job.attempts, attempts),
+    durationMs: null,
+    error: `${job.error ?? "refresh incomplete"} after ${attempts} Queue attempts`,
+  };
+  const target = job.target ?? (await readRefreshTarget(env, job.targetKey));
+  if (target) {
+    await mutateRefreshTargetState(env, target, {
+      kind: "failure",
+      at: now,
+      message: failed.error,
+      terminal: true,
+    }).catch(() => undefined);
+  }
+  await writeRefreshJob(env, failed);
+  await auditSyncEvent(env, {
+    event: "job_failed",
+    targetKey: job.targetKey,
+    jobId: job.id,
+    status: "failed",
+    reason: failed.error,
+  });
+  return failed;
+}
+
+async function processRefreshJobFallback(input: RefreshJob, env: Env): Promise<RefreshJob> {
+  const result = await processRefreshJob(input, env, false, progressiveBuildBudgetMs);
+  if (result.status !== "queued") return result;
+  const now = new Date().toISOString();
+  const failed = {
+    ...result,
+    status: "failed" as const,
+    finishedAt: now,
+    updatedAt: now,
+    durationMs: null,
+    error: `${result.error ?? "refresh incomplete"}; Queue continuation unavailable`,
+  };
+  await writeRefreshJob(env, failed);
+  await auditSyncEvent(env, {
+    event: "job_failed",
+    targetKey: failed.targetKey,
+    jobId: failed.id,
+    status: "failed",
+    reason: failed.error,
+  });
+  return failed;
 }
 
 async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
@@ -4351,10 +5063,9 @@ async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
   ]);
   const state = stateRaw ? tryJsonParse<{ lastTickAt?: string }>(stateRaw, "refresh state") : null;
   const activeTargetKeys = new Set(
-    jobs
-      .filter((job) => job.status === "queued" || job.status === "running")
-      .map((job) => job.targetKey),
+    jobs.filter((job) => refreshJobActive(job)).map((job) => job.targetKey),
   );
+  const activeJobs = jobs.filter((job) => refreshJobActive(job));
   const targetStates = await Promise.all(
     targets.map(async (target) => ({ target, cached: await readCached(env, target.key) })),
   );
@@ -4373,8 +5084,8 @@ async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
     status: {
       targets: targets.length,
       dueTargets,
-      queuedJobs: jobs.filter((job) => job.status === "queued").length,
-      runningJobs: jobs.filter((job) => job.status === "running").length,
+      queuedJobs: activeJobs.filter((job) => job.status === "queued").length,
+      runningJobs: activeJobs.filter((job) => job.status === "running").length,
       failedJobs: jobs.filter((job) => job.status === "failed").length,
       lastTickAt: state?.lastTickAt ?? null,
       nextDueAt:
@@ -4396,23 +5107,204 @@ function progressKey(key: string): string {
   return `progress:v1:${key}`;
 }
 
-async function readProgress(env: Env, key: string): Promise<StoredBuildProgress | null> {
+function progressTombstoneKey(key: string): string {
+  return `progress:tombstone:v1:${key}`;
+}
+
+function isStoredBuildProgress(value: unknown): value is StoredBuildProgress {
+  const progress = value as StoredBuildProgress | null;
+  return Boolean(
+    progress &&
+    Array.isArray(progress.scannedRepos) &&
+    Array.isArray(progress.projects) &&
+    (progress.generationStartedAt === undefined ||
+      (typeof progress.generationStartedAt === "string" &&
+        safeIso(progress.generationStartedAt) > 0)) &&
+    typeof progress.updatedAt === "string" &&
+    safeIso(progress.updatedAt) > 0,
+  );
+}
+
+function isStoredBuildProgressTombstone(value: unknown): value is StoredBuildProgressTombstone {
+  const tombstone = value as StoredBuildProgressTombstone | null;
+  return Boolean(
+    tombstone && typeof tombstone.clearedAt === "string" && safeIso(tombstone.clearedAt),
+  );
+}
+
+function storedBuildProgressExpired(progress: StoredBuildProgress): boolean {
+  return Date.now() - safeIso(progress.updatedAt) > progressTtlSeconds * 1000;
+}
+
+async function readFallbackProgress(
+  env: Env,
+  key: string,
+): Promise<StoredBuildProgress | StoredBuildProgressTombstone | null> {
   const raw = await env.DASHBOARD_CACHE?.get(progressKey(key));
   if (!raw) return null;
-  const parsed = tryJsonParse<StoredBuildProgress>(raw, `progress ${key}`);
-  return parsed && Array.isArray(parsed.scannedRepos) && Array.isArray(parsed.projects)
-    ? parsed
-    : null;
+  const stored = tryJsonParse<unknown>(raw, `progress ${key}`);
+  if (isStoredBuildProgress(stored) || isStoredBuildProgressTombstone(stored)) {
+    return stored;
+  }
+  return null;
+}
+
+async function readProgressTombstone(
+  env: Env,
+  key: string,
+): Promise<StoredBuildProgressTombstone | null> {
+  const raw = await env.DASHBOARD_CACHE?.get(progressTombstoneKey(key));
+  if (!raw) return null;
+  const stored = tryJsonParse<unknown>(raw, `progress tombstone ${key}`);
+  return isStoredBuildProgressTombstone(stored) ? stored : null;
+}
+
+function latestProgressTombstone(
+  fallback: StoredBuildProgress | StoredBuildProgressTombstone | null,
+  tombstone: StoredBuildProgressTombstone | null,
+): StoredBuildProgressTombstone | null {
+  const legacy = isStoredBuildProgressTombstone(fallback) ? fallback : null;
+  if (!legacy) return tombstone;
+  if (!tombstone) return legacy;
+  return safeIso(legacy.clearedAt) >= safeIso(tombstone.clearedAt) ? legacy : tombstone;
+}
+
+function progressCleared(
+  progress: StoredBuildProgress,
+  tombstone: StoredBuildProgressTombstone | null,
+): boolean {
+  const generationStartedAt = progress.generationStartedAt ?? progress.updatedAt;
+  return Boolean(tombstone && safeIso(tombstone.clearedAt) >= safeIso(generationStartedAt));
+}
+
+function progressGenerationStartedAt(
+  tombstone: StoredBuildProgressTombstone | null,
+  now = Date.now(),
+): string {
+  const clearedAt = tombstone ? safeIso(tombstone.clearedAt) : 0;
+  return new Date(
+    clearedAt > 0 && clearedAt <= now ? Math.max(now, clearedAt + 1) : now,
+  ).toISOString();
+}
+
+async function beginProgressGeneration(env: Env, key: string): Promise<string> {
+  return progressGenerationStartedAt(await readProgressTombstone(env, key));
+}
+
+async function durableProgressResponse(
+  env: Env,
+  key: string,
+  pathname: "get" | "put" | "delete",
+  progress?: StoredBuildProgress,
+): Promise<Response | null> {
+  if (!env.DASHBOARD_LOCKS) return null;
+  try {
+    const id = env.DASHBOARD_LOCKS.idFromName(key);
+    return await env.DASHBOARD_LOCKS.get(id).fetch(
+      new Request(`https://releasebar.internal/progress/${pathname}`, {
+        method: "POST",
+        ...(progress ? { body: JSON.stringify(progress) } : {}),
+      }),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function durableProgressSupported(response: Response | null): response is Response {
+  return response?.headers.get("x-releasebar-progress") === "durable";
+}
+
+async function readProgress(env: Env, key: string): Promise<StoredBuildProgress | null> {
+  const [response, fallbackStored, storedTombstone] = await Promise.all([
+    durableProgressResponse(env, key, "get"),
+    readFallbackProgress(env, key),
+    readProgressTombstone(env, key),
+  ]);
+  const durable = durableProgressSupported(response);
+  const fallback = isStoredBuildProgress(fallbackStored) ? fallbackStored : null;
+  const tombstone = latestProgressTombstone(fallbackStored, storedTombstone);
+  let durableProgress: StoredBuildProgress | null = null;
+  if (durable && response.ok) {
+    try {
+      const progress = await response.json();
+      if (isStoredBuildProgress(progress)) {
+        durableProgress = progress;
+      }
+    } catch {
+      durableProgress = null;
+    }
+  }
+
+  const markedFallback = fallback?.durableFallback ? fallback : null;
+  const authoritativeDurable = durable && response.ok;
+  const progress =
+    durableProgress &&
+    (!markedFallback || safeIso(durableProgress.updatedAt) >= safeIso(markedFallback.updatedAt))
+      ? durableProgress
+      : (markedFallback ?? (!authoritativeDurable ? fallback : null));
+  if (!progress) return null;
+  if (progressCleared(progress, tombstone)) {
+    if (progress === durableProgress) {
+      await durableProgressResponse(env, key, "delete");
+    }
+    return null;
+  }
+  if (storedBuildProgressExpired(progress)) {
+    if (progress === durableProgress) {
+      await durableProgressResponse(env, key, "delete");
+    }
+    await env.DASHBOARD_CACHE?.delete?.(progressKey(key));
+    return null;
+  }
+  return progress;
 }
 
 async function writeProgress(env: Env, key: string, progress: StoredBuildProgress): Promise<void> {
-  await env.DASHBOARD_CACHE?.put(progressKey(key), JSON.stringify(progress), {
-    expirationTtl: progressTtlSeconds,
-  });
+  const tombstone = await readProgressTombstone(env, key);
+  if (progressCleared(progress, tombstone)) return;
+  const response = await durableProgressResponse(env, key, "put", progress);
+  if (durableProgressSupported(response) && response.ok) {
+    await env.DASHBOARD_CACHE?.delete?.(progressKey(key)).catch(() => undefined);
+    return;
+  }
+  await env.DASHBOARD_CACHE?.put(
+    progressKey(key),
+    JSON.stringify({ ...progress, durableFallback: true } satisfies StoredBuildProgress),
+    {
+      expirationTtl: progressTtlSeconds,
+    },
+  );
 }
 
-async function deleteProgress(env: Env, key: string): Promise<void> {
-  await env.DASHBOARD_CACHE?.delete?.(progressKey(key));
+async function writeProgressTombstone(
+  env: Env,
+  key: string,
+): Promise<StoredBuildProgressTombstone> {
+  const tombstone = {
+    clearedAt: new Date().toISOString(),
+  } satisfies StoredBuildProgressTombstone;
+  await env.DASHBOARD_CACHE?.put(progressTombstoneKey(key), JSON.stringify(tombstone), {
+    expirationTtl: progressTtlSeconds,
+  });
+  return tombstone;
+}
+
+async function deleteProgress(env: Env, key: string): Promise<StoredBuildProgressTombstone> {
+  if (env.DASHBOARD_LOCKS) {
+    const response = await durableProgressResponse(env, key, "delete");
+    if (!response) {
+      return writeProgressTombstone(env, key);
+    }
+    if (response.headers.get("x-releasebar-progress") === "durable") {
+      if (!response.ok) {
+        return writeProgressTombstone(env, key);
+      }
+    } else if (!response.ok && response.status !== 404 && response.status !== 405) {
+      return writeProgressTombstone(env, key);
+    }
+  }
+  return writeProgressTombstone(env, key);
 }
 
 function projectActivityDate(project: Project): string | null {
@@ -4432,7 +5324,7 @@ function hotScore(project: Project): number {
   const activityDays = daysSince(projectActivityDate(project));
   const recency =
     activityDays === null ? 0 : (Math.max(0, 30 - Math.min(activityDays, 30)) / 30) * 20;
-  const prs = Math.log1p(project.openPullRequests) * 2;
+  const prs = Math.log1p(project.openPullRequests ?? 0) * 2;
   const ci = project.ciState === "failure" ? 15 : project.ciState === "running" ? 5 : 0;
   return commits * 4 + stars + recency + prs + ci;
 }
@@ -9283,11 +10175,28 @@ async function ownerEventsResponse(request: Request, env: Env): Promise<Response
 }
 
 async function acquireBuildLock(env: Env, key: string): Promise<BuildLock | null> {
-  if (!env.DASHBOARD_LOCKS) {
+  const acquireLocal = (): BuildLock | null => {
+    const now = Date.now();
+    const existing = localBuildLocks.get(key);
+    if (existing && existing.expiresAt > now) return null;
+    const token = randomNonce();
+    localBuildLocks.set(key, { token, expiresAt: now + buildLockTtlMs });
     return {
-      refresh: async () => undefined,
-      release: async () => undefined,
+      refresh: async () => {
+        const current = localBuildLocks.get(key);
+        if (current?.token === token) {
+          localBuildLocks.set(key, { token, expiresAt: Date.now() + buildLockTtlMs });
+        }
+      },
+      release: async () => {
+        if (localBuildLocks.get(key)?.token === token) {
+          localBuildLocks.delete(key);
+        }
+      },
     };
+  };
+  if (!env.DASHBOARD_LOCKS) {
+    return acquireLocal();
   }
 
   try {
@@ -9304,10 +10213,7 @@ async function acquireBuildLock(env: Env, key: string): Promise<BuildLock | null
       return null;
     }
     if (!response.ok) {
-      return {
-        refresh: async () => undefined,
-        release: async () => undefined,
-      };
+      return acquireLocal();
     }
     const sendToken = (pathname: string) =>
       stub.fetch(
@@ -9325,70 +10231,69 @@ async function acquireBuildLock(env: Env, key: string): Promise<BuildLock | null
       },
     };
   } catch {
-    return {
-      refresh: async () => undefined,
-      release: async () => undefined,
-    };
+    return acquireLocal();
   }
 }
 
-async function rebuild(dashboard: DashboardRequest, env: Env): Promise<DashboardPayload> {
-  const existing = locks.get(dashboard.key);
-  if (existing) {
-    await auditSyncEvent(env, {
-      event: "dashboard_build_join",
-      targetKey: dashboard.key,
-      status: "running",
-      source: "in-memory-lock",
-    });
-    return existing;
-  }
-
-  const promise = (async () => {
-    const startedAt = Date.now();
-    const storedProgress = await readProgress(env, dashboard.key);
-    await auditSyncEvent(env, {
-      event: "dashboard_build_start",
-      targetKey: dashboard.key,
-      status: "running",
-      source:
-        dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
-      projects: storedProgress?.projects.length ?? 0,
-      scanned: storedProgress?.scannedRepos.length ?? 0,
-      detail: storedProgress
-        ? `resume scanned=${storedProgress.scannedRepos.length} projects=${storedProgress.projects.length}`
-        : "fresh build",
-    });
-    const scannedRepos = new Set(storedProgress?.scannedRepos ?? []);
-    const progressProjects = storedProgress?.projects ?? [];
-    let lastProgressWriteAt = 0;
-    const saveProgress = async (
-      payload: DashboardPayload,
-      progress: {
-        scannedRepo: string;
-        scanned: number;
-        done: boolean;
-        phase: "metadata" | "hydrate" | "complete";
-      },
-    ) => {
-      const scannedRepo = progress.scannedRepo;
-      if (scannedRepo) {
-        scannedRepos.add(scannedRepo.toLowerCase());
-      }
-      const done = payload.cache?.progress?.done !== false;
-      const now = Date.now();
-      if (!done && now - lastProgressWriteAt < progressWriteIntervalMs) {
-        return;
-      }
-      lastProgressWriteAt = now;
-      const profiled = withProfile(payload, dashboard.profile);
-      await writeCached(env, dashboard.key, profiled);
-      await writeProgress(env, dashboard.key, {
-        scannedRepos: [...scannedRepos],
-        projects: profiled.projects,
-        updatedAt: profiled.generatedAt,
-      });
-      await auditSyncEvent(env, {
+async function rebuild(
+  dashboard: DashboardRequest,
+  env: Env,
+  signal?: AbortSignal,
+): Promise<DashboardPayload> {
+  const startedAt = Date.now();
+  const [storedProgress, generationStartedAt] = await Promise.all([
+    readProgress(env, dashboard.key),
+    beginProgressGeneration(env, dashboard.key),
+  ]);
+  await auditSyncEvent(env, {
+    event: "dashboard_build_start",
+    targetKey: dashboard.key,
+    status: "running",
+    source: dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
+    projects: storedProgress?.projects.length ?? 0,
+    scanned: storedProgress?.scannedRepos.length ?? 0,
+    detail: storedProgress
+      ? `resume scanned=${storedProgress.scannedRepos.length} projects=${storedProgress.projects.length}`
+      : "fresh build",
+  });
+  const scannedRepos = new Set(storedProgress?.scannedRepos ?? []);
+  const progressProjects = storedProgress?.projects ?? [];
+  let lastProgressWriteAt = 0;
+  const saveProgress = async (
+    payload: DashboardPayload,
+    progress: {
+      scannedRepo: string;
+      scanned: number;
+      done: boolean;
+      phase: "metadata" | "hydrate" | "complete";
+      removedRepos?: string[];
+    },
+  ) => {
+    for (const removedRepo of progress.removedRepos ?? []) {
+      scannedRepos.delete(removedRepo.toLowerCase());
+    }
+    const scannedRepo = progress.scannedRepo;
+    if (scannedRepo) {
+      scannedRepos.add(scannedRepo.toLowerCase());
+    }
+    const done = payload.cache?.progress?.done !== false;
+    const now = Date.now();
+    if (!done && now - lastProgressWriteAt < progressWriteIntervalMs) {
+      return;
+    }
+    lastProgressWriteAt = now;
+    const profiled = withProfile(payload, dashboard.profile);
+    const stored: StoredBuildProgress = {
+      scannedRepos: [...scannedRepos],
+      projects: profiled.projects,
+      generationStartedAt,
+      updatedAt: profiled.generatedAt,
+    };
+    await Promise.all([
+      ...(!done
+        ? [writeCached(env, dashboard.key, profiled), writeProgress(env, dashboard.key, stored)]
+        : []),
+      auditSyncEvent(env, {
         event: "dashboard_progress_write",
         targetKey: dashboard.key,
         status: done ? "fresh" : "partial",
@@ -9398,85 +10303,87 @@ async function rebuild(dashboard: DashboardRequest, env: Env): Promise<Dashboard
         limit: payload.cache?.progress?.limit,
         done,
         detail: dashboardSyncDetail(profiled, scannedRepo ? `repo=${scannedRepo}` : ""),
-      });
-    };
-    try {
-      const payload = await buildDashboard({
-        title: "ReleaseBar",
-        subtitle: dashboard.subtitle,
-        canonicalDomain: env.RELEASEDECK_CANONICAL_DOMAIN ?? "release.bar",
-        owners: dashboard.owners,
-        includeRepos: dashboard.includeRepos,
-        excludeRepos: dashboard.profile?.hiddenRepos,
-        ...optionsFromUrl(dashboard.url),
-        repoLimit,
-        repoScanLimit: repoScanBatchSize,
-        repoScanTarget: repoLimit,
-        initialProjects: progressProjects,
-        skipRepos: [...scannedRepos],
-        token: dashboard.token ?? env.GITHUB_TOKEN,
-        includeReleaseData: dashboard.includeReleaseData,
-        hydrateSort: dashboard.hydrateSort,
-        hydrateDirection: dashboard.hydrateDirection,
-        quotaSource:
-          dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
-        quotaAccount: dashboard.quotaAccount ?? null,
-        fetch: auditGitHubFetch(
-          "dashboard",
-          dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
-          dashboard.quotaAccount ?? null,
-          env,
-        ),
-        projectCache: env.DASHBOARD_CACHE,
-        onProgress: (partial, progress) => saveProgress(partial, progress),
-      });
-      const profiled = withProfile(payload, dashboard.profile);
-      await writeCached(env, dashboard.key, profiled);
-      if (profiled.cache?.progress?.done === false) {
-        await writeProgress(env, dashboard.key, {
+      }),
+    ]);
+  };
+  try {
+    const payload = await buildDashboard({
+      title: "ReleaseBar",
+      subtitle: dashboard.subtitle,
+      canonicalDomain: env.RELEASEDECK_CANONICAL_DOMAIN ?? "release.bar",
+      owners: dashboard.owners,
+      includeRepos: dashboard.includeRepos,
+      excludeRepos: dashboard.profile?.hiddenRepos,
+      ...optionsFromUrl(dashboard.url),
+      repoLimit,
+      repoScanLimit: repoScanBatchSize,
+      repoScanTarget: repoLimit,
+      initialProjects: progressProjects,
+      skipRepos: [...scannedRepos],
+      token: dashboard.token ?? env.GITHUB_TOKEN,
+      includeReleaseData: dashboard.includeReleaseData,
+      hydrateSort: dashboard.hydrateSort,
+      hydrateDirection: dashboard.hydrateDirection,
+      quotaSource:
+        dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
+      quotaAccount: dashboard.quotaAccount ?? null,
+      fetch: auditGitHubFetch(
+        "dashboard",
+        dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
+        dashboard.quotaAccount ?? null,
+        env,
+        undefined,
+        signal,
+      ),
+      projectCache: env.DASHBOARD_CACHE,
+      onProgress: (partial, progress) => saveProgress(partial, progress),
+    });
+    const profiled = withProfile(payload, dashboard.profile);
+    if (profiled.cache?.progress?.done === false) {
+      await Promise.all([
+        writeCached(env, dashboard.key, profiled),
+        writeProgress(env, dashboard.key, {
           scannedRepos: [...scannedRepos],
           projects: profiled.projects,
+          generationStartedAt,
           updatedAt: profiled.generatedAt,
-        });
-      } else {
-        await deleteProgress(env, dashboard.key);
-        await rememberHotDashboard(env, dashboard.key, profiled);
-      }
-      await auditSyncEvent(env, {
-        event: "dashboard_build_done",
-        targetKey: dashboard.key,
-        status: profiled.cache?.progress?.done === false ? "partial" : "fresh",
-        durationMs: Date.now() - startedAt,
-        projects: profiled.projects.length,
-        scanned: profiled.cache?.progress?.scanned,
-        limit: profiled.cache?.progress?.limit,
-        done: profiled.cache?.progress?.done,
-        detail: dashboardSyncDetail(profiled),
-      });
-      return profiled;
-    } catch (error) {
-      await auditSyncEvent(env, {
-        event: "dashboard_build_failed",
-        targetKey: dashboard.key,
-        status: "failed",
-        durationMs: Date.now() - startedAt,
-        reason: dashboardErrorMessage(error),
-      });
-      throw error;
+        }),
+      ]);
+    } else {
+      await deleteProgress(env, dashboard.key);
+      await Promise.all([
+        writeCached(env, dashboard.key, profiled),
+        rememberHotDashboard(env, dashboard.key, profiled),
+      ]);
     }
-  })();
-
-  locks.set(dashboard.key, promise);
-  try {
-    return await promise;
-  } finally {
-    locks.delete(dashboard.key);
+    await auditSyncEvent(env, {
+      event: "dashboard_build_done",
+      targetKey: dashboard.key,
+      status: profiled.cache?.progress?.done === false ? "partial" : "fresh",
+      durationMs: Date.now() - startedAt,
+      projects: profiled.projects.length,
+      scanned: profiled.cache?.progress?.scanned,
+      limit: profiled.cache?.progress?.limit,
+      done: profiled.cache?.progress?.done,
+      detail: dashboardSyncDetail(profiled),
+    });
+    return profiled;
+  } catch (error) {
+    await auditSyncEvent(env, {
+      event: isAbortError(error) ? "dashboard_build_aborted" : "dashboard_build_failed",
+      targetKey: dashboard.key,
+      status: isAbortError(error) ? "aborted" : "failed",
+      durationMs: Date.now() - startedAt,
+      reason: dashboardErrorMessage(error),
+    });
+    throw error;
   }
 }
 
 async function rebuildWithBuildLock(
   dashboard: DashboardRequest,
   env: Env,
+  signal?: AbortSignal,
 ): Promise<DashboardPayload | null> {
   const lock = await acquireBuildLock(env, dashboard.key);
   if (!lock) {
@@ -9493,7 +10400,7 @@ async function rebuildWithBuildLock(
     void lock.refresh();
   }, buildLockRefreshMs);
   try {
-    return await rebuild(dashboard, env);
+    return await rebuild(dashboard, env, signal);
   } finally {
     globalThis.clearInterval(refresh);
     await lock.release();
@@ -9526,40 +10433,110 @@ async function progressiveBuildPausedForSharedQuota(
   return true;
 }
 
-async function continueProgressiveBuild(dashboard: DashboardRequest, env: Env): Promise<void> {
-  if (await progressiveBuildPausedForSharedQuota(dashboard, env)) return;
+async function continueProgressiveBuild(
+  dashboard: DashboardRequest,
+  env: Env,
+  budgetMs = progressiveBuildBudgetMs,
+  externalSignal?: AbortSignal,
+): Promise<DashboardPayload | null> {
+  if (await progressiveBuildPausedForSharedQuota(dashboard, env)) return null;
   const startedAt = Date.now();
+  const deadlineController = externalSignal ? null : new AbortController();
+  const signal = externalSignal ?? deadlineController!.signal;
+  const deadlineTimer = deadlineController
+    ? globalThis.setTimeout(() => deadlineController.abort(), budgetMs)
+    : null;
   await auditSyncEvent(env, {
     event: "dashboard_progressive_start",
     targetKey: dashboard.key,
     status: "running",
-    detail: `budgetMs=${progressiveBuildBudgetMs}`,
+    detail: `budgetMs=${budgetMs}`,
   });
-  let payload = await rebuildWithBuildLock(dashboard, env);
-  while (
-    payload?.cache?.progress?.done === false &&
-    Date.now() - startedAt < progressiveBuildBudgetMs
-  ) {
-    if (await progressiveBuildPausedForSharedQuota(dashboard, env)) break;
-    payload = await rebuildWithBuildLock(dashboard, env);
+  try {
+    let previousScanned = (await readProgress(env, dashboard.key))?.scannedRepos.length ?? 0;
+    let payload = await rebuildWithBuildLock(dashboard, env, signal);
+    while (
+      payload?.cache?.progress?.done === false &&
+      !signal.aborted &&
+      Date.now() - startedAt < budgetMs
+    ) {
+      const scanned = payload.cache?.progress?.scanned ?? 0;
+      if (scanned <= previousScanned) break;
+      previousScanned = scanned;
+      if (await progressiveBuildPausedForSharedQuota(dashboard, env)) break;
+      const next = await rebuildWithBuildLock(dashboard, env, signal);
+      if (!next) {
+        payload = null;
+        break;
+      }
+      payload = next;
+    }
+    await auditSyncEvent(env, {
+      event: "dashboard_progressive_done",
+      targetKey: dashboard.key,
+      status:
+        payload?.cache?.progress?.done === false ? "partial" : (payload?.cache?.state ?? "done"),
+      durationMs: Date.now() - startedAt,
+      projects: payload?.projects.length ?? 0,
+      scanned: payload?.cache?.progress?.scanned,
+      limit: payload?.cache?.progress?.limit,
+      done: payload?.cache?.progress?.done,
+      detail: dashboardSyncDetail(payload),
+    });
+    return payload;
+  } finally {
+    if (deadlineTimer !== null) {
+      globalThis.clearTimeout(deadlineTimer);
+    }
   }
-  await auditSyncEvent(env, {
-    event: "dashboard_progressive_done",
-    targetKey: dashboard.key,
-    status:
-      payload?.cache?.progress?.done === false ? "partial" : (payload?.cache?.state ?? "done"),
-    durationMs: Date.now() - startedAt,
-    projects: payload?.projects.length ?? 0,
-    scanned: payload?.cache?.progress?.scanned,
-    limit: payload?.cache?.progress?.limit,
-    done: payload?.cache?.progress?.done,
-    detail: dashboardSyncDetail(payload),
-  });
+}
+
+function scheduleProgressiveBuild(
+  dashboard: DashboardRequest,
+  env: Env,
+  context: ExecutionContext,
+  reason: string,
+  target: RefreshTarget | null,
+  initialBuild?: Promise<DashboardPayload | null>,
+  queueDelaySeconds = refreshQueueDeliveryDelaySeconds,
+): void {
+  const task = env.REFRESH_QUEUE
+    ? (async () => {
+        if (!target) {
+          await auditSyncEvent(env, {
+            event: "dashboard_refresh_schedule_failed",
+            targetKey: dashboard.key,
+            status: "missing-target",
+            reason,
+          });
+          return;
+        }
+        await enqueueRefreshJob(env, context, target, reason, queueDelaySeconds);
+      })()
+    : initialBuild
+      ? initialBuild.then((payload) =>
+          payload && payload.cache?.progress?.done !== false
+            ? payload
+            : continueProgressiveBuild(dashboard, env, progressiveBuildBudgetMs),
+        )
+      : continueProgressiveBuild(dashboard, env, progressiveBuildBudgetMs);
+  context.waitUntil(
+    task.catch((error) =>
+      auditSyncEvent(env, {
+        event: "dashboard_refresh_schedule_failed",
+        targetKey: dashboard.key,
+        status: "failed",
+        reason: errorMessage(error),
+      }),
+    ),
+  );
 }
 
 async function refreshDashboardMetadataFirst(
   dashboard: DashboardRequest,
   env: Env,
+  signal?: AbortSignal,
+  resetProgress = false,
 ): Promise<DashboardPayload | null> {
   const lock = await acquireBuildLock(env, dashboard.key);
   if (!lock) {
@@ -9576,14 +10553,30 @@ async function refreshDashboardMetadataFirst(
     void lock.refresh();
   }, buildLockRefreshMs);
   const startedAt = Date.now();
-  await deleteProgress(env, dashboard.key);
-  await auditSyncEvent(env, {
-    event: "dashboard_manual_refresh_start",
-    targetKey: dashboard.key,
-    status: "running",
-    detail: "phase=metadata",
-  });
   try {
+    const storedProgress = resetProgress ? null : await readProgress(env, dashboard.key);
+    if (storedProgress) {
+      const resumed = dashboardPayloadFromProgress(dashboard, env, storedProgress);
+      await auditSyncEvent(env, {
+        event: "dashboard_manual_refresh_resume",
+        targetKey: dashboard.key,
+        status: "partial",
+        projects: resumed.projects.length,
+        scanned: resumed.cache?.progress?.scanned,
+        limit: resumed.cache?.progress?.limit,
+        done: resumed.cache?.progress?.done,
+        detail: "phase=metadata source=checkpoint",
+      });
+      return resumed;
+    }
+    const tombstone = await deleteProgress(env, dashboard.key);
+    const generationStartedAt = progressGenerationStartedAt(tombstone);
+    await auditSyncEvent(env, {
+      event: "dashboard_manual_refresh_start",
+      targetKey: dashboard.key,
+      status: "running",
+      detail: "phase=metadata",
+    });
     const payload = await buildDashboard({
       title: "ReleaseBar",
       subtitle: dashboard.subtitle,
@@ -9607,6 +10600,8 @@ async function refreshDashboardMetadataFirst(
         dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
         dashboard.quotaAccount ?? null,
         env,
+        undefined,
+        signal,
       ),
       projectCache: env.DASHBOARD_CACHE,
     });
@@ -9623,6 +10618,7 @@ async function refreshDashboardMetadataFirst(
     await writeProgress(env, dashboard.key, {
       scannedRepos: [],
       projects: profiled.projects,
+      generationStartedAt,
       updatedAt: profiled.generatedAt,
     });
     await auditSyncEvent(env, {
@@ -9641,6 +10637,42 @@ async function refreshDashboardMetadataFirst(
     globalThis.clearInterval(refresh);
     await lock.release();
   }
+}
+
+function dashboardPayloadFromProgress(
+  dashboard: DashboardRequest,
+  env: Env,
+  progress: StoredBuildProgress,
+): DashboardPayload {
+  const generatedAt = progress.updatedAt;
+  return withProfile(
+    {
+      ...statusPayload(
+        dashboard,
+        env,
+        "partial",
+        "release data update resumed from checkpoint",
+        generatedAt,
+      ),
+      cache: {
+        state: "partial",
+        stale: true,
+        capped: false,
+        repoLimit,
+        generatedAt,
+        quota: quotaForDashboard(dashboard, env),
+        progress: {
+          scanned: progress.scannedRepos.length,
+          limit: repoLimit,
+          done: false,
+        },
+        message: "release data update resumed from checkpoint",
+      },
+      totals: dashboardTotals(progress.projects),
+      projects: progress.projects,
+    },
+    dashboard.profile,
+  );
 }
 
 function errorPayload(dashboard: DashboardRequest, env: Env, message: string): DashboardPayload {
@@ -9674,15 +10706,6 @@ function rebuildingPayload(dashboard: DashboardRequest, env: Env): DashboardPayl
     "rebuilding",
     "dashboard build queued",
     new Date().toISOString(),
-  );
-}
-
-function cacheBuildError(dashboard: DashboardRequest, env: Env, error: unknown): Promise<void> {
-  return writeCached(
-    env,
-    dashboard.key,
-    errorPayload(dashboard, env, dashboardErrorMessage(error)),
-    5 * 60,
   );
 }
 
@@ -9899,9 +10922,24 @@ async function ownerResponse(
       ? [primaryOwner, ...extraOwnerSlugs]
       : extraOwnerSlugs;
   const tokenSources = { owners: ownerSlugs, repos: includeRepos };
-  const [token, sourceAppCovered] = allowRefresh
-    ? [await bestInstallationToken(request, env, tokenSources).catch(() => null), false]
-    : [null, await sourceInstallationRegistryCovers(env, tokenSources).catch(() => false)];
+  const coldBuildStartedAt = allowRefresh && env.REFRESH_QUEUE ? Date.now() : null;
+  const credentialController = coldBuildStartedAt === null ? null : new AbortController();
+  const credentialTimer = credentialController
+    ? globalThis.setTimeout(() => credentialController.abort(), coldBuildWaitMs)
+    : undefined;
+  let token: RequestToken | null = null;
+  if (allowRefresh) {
+    token = await bestInstallationToken(request, env, tokenSources, {
+      signal: credentialController?.signal,
+    }).catch(() => null);
+  }
+  if (credentialTimer) {
+    globalThis.clearTimeout(credentialTimer);
+  }
+  const sourceAppCovered =
+    !allowRefresh || credentialController?.signal.aborted
+      ? await sourceInstallationRegistryCovers(env, tokenSources).catch(() => false)
+      : false;
   const includeReleaseData = await dashboardReleaseDataAllowed(request, env, tokenSources, token, {
     sourceAppCovered,
   });
@@ -9914,17 +10952,18 @@ async function ownerResponse(
     includeReleaseData,
     schemaVersion: dashboardSchemaVersion,
   });
-  if (allowRefresh) {
-    await rememberRefreshTarget(env, {
-      key,
-      owner: primaryOwner ?? "custom",
-      owners: ownerSlugs,
-      repos: includeRepos,
-      includeReleaseData,
-      path: `${url.pathname}${url.search}`,
-      priority: primaryOwner ? 100 : 60,
-    });
-  }
+  const refreshTarget = allowRefresh
+    ? await rememberRefreshTarget(env, {
+        key,
+        owner: primaryOwner ?? "custom",
+        owners: ownerSlugs,
+        repos: includeRepos,
+        profile,
+        includeReleaseData,
+        path: `${url.pathname}${url.search}`,
+        priority: primaryOwner ? 100 : 60,
+      })
+    : null;
   const cached = await readCached(env, key);
   const ageMs = cacheAgeMs(cached);
   const displayCached = canDisplayCached(cached);
@@ -10003,16 +11042,7 @@ async function ownerResponse(
     );
     if (!options.includeUnreleased) {
       await markManualRefreshCooldown(env, key);
-      const build = rebuildWithBuildLock(dashboard, env);
-      context.waitUntil(
-        build
-          .then((built) =>
-            built?.cache?.progress?.done === false
-              ? continueProgressiveBuild(dashboard, env)
-              : undefined,
-          )
-          .catch((error) => cacheBuildError(dashboard, env, error)),
-      );
+      scheduleProgressiveBuild(dashboard, env, context, "manual-refresh", refreshTarget);
       if (displayCached) {
         return jsonResponse(
           withCacheState(cached, "stale", "manual refresh started; release data updating"),
@@ -10031,7 +11061,7 @@ async function ownerResponse(
 
     let payload: DashboardPayload | null;
     try {
-      payload = await refreshDashboardMetadataFirst(dashboard, env);
+      payload = await refreshDashboardMetadataFirst(dashboard, env, undefined, true);
     } catch (error) {
       const failed = errorPayload(dashboard, env, dashboardErrorMessage(error));
       if (!displayCached) {
@@ -10044,11 +11074,7 @@ async function ownerResponse(
     }
     if (payload) {
       await markManualRefreshCooldown(env, key);
-      context.waitUntil(
-        continueProgressiveBuild(dashboard, env).catch((error) =>
-          cacheBuildError(dashboard, env, error),
-        ),
-      );
+      scheduleProgressiveBuild(dashboard, env, context, "manual-refresh", refreshTarget);
       return jsonResponse(payload, 202, { "cache-control": "no-store", ...corsHeaders });
     }
     if (displayCached) {
@@ -10076,12 +11102,8 @@ async function ownerResponse(
       includeReleaseData,
       token,
     );
-    if (allowRefresh) {
-      context.waitUntil(
-        rebuildWithBuildLock(dashboard, env).catch((error) =>
-          cacheBuildError(dashboard, env, error),
-        ),
-      );
+    if (allowRefresh && (!refreshTarget || !refreshTargetBackoffActive(refreshTarget))) {
+      scheduleProgressiveBuild(dashboard, env, context, "error-cache", refreshTarget);
       auditDashboardSync(context, env, {
         event: "dashboard_refresh_schedule",
         targetKey: key,
@@ -10089,6 +11111,15 @@ async function ownerResponse(
         reason: "error-cache",
         projects: cached.projects.length,
         detail: dashboardSyncDetail(cached),
+      });
+    } else if (allowRefresh && refreshTarget) {
+      auditDashboardSync(context, env, {
+        event: "dashboard_refresh_schedule",
+        targetKey: key,
+        status: "backoff",
+        reason: "error-cache",
+        projects: cached.projects.length,
+        detail: `nextDueAt=${refreshTarget.nextDueAt} failureCount=${refreshTarget.failureCount}`,
       });
     }
     return jsonResponse(cached, errorStatus(cached.cache.message ?? ""), {
@@ -10110,8 +11141,14 @@ async function ownerResponse(
       token,
     );
     const state = cached.cache?.progress?.done === false ? "partial" : "stale";
-    if (allowRefresh) {
-      context.waitUntil(continueProgressiveBuild(dashboard, env).catch(() => undefined));
+    if (allowRefresh && (!refreshTarget || !refreshTargetBackoffActive(refreshTarget))) {
+      scheduleProgressiveBuild(
+        dashboard,
+        env,
+        context,
+        state === "partial" ? "partial-cache" : "stale-cache",
+        refreshTarget,
+      );
       auditDashboardSync(context, env, {
         event: "dashboard_refresh_schedule",
         targetKey: key,
@@ -10122,6 +11159,18 @@ async function ownerResponse(
         limit: cached.cache?.progress?.limit,
         done: cached.cache?.progress?.done,
         detail: dashboardSyncDetail(cached),
+      });
+    } else if (allowRefresh && refreshTarget) {
+      auditDashboardSync(context, env, {
+        event: "dashboard_refresh_schedule",
+        targetKey: key,
+        status: "backoff",
+        reason: state === "partial" ? "partial-cache" : "stale-cache",
+        projects: cached.projects.length,
+        scanned: cached.cache?.progress?.scanned,
+        limit: cached.cache?.progress?.limit,
+        done: cached.cache?.progress?.done,
+        detail: `nextDueAt=${refreshTarget.nextDueAt} failureCount=${refreshTarget.failureCount}`,
       });
     }
     return jsonResponse(withCacheState(cached, state), 200, {
@@ -10152,6 +11201,53 @@ async function ownerResponse(
     );
   }
 
+  if (refreshTarget && refreshTargetBackoffActive(refreshTarget)) {
+    const dashboard = unresolvedDashboardRequest(
+      ownerSlugs,
+      includeRepos,
+      profile,
+      key,
+      url,
+      includeReleaseData,
+      token,
+    );
+    const message = `refresh paused after repeated failures; retry scheduled ${refreshTarget.nextDueAt}`;
+    const storedProgress = await readProgress(env, key);
+    const payload = storedProgress
+      ? withCacheState(
+          dashboardPayloadFromProgress(dashboard, env, storedProgress),
+          "partial",
+          message,
+        )
+      : statusPayload(dashboard, env, "rebuilding", message, new Date().toISOString());
+    auditDashboardSync(context, env, {
+      event: "dashboard_response",
+      targetKey: key,
+      status: "backoff",
+      reason: "refresh-target",
+      projects: payload.projects.length,
+      scanned: payload.cache?.progress?.scanned,
+      limit: payload.cache?.progress?.limit,
+      done: payload.cache?.progress?.done,
+      detail: `nextDueAt=${refreshTarget.nextDueAt} failureCount=${refreshTarget.failureCount}`,
+    });
+    return jsonResponse(payload, storedProgress ? 200 : 202, {
+      "cache-control": "no-store",
+    });
+  }
+
+  const coldBuildController = env.REFRESH_QUEUE ? new AbortController() : null;
+  const coldBuildRemainingMs =
+    coldBuildStartedAt === null
+      ? coldBuildWaitMs
+      : Math.max(0, coldBuildWaitMs - (Date.now() - coldBuildStartedAt));
+  let coldWaitTimer: ReturnType<typeof setTimeout> | undefined;
+  const coldDeadline = new Promise<typeof buildPending>((resolve) => {
+    coldWaitTimer = setTimeout(() => {
+      coldBuildController?.abort();
+      resolve(buildPending);
+    }, coldBuildRemainingMs);
+  });
   let owners: Owner[] | null;
   try {
     owners = await resolveOwners(
@@ -10160,8 +11256,41 @@ async function ownerResponse(
       token?.token,
       token?.quotaSource,
       token?.quotaAccount ?? null,
+      coldBuildController?.signal,
     );
   } catch (error) {
+    if (coldWaitTimer) {
+      clearTimeout(coldWaitTimer);
+    }
+    if (coldBuildController && isAbortError(error)) {
+      const dashboard = unresolvedDashboardRequest(
+        ownerSlugs,
+        includeRepos,
+        profile,
+        key,
+        url,
+        includeReleaseData,
+        token,
+      );
+      auditDashboardSync(context, env, {
+        event: "dashboard_cold_wait_timeout",
+        targetKey: key,
+        status: "queued",
+        reason: "cold-owner",
+        detail: `waitMs=${coldBuildWaitMs} phase=owner`,
+      });
+      scheduleProgressiveBuild(
+        dashboard,
+        env,
+        context,
+        options.includeUnreleased && includeReleaseData ? "cold-metadata" : "cold-build",
+        refreshTarget,
+      );
+      const partial = await partialDashboardPayload(dashboard, env, ownerSlugs);
+      return jsonResponse(partial ?? rebuildingPayload(dashboard, env), partial ? 200 : 202, {
+        "cache-control": "no-store",
+      });
+    }
     const dashboard = unresolvedDashboardRequest(
       ownerSlugs,
       includeRepos,
@@ -10176,6 +11305,9 @@ async function ownerResponse(
     return jsonResponse(payload, errorStatus(error), retryAfterHeaders(error));
   }
   if (!owners) {
+    if (coldWaitTimer) {
+      clearTimeout(coldWaitTimer);
+    }
     return jsonResponse({ error: "owner not found" }, 404, {
       "cache-control": "no-store",
     });
@@ -10190,15 +11322,13 @@ async function ownerResponse(
     includeReleaseData,
     token,
   );
-  const build = rebuildWithBuildLock(dashboard, env);
-  let coldWaitTimer: ReturnType<typeof setTimeout> | undefined;
+  const metadataFirst = options.includeUnreleased && dashboard.includeReleaseData;
+  const build = metadataFirst
+    ? refreshDashboardMetadataFirst(dashboard, env, coldBuildController?.signal)
+    : rebuildWithBuildLock(dashboard, env, coldBuildController?.signal);
+  const buildReason = metadataFirst ? "cold-metadata" : "cold-build";
   try {
-    const payload = await Promise.race([
-      build,
-      new Promise<typeof buildPending>((resolve) => {
-        coldWaitTimer = setTimeout(() => resolve(buildPending), coldBuildWaitMs);
-      }),
-    ]);
+    const payload = await Promise.race([build, coldDeadline]);
     if (coldWaitTimer) {
       clearTimeout(coldWaitTimer);
     }
@@ -10207,17 +11337,46 @@ async function ownerResponse(
         event: "dashboard_cold_wait_timeout",
         targetKey: key,
         status: payload === null ? "locked" : "queued",
-        reason: "cold-build",
-        detail: `waitMs=${coldBuildWaitMs}`,
+        reason: buildReason,
+        detail: `waitMs=${coldBuildWaitMs} phase=${metadataFirst ? "metadata" : "hydrate"}`,
       });
-      context.waitUntil(
-        build
-          .then((built) =>
-            allowRefresh && built?.cache?.progress?.done === false
-              ? continueProgressiveBuild(dashboard, env)
-              : undefined,
-          )
-          .catch((error) => cacheBuildError(dashboard, env, error)),
+      let queueDelaySeconds = refreshQueueDeliveryDelaySeconds;
+      if (env.REFRESH_QUEUE) {
+        const settled = build.then(
+          () => true,
+          async (error) => {
+            if (!isAbortError(error)) {
+              await auditSyncEvent(env, {
+                event: "dashboard_cold_build_abandoned",
+                targetKey: key,
+                status: "failed",
+                reason: errorMessage(error),
+              });
+            }
+            return true;
+          },
+        );
+        coldBuildController?.abort();
+        const stopped = await Promise.race([settled, sleep(250).then(() => false)]);
+        if (!stopped) {
+          queueDelaySeconds = Math.ceil(buildLockTtlMs / 1000);
+          await auditSyncEvent(env, {
+            event: "dashboard_cold_build_abort_pending",
+            targetKey: key,
+            status: "queued",
+            reason: buildReason,
+            detail: `queueDelaySeconds=${queueDelaySeconds}`,
+          }).catch(() => undefined);
+        }
+      }
+      scheduleProgressiveBuild(
+        dashboard,
+        env,
+        context,
+        buildReason,
+        refreshTarget,
+        env.REFRESH_QUEUE ? undefined : build,
+        queueDelaySeconds,
       );
       const progressive = await readCached(env, key);
       if (canDisplayCached(progressive) && progressive.projects.length) {
@@ -10263,18 +11422,31 @@ async function ownerResponse(
       });
     }
     if (payload.cache?.progress?.done === false) {
-      if (allowRefresh) {
-        context.waitUntil(continueProgressiveBuild(dashboard, env).catch(() => undefined));
+      if (allowRefresh && (!refreshTarget || !refreshTargetBackoffActive(refreshTarget))) {
+        const reason = metadataFirst ? "cold-metadata" : "partial-build";
+        scheduleProgressiveBuild(dashboard, env, context, reason, refreshTarget);
         auditDashboardSync(context, env, {
           event: "dashboard_refresh_schedule",
           targetKey: key,
           status: "queued",
-          reason: "partial-build",
+          reason,
           projects: payload.projects.length,
           scanned: payload.cache?.progress?.scanned,
           limit: payload.cache?.progress?.limit,
           done: payload.cache?.progress?.done,
           detail: dashboardSyncDetail(payload),
+        });
+      } else if (allowRefresh && refreshTarget) {
+        auditDashboardSync(context, env, {
+          event: "dashboard_refresh_schedule",
+          targetKey: key,
+          status: "backoff",
+          reason: metadataFirst ? "cold-metadata" : "partial-build",
+          projects: payload.projects.length,
+          scanned: payload.cache?.progress?.scanned,
+          limit: payload.cache?.progress?.limit,
+          done: payload.cache?.progress?.done,
+          detail: `nextDueAt=${refreshTarget.nextDueAt} failureCount=${refreshTarget.failureCount}`,
         });
       }
       return jsonResponse(payload, 200, {
@@ -10342,7 +11514,7 @@ function dashboardRequest(
 export class DashboardBuildLock {
   constructor(
     private readonly state: DurableObjectState,
-    _env: Env,
+    private readonly env: Env,
   ) {}
 
   async fetch(request: Request): Promise<Response> {
@@ -10386,6 +11558,108 @@ export class DashboardBuildLock {
         token: existing.token,
         expiresAt: Date.now() + buildLockTtlMs,
       } satisfies StoredBuildLock);
+      return new Response(null, { status: 204 });
+    }
+
+    if (url.pathname === "/target/mutate") {
+      const body = (await request.json().catch(() => null)) as {
+        snapshot?: unknown;
+        mutation?: unknown;
+      } | null;
+      const snapshot = isRefreshTarget(body?.snapshot) ? body.snapshot : null;
+      const mutation = isRefreshTargetMutation(body?.mutation) ? body.mutation : null;
+      const key = mutation?.kind === "observe" ? mutation.input.key : snapshot?.key;
+      if (!mutation || !key) {
+        return new Response(null, { status: 400 });
+      }
+      const mutate = async () => {
+        let current = await this.state.storage.get<RefreshTarget>("refresh-target");
+        if (!current && this.env.DASHBOARD_CACHE) {
+          const raw = await this.env.DASHBOARD_CACHE.get(refreshTargetStorageKey(key));
+          if (raw) {
+            const parsed = tryJsonParse<RefreshTarget>(raw, `refresh target ${key}`);
+            current = isRefreshTarget(parsed) ? parsed : undefined;
+          }
+        }
+        const updated = applyRefreshTargetMutation(snapshot, current ?? null, mutation);
+        await Promise.all([
+          this.state.storage.put("refresh-target", updated),
+          this.env.DASHBOARD_CACHE?.put(refreshTargetStorageKey(key), JSON.stringify(updated), {
+            expirationTtl: dashboardStorageTtlSeconds,
+          }),
+        ]);
+        return updated;
+      };
+      const updated = this.state.blockConcurrencyWhile
+        ? await this.state.blockConcurrencyWhile(mutate)
+        : await mutate();
+      return Response.json(updated);
+    }
+
+    if (url.pathname === "/progress/get") {
+      const progress = await this.state.storage.get<StoredBuildProgress>("build-progress");
+      if (progress && (!isStoredBuildProgress(progress) || storedBuildProgressExpired(progress))) {
+        await this.state.storage.delete("build-progress");
+        return new Response(null, {
+          status: 204,
+          headers: { "x-releasebar-progress": "durable" },
+        });
+      }
+      return progress
+        ? Response.json(progress, {
+            headers: { "x-releasebar-progress": "durable" },
+          })
+        : new Response(null, {
+            status: 204,
+            headers: { "x-releasebar-progress": "durable" },
+          });
+    }
+
+    if (url.pathname === "/progress/put") {
+      const progress = await request.json().catch(() => null);
+      if (!isStoredBuildProgress(progress)) {
+        return new Response(null, {
+          status: 400,
+          headers: { "x-releasebar-progress": "durable" },
+        });
+      }
+      await this.state.storage.put("build-progress", progress);
+      return new Response(null, {
+        status: 204,
+        headers: { "x-releasebar-progress": "durable" },
+      });
+    }
+
+    if (url.pathname === "/progress/delete") {
+      await this.state.storage.delete("build-progress");
+      return new Response(null, {
+        status: 204,
+        headers: { "x-releasebar-progress": "durable" },
+      });
+    }
+
+    if (url.pathname === "/job/reserve") {
+      const body = (await request.json().catch(() => null)) as { jobId?: string } | null;
+      if (!body?.jobId) {
+        return new Response(null, { status: 400 });
+      }
+      const existing = await this.state.storage.get<StoredRefreshJobReservation>("refresh-job");
+      if (existing && existing.jobId !== body.jobId && existing.expiresAt > Date.now()) {
+        return new Response(null, { status: 409 });
+      }
+      await this.state.storage.put("refresh-job", {
+        jobId: body.jobId,
+        expiresAt: Date.now() + refreshJobReservationTtlMs,
+      } satisfies StoredRefreshJobReservation);
+      return new Response(null, { status: 204 });
+    }
+
+    if (url.pathname === "/job/release") {
+      const body = (await request.json().catch(() => null)) as { jobId?: string } | null;
+      const existing = await this.state.storage.get<StoredRefreshJobReservation>("refresh-job");
+      if (existing?.jobId === body?.jobId) {
+        await this.state.storage.delete("refresh-job");
+      }
       return new Response(null, { status: 204 });
     }
 
@@ -10441,10 +11715,49 @@ export default {
     _context: ExecutionContext,
   ): Promise<void> {
     for (const message of batch.messages) {
+      const deliveryAttempts = message.attempts ?? message.body.attempts + 1;
+      const exhausted = deliveryAttempts >= refreshQueueMaxAttempts;
+      let processedJob: RefreshJob | null = null;
       try {
-        await processRefreshJob(message.body, env);
-        message.ack();
-      } catch {
+        const job = await processRefreshJob(message.body, env, !exhausted);
+        processedJob = job;
+        if (job.status === "queued") {
+          const delaySeconds =
+            job.error === "dashboard locked" ||
+            job.error === "dashboard stalled" ||
+            job.error === "dashboard deadline reached" ||
+            job.error === "target snapshot unavailable" ||
+            job.error === "profile snapshot unavailable"
+              ? buildLockRetrySeconds
+              : incompleteBuildRetrySeconds;
+          if (exhausted) {
+            await failExhaustedRefreshJob(job, env, deliveryAttempts);
+            await releaseRefreshJobReservation(env, job.targetKey, job.id);
+            message.retry({ delaySeconds });
+            continue;
+          }
+          message.retry({
+            delaySeconds,
+          });
+        } else {
+          await releaseRefreshJobReservation(env, job.targetKey, job.id);
+          message.ack();
+        }
+      } catch (error) {
+        if (exhausted) {
+          const job =
+            processedJob ??
+            (await readRefreshJob(env, message.body.id).catch(() => null)) ??
+            message.body;
+          if (job.status === "queued" || job.status === "running") {
+            await failExhaustedRefreshJob(
+              { ...job, error: errorMessage(error) },
+              env,
+              deliveryAttempts,
+            ).catch(() => undefined);
+          }
+          await releaseRefreshJobReservation(env, job.targetKey, job.id).catch(() => undefined);
+        }
         message.retry({ delaySeconds: 300 });
       }
     }

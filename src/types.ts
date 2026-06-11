@@ -39,8 +39,8 @@ export type Project = {
   topics: string[];
   stars: number;
   forks: number;
-  openIssues: number;
-  openPullRequests: number;
+  openIssues: number | null;
+  openPullRequests: number | null;
   issuesUrl: string;
   pullRequestsUrl: string;
   archived: boolean;
@@ -515,6 +515,7 @@ export type RefreshTarget = {
   owner: string;
   owners: string[];
   repos: string[];
+  profileSnapshotKey?: string | null;
   includeReleaseData: boolean;
   path: string;
   priority: number;
@@ -523,12 +524,15 @@ export type RefreshTarget = {
   lastSuccessAt: string | null;
   nextDueAt: string;
   failureCount: number;
+  terminalBackoffUntil?: string | null;
   message?: string;
 };
 
 export type RefreshJob = {
   id: string;
   targetKey: string;
+  target?: RefreshTarget;
+  targetSnapshotKey?: string;
   kind: "dashboard";
   status: "queued" | "running" | "succeeded" | "failed" | "skipped";
   reason: string;

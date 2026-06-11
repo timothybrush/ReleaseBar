@@ -525,15 +525,16 @@ test("dashboard project sorting handles dev issue and pull request counts numeri
     testProject({ owner: "owner", name: "zero", openIssues: 0, openPullRequests: 0 }),
     testProject({ owner: "owner", name: "many", openIssues: 37, openPullRequests: 3 }),
     testProject({ owner: "owner", name: "some", openIssues: 4, openPullRequests: 12 }),
+    testProject({ owner: "owner", name: "unknown", openIssues: null, openPullRequests: null }),
   ];
 
   assert.deepEqual(
     sortProjects(projects, "issues", "desc").map((project) => project.name),
-    ["many", "some", "zero"],
+    ["many", "some", "zero", "unknown"],
   );
   assert.deepEqual(
     sortProjects(projects, "prs", "desc").map((project) => project.name),
-    ["some", "many", "zero"],
+    ["some", "many", "zero", "unknown"],
   );
   assert.deepEqual(
     sortProjects(
@@ -933,12 +934,13 @@ test("need attention explains release debt, stale releases, CI, and open work", 
 });
 
 test("worker builds root hot dashboard from cached dashboards", async () => {
-  const alphaKey = dashboardCacheKey({ owner: "alpha", includeUnreleased: true, schemaVersion: 5 });
-  const betaKey = dashboardCacheKey({ owner: "beta", includeUnreleased: true, schemaVersion: 5 });
-  const forksKey = dashboardCacheKey({ owner: "forks", includeForks: true, schemaVersion: 5 });
+  const alphaKey = dashboardCacheKey({ owner: "alpha", includeUnreleased: true, schemaVersion: 6 });
+  const betaKey = dashboardCacheKey({ owner: "beta", includeUnreleased: true, schemaVersion: 6 });
+  const forksKey = dashboardCacheKey({ owner: "forks", includeForks: true, schemaVersion: 6 });
+  const legacyKey = dashboardCacheKey({ owner: "legacy", schemaVersion: 5 });
   const env = {
     DASHBOARD_CACHE: kvStore({
-      "hot:index:v3": JSON.stringify([alphaKey]),
+      "hot:index:v3": JSON.stringify([alphaKey, legacyKey]),
       [alphaKey]: JSON.stringify(
         testDashboard("alpha", [
           testProject({
@@ -990,7 +992,18 @@ test("worker builds root hot dashboard from cached dashboards", async () => {
           repoLimit: 200,
         },
       }),
-      [dashboardCacheKey({ owner: "gamma", schemaVersion: 5 })]: JSON.stringify(
+      [legacyKey]: JSON.stringify(
+        testDashboard("legacy", [
+          testProject({
+            owner: "legacy",
+            name: "estimated-counts",
+            stars: 10_000,
+            openIssues: 500,
+            openPullRequests: 100,
+          }),
+        ]),
+      ),
+      [dashboardCacheKey({ owner: "gamma", schemaVersion: 6 })]: JSON.stringify(
         testDashboard("gamma", [
           testProject({
             owner: "gamma",
@@ -1020,6 +1033,10 @@ test("worker builds root hot dashboard from cached dashboards", async () => {
     false,
   );
   assert.equal(
+    body.projects.some((project) => project.fullName === "legacy/estimated-counts"),
+    false,
+  );
+  assert.equal(
     body.projects.some((project) => project.fullName === "forks/cached-fork"),
     false,
   );
@@ -1040,6 +1057,7 @@ test("worker builds root hot dashboard from cached dashboards", async () => {
 
 test("worker keeps hot owner route distinct from root hot API", async () => {
   const originalFetch = globalThis.fetch;
+  const waits: Promise<unknown>[] = [];
   globalThis.fetch = async (input) => {
     const url = new URL(String(input));
     if (url.pathname === "/users/hot") {
@@ -1054,9 +1072,10 @@ test("worker keeps hot owner route distinct from root hot API", async () => {
     const response = await worker.fetch(
       new Request("https://release.bar/api/hot"),
       { DASHBOARD_CACHE: kvStore() },
-      { waitUntil: () => undefined },
+      { waitUntil: (promise) => waits.push(promise) },
     );
     const body = (await response.json()) as DashboardPayload;
+    await Promise.all(waits);
     assert.equal(response.status, 200);
     assert.equal(body.owners[0]?.login, "hot");
     assert.notEqual(body.title, "ReleaseBar Hot");
@@ -1153,7 +1172,7 @@ test("worker embeds cached metadata-only owner dashboard data in the app shell",
     owner: "owner",
     includeUnreleased: true,
     includeReleaseData: false,
-    schemaVersion: 5,
+    schemaVersion: 6,
   });
   const response = await worker.fetch(
     new Request("https://release.bar/owner", { headers: { cookie: "rd_session=bogus" } }),
@@ -1196,7 +1215,7 @@ test("worker embeds cached crawler dashboard shells without discovering app inst
     owner: "owner",
     includeUnreleased: true,
     includeReleaseData: false,
-    schemaVersion: 5,
+    schemaVersion: 6,
   });
   let installationListCalls = 0;
   const originalFetch = globalThis.fetch;
@@ -4977,7 +4996,7 @@ test("worker manual dashboard refresh returns structured GitHub errors", async (
     assert.equal(body.cache?.state, "error");
     assert.match(body.cache?.message ?? "", /GitHub shared API quota is exhausted/);
 
-    const key = dashboardCacheKey({ owner: "owner", includeUnreleased: true, schemaVersion: 5 });
+    const key = dashboardCacheKey({ owner: "owner", includeUnreleased: true, schemaVersion: 6 });
     const dashboard = testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]);
     dashboard.generatedAt = new Date().toISOString();
     if (dashboard.cache && dashboard.options) {
@@ -5153,7 +5172,7 @@ test("worker manual dashboard refresh preserves released-only cache while rebuil
     }
     throw new Error(`unexpected fetch ${url.pathname}`);
   };
-  const key = dashboardCacheKey({ owner: "owner", includeUnreleased: false, schemaVersion: 5 });
+  const key = dashboardCacheKey({ owner: "owner", includeUnreleased: false, schemaVersion: 6 });
   const dashboard = testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]);
   dashboard.generatedAt = new Date().toISOString();
   if (dashboard.cache) {
@@ -5439,7 +5458,7 @@ test("dashboard build records GitHub quota headers", async () => {
 });
 
 test("worker preserves cached quota metadata on fresh responses", async () => {
-  const key = dashboardCacheKey({ owner: "owner", includeUnreleased: true, schemaVersion: 5 });
+  const key = dashboardCacheKey({ owner: "owner", includeUnreleased: true, schemaVersion: 6 });
   const dashboard = testDashboard("owner", []);
   dashboard.generatedAt = new Date().toISOString();
   if (dashboard.cache) {
@@ -5472,7 +5491,7 @@ test("worker preserves cached quota metadata on fresh responses", async () => {
 });
 
 test("worker streams cached dashboard snapshots over owner events", async () => {
-  const key = dashboardCacheKey({ owner: "owner", includeUnreleased: true, schemaVersion: 5 });
+  const key = dashboardCacheKey({ owner: "owner", includeUnreleased: true, schemaVersion: 6 });
   const dashboard = testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]);
   dashboard.generatedAt = new Date().toISOString();
   if (dashboard.cache) {
@@ -5493,7 +5512,7 @@ test("worker streams cached dashboard snapshots over owner events", async () => 
 });
 
 test("worker records dashboard stream sync audits", async () => {
-  const key = dashboardCacheKey({ owner: "owner", includeUnreleased: true, schemaVersion: 5 });
+  const key = dashboardCacheKey({ owner: "owner", includeUnreleased: true, schemaVersion: 6 });
   const dashboard = testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]);
   dashboard.generatedAt = new Date().toISOString();
   if (dashboard.cache) {
@@ -5522,7 +5541,7 @@ test("worker records dashboard stream sync audits", async () => {
 });
 
 test("worker keeps owner events working for the repos owner slug", async () => {
-  const key = dashboardCacheKey({ owner: "repos", includeUnreleased: true, schemaVersion: 5 });
+  const key = dashboardCacheKey({ owner: "repos", includeUnreleased: true, schemaVersion: 6 });
   const dashboard = testDashboard("repos", [testProject({ owner: "repos", name: "repo" })]);
   dashboard.generatedAt = new Date().toISOString();
   if (dashboard.cache) {
@@ -5581,6 +5600,81 @@ test("worker returns rebuilding while another isolate owns the dashboard build l
   }
 });
 
+test("worker uses an in-isolate build lease when Durable Objects fail open", async () => {
+  const originalFetch = globalThis.fetch;
+  const cache = kvStore();
+  let graphqlCalls = 0;
+  let markGraphqlStarted: (() => void) | undefined;
+  let releaseGraphql: (() => void) | undefined;
+  const graphqlStarted = new Promise<void>((resolve) => {
+    markGraphqlStarted = resolve;
+  });
+  const graphqlGate = new Promise<void>((resolve) => {
+    releaseGraphql = resolve;
+  });
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/users/local") {
+      return Response.json({ login: "local", type: "User" });
+    }
+    if (url.pathname === "/graphql") {
+      graphqlCalls += 1;
+      markGraphqlStarted?.();
+      await graphqlGate;
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "User",
+            repositories: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [],
+            },
+          },
+        },
+      });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const failedLocks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async (request: Request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/acquire") {
+          return new Response(null, { status: 503 });
+        }
+        return new Response(null, { status: 204 });
+      },
+    }),
+  };
+  const env = {
+    DASHBOARD_CACHE: cache,
+    DASHBOARD_LOCKS: failedLocks,
+    GITHUB_TOKEN: "shared-token",
+    REFRESH_QUEUE: { send: async () => undefined },
+  };
+
+  try {
+    const first = worker.fetch(new Request("https://release.bar/api/local"), env, {
+      waitUntil: () => undefined,
+    });
+    await graphqlStarted;
+    const second = await worker.fetch(new Request("https://release.bar/api/local"), env, {
+      waitUntil: () => undefined,
+    });
+    assert.equal(second.status, 202);
+    const secondBody = (await second.json()) as DashboardPayload;
+    assert.equal(secondBody.cache?.state, "rebuilding");
+    releaseGraphql?.();
+    const firstResponse = await first;
+    assert.equal(firstResponse.status, 200);
+    assert.equal(graphqlCalls, 1);
+  } finally {
+    releaseGraphql?.();
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("worker does not display dashboard data past the stale display window", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input) => {
@@ -5596,7 +5690,7 @@ test("worker does not display dashboard data past the stale display window", asy
       fetch: async () => new Response(null, { status: 409 }),
     }),
   };
-  const key = dashboardCacheKey({ owner: "old", schemaVersion: 5 });
+  const key = dashboardCacheKey({ owner: "old", schemaVersion: 6 });
   const dashboard = testDashboard("old", [testProject({ owner: "old", name: "ancient" })]);
   dashboard.generatedAt = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
   if (dashboard.cache) {
@@ -5644,8 +5738,8 @@ test("worker serves partial cached sources while combined dashboard rebuilds", a
       fetch: async () => new Response(null, { status: 409 }),
     }),
   };
-  const alphaKey = dashboardCacheKey({ owner: "alpha", includeUnreleased: true, schemaVersion: 5 });
-  const betaKey = dashboardCacheKey({ owner: "beta", includeUnreleased: true, schemaVersion: 5 });
+  const alphaKey = dashboardCacheKey({ owner: "alpha", includeUnreleased: true, schemaVersion: 6 });
+  const betaKey = dashboardCacheKey({ owner: "beta", includeUnreleased: true, schemaVersion: 6 });
 
   try {
     const response = await worker.fetch(
@@ -5755,12 +5849,12 @@ test("worker progressively resumes large owner dashboard builds from partial cac
     const firstBody = (await first.json()) as DashboardPayload;
     assert.equal(first.headers.get("cache-control"), "no-store");
     assert.equal(firstBody.cache?.state, "partial");
-    assert.equal(firstBody.cache?.progress?.scanned, 12);
+    assert.equal(firstBody.cache?.progress?.scanned, 0);
     assert.equal(firstBody.cache?.progress?.done, false);
     assert.equal(firstBody.projects.length, 25);
     assert.equal(
       firstBody.projects.filter((project) => project.version === "repo search").length,
-      13,
+      25,
     );
 
     await Promise.all(waitUntil.splice(0));
@@ -5777,6 +5871,619 @@ test("worker progressively resumes large owner dashboard builds from partial cac
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("worker bounds cold owner resolution by the response deadline", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const waits: Promise<unknown>[] = [];
+  const sentJobs: RefreshJob[] = [];
+  let deliveryDelaySeconds: number | undefined;
+  let ownerAborted = false;
+  let releaseOwner: (() => void) | undefined;
+  const ownerGate = new Promise<void>((resolve) => {
+    releaseOwner = resolve;
+  });
+  let ownerStarted = false;
+  const cache = kvStore();
+
+  globalThis.setTimeout = ((callback: TimerHandler, delay?: number) =>
+    originalSetTimeout(callback, delay === 15_000 ? 0 : delay)) as typeof setTimeout;
+  globalThis.fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/users/slowmeta") {
+      ownerStarted = true;
+      await new Promise<void>((resolve, reject) => {
+        if (init?.signal?.aborted) {
+          ownerAborted = true;
+          reject(new DOMException("Aborted", "AbortError"));
+          return;
+        }
+        init?.signal?.addEventListener(
+          "abort",
+          () => {
+            ownerAborted = true;
+            reject(new DOMException("Aborted", "AbortError"));
+          },
+          { once: true },
+        );
+        void ownerGate.then(resolve);
+      });
+      return Response.json({ login: "slowmeta", type: "User" });
+    }
+    throw new Error(`unexpected fetch ${path}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/slowmeta"),
+      {
+        DASHBOARD_CACHE: cache,
+        REFRESH_QUEUE: {
+          async send(job: RefreshJob, options?: { delaySeconds?: number }) {
+            sentJobs.push(job);
+            deliveryDelaySeconds = options?.delaySeconds;
+          },
+        },
+      },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    assert.equal(ownerStarted, true);
+    assert.equal(response.status, 202);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.cache?.state, "rebuilding");
+    await new Promise((resolve) => originalSetTimeout(resolve, 0));
+    assert.equal(ownerAborted, true);
+    assert.equal(sentJobs.length, 1);
+    assert.equal(sentJobs[0]?.reason, "cold-metadata");
+    assert.equal(deliveryDelaySeconds, 2);
+  } finally {
+    releaseOwner?.();
+    await Promise.all(waits);
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("worker bounds cold GitHub App token lookup by the response deadline", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs1", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const waits: Promise<unknown>[] = [];
+  const sentJobs: RefreshJob[] = [];
+  let credentialAborted = false;
+  const cache = kvStore();
+
+  globalThis.setTimeout = ((callback: TimerHandler, delay?: number) =>
+    originalSetTimeout(callback, delay === 15_000 ? 0 : delay)) as typeof setTimeout;
+  globalThis.fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/app/installations") {
+      return new Promise<Response>((_resolve, reject) => {
+        if (init?.signal?.aborted) {
+          credentialAborted = true;
+          reject(new DOMException("Aborted", "AbortError"));
+          return;
+        }
+        init?.signal?.addEventListener(
+          "abort",
+          () => {
+            credentialAborted = true;
+            reject(new DOMException("Aborted", "AbortError"));
+          },
+          { once: true },
+        );
+      });
+    }
+    if (path === "/users/slowtoken") {
+      throw new DOMException("Aborted", "AbortError");
+    }
+    throw new Error(`unexpected fetch ${path}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/slowtoken"),
+      {
+        DASHBOARD_CACHE: cache,
+        GITHUB_APP_ID: "123",
+        GITHUB_APP_PRIVATE_KEY: privateKey,
+        REFRESH_QUEUE: {
+          async send(job: RefreshJob) {
+            sentJobs.push(job);
+          },
+        },
+      },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    assert.equal(response.status, 202);
+    assert.equal(credentialAborted, true);
+    await Promise.all(waits);
+    assert.equal(sentJobs.length, 1);
+    assert.equal(sentJobs[0]?.reason, "cold-build");
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("worker resumes durable progress on cold metadata cache misses", async () => {
+  const originalFetch = globalThis.fetch;
+  const cache = kvStore();
+  const waits: Promise<unknown>[] = [];
+  const sentJobs: RefreshJob[] = [];
+  const project = testProject({ owner: "checkpoint", name: "repo" });
+  const progress = {
+    scannedRepos: Array.from({ length: 43 }, (_, index) => `checkpoint/repo-${index}`),
+    projects: [project],
+    updatedAt: new Date().toISOString(),
+  };
+  let progressDeletes = 0;
+  let progressWrites = 0;
+  let released = false;
+  const locks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async (request: Request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/acquire" || path === "/job/reserve") {
+          return new Response(null, { status: 204 });
+        }
+        if (path === "/release") {
+          released = true;
+          return new Response(null, { status: 204 });
+        }
+        if (path === "/progress/get") {
+          return Response.json(progress, {
+            headers: { "x-releasebar-progress": "durable" },
+          });
+        }
+        if (path === "/progress/delete") {
+          progressDeletes += 1;
+          return new Response(null, {
+            status: 204,
+            headers: { "x-releasebar-progress": "durable" },
+          });
+        }
+        if (path === "/progress/put") {
+          progressWrites += 1;
+          return new Response(null, {
+            status: 204,
+            headers: { "x-releasebar-progress": "durable" },
+          });
+        }
+        return new Response(null, { status: 404 });
+      },
+    }),
+  };
+
+  globalThis.fetch = async (input) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/users/checkpoint") {
+      return Response.json({ login: "checkpoint", type: "User" });
+    }
+    throw new Error(`unexpected fetch ${path}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/checkpoint"),
+      {
+        DASHBOARD_CACHE: cache,
+        DASHBOARD_LOCKS: locks,
+        REFRESH_QUEUE: {
+          async send(job: RefreshJob) {
+            sentJobs.push(job);
+          },
+        },
+      },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.cache?.state, "partial");
+    assert.equal(body.cache?.progress?.scanned, 43);
+    assert.deepEqual(body.projects, [project]);
+    await Promise.all(waits);
+    assert.equal(sentJobs.length, 1);
+    assert.equal(sentJobs[0]?.reason, "cold-metadata");
+    assert.equal(progressDeletes, 0);
+    assert.equal(progressWrites, 0);
+    assert.equal(released, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker chains direct progressive continuation after a cold build timeout", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const repos = Array.from({ length: 13 }, (_, index) => {
+    const name = `repo-${String(index + 1).padStart(2, "0")}`;
+    return {
+      owner: { login: "slow" },
+      name,
+      full_name: `slow/${name}`,
+      description: null,
+      html_url: `https://github.com/slow/${name}`,
+      default_branch: "main",
+      language: null,
+      stargazers_count: 0,
+      forks_count: 0,
+      open_issues_count: 0,
+      archived: false,
+      pushed_at: `2026-05-${String(25 - index).padStart(2, "0")}T00:00:00Z`,
+      updated_at: `2026-05-${String(25 - index).padStart(2, "0")}T00:00:00Z`,
+      fork: false,
+      private: false,
+    };
+  });
+  const waits: Promise<unknown>[] = [];
+  let releaseFirstRepo: (() => void) | undefined;
+  const firstRepoGate = new Promise<void>((resolve) => {
+    releaseFirstRepo = resolve;
+  });
+  let firstRepoStarted: (() => void) | undefined;
+  const firstRepoFetch = new Promise<void>((resolve) => {
+    firstRepoStarted = resolve;
+  });
+  let gated = false;
+  const cache = kvStore();
+  const key = dashboardCacheKey({
+    owner: "slow",
+    includeUnreleased: false,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+
+  globalThis.setTimeout = ((callback: TimerHandler, delay?: number) =>
+    originalSetTimeout(callback, delay === 15_000 ? 0 : delay)) as typeof setTimeout;
+  globalThis.fetch = async (input) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/users/slow") {
+      return Response.json({ login: "slow", type: "User" });
+    }
+    if (path === "/users/slow/repos") {
+      return Response.json(repos);
+    }
+    if (path.endsWith("/releases")) {
+      if (!gated) {
+        gated = true;
+        firstRepoStarted?.();
+        await firstRepoGate;
+      }
+      return Response.json([
+        {
+          tag_name: "v1.0.0",
+          name: null,
+          html_url: "https://github.com/slow/repo/releases/v1.0.0",
+          draft: false,
+          published_at: "2026-05-01T00:00:00Z",
+        },
+      ]);
+    }
+    if (path.endsWith("/commits/main")) {
+      return Response.json({
+        sha: "abcdef123456",
+        commit: { committer: { date: "2026-05-02T00:00:00Z" } },
+      });
+    }
+    if (path.includes("/compare/")) {
+      return Response.json({
+        total_commits: 0,
+        html_url: "https://github.com/slow/repo/compare",
+      });
+    }
+    if (path.endsWith("/pulls")) {
+      return Response.json([]);
+    }
+    if (path.endsWith("/check-runs")) {
+      return Response.json({ check_runs: [] });
+    }
+    throw new Error(`unexpected fetch ${path}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/slow?unreleased=false"),
+      { DASHBOARD_CACHE: cache },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    assert.equal(response.status, 202);
+    await firstRepoFetch;
+    releaseFirstRepo?.();
+    while (waits.length > 0) {
+      await Promise.all(waits.splice(0));
+    }
+
+    const stored = JSON.parse((await cache.get(key)) ?? "{}") as DashboardPayload;
+    assert.equal(stored.cache?.state, "fresh");
+    assert.equal(stored.cache?.progress?.done, true);
+    assert.equal(stored.cache?.progress?.scanned, 13);
+    assert.equal(stored.projects.length, 13);
+  } finally {
+    releaseFirstRepo?.();
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("worker deduplicates queued refreshes for partial dashboards", async () => {
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const cached: DashboardPayload = {
+    ...testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]),
+    cache: {
+      state: "partial",
+      stale: true,
+      capped: false,
+      repoLimit: 200,
+      generatedAt: new Date().toISOString(),
+      progress: {
+        scanned: 12,
+        limit: 200,
+        done: false,
+      },
+    },
+  };
+  const backingCache = kvStore({ [key]: JSON.stringify(cached) });
+  let targetReads = 0;
+  const cache = {
+    ...backingCache,
+    async get(storageKey: string) {
+      if (storageKey.startsWith("refresh:target:v1:")) {
+        targetReads += 1;
+      }
+      return backingCache.get(storageKey);
+    },
+  };
+  const sentJobs: RefreshJob[] = [];
+  let deliveryDelaySeconds: number | undefined;
+  let reservedJobId: string | null = null;
+  const locks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async (request: Request) => {
+        const path = new URL(request.url).pathname;
+        const body = (await request.json()) as { jobId?: string };
+        if (path === "/job/reserve") {
+          if (reservedJobId && reservedJobId !== body.jobId) {
+            return new Response(null, { status: 409 });
+          }
+          reservedJobId = body.jobId ?? null;
+          return new Response(null, { status: 204 });
+        }
+        if (path === "/job/release") {
+          if (reservedJobId === body.jobId) {
+            reservedJobId = null;
+          }
+          return new Response(null, { status: 204 });
+        }
+        return new Response(null, { status: 404 });
+      },
+    }),
+  };
+  const env = {
+    DASHBOARD_CACHE: cache,
+    DASHBOARD_LOCKS: locks,
+    GITHUB_TOKEN: "shared-token",
+    REFRESH_QUEUE: {
+      async send(job: RefreshJob, options?: { delaySeconds?: number }) {
+        sentJobs.push(job);
+        deliveryDelaySeconds = options?.delaySeconds;
+      },
+    },
+  };
+
+  await Promise.all(
+    Array.from({ length: 2 }, async () => {
+      const waits: Promise<unknown>[] = [];
+      const response = await worker.fetch(new Request("https://release.bar/api/owner"), env, {
+        waitUntil: (promise) => waits.push(promise),
+      });
+      assert.equal(response.status, 200);
+      await Promise.all(waits);
+    }),
+  );
+
+  assert.equal(sentJobs.length, 1);
+  assert.equal(sentJobs[0]?.reason, "partial-cache");
+  assert.equal(sentJobs[0]?.target, undefined);
+  assert.match(sentJobs[0]?.targetSnapshotKey ?? "", /^refresh:jobs:v2:/);
+  assert.equal(deliveryDelaySeconds, 2);
+  assert.equal(targetReads, 2);
+  const indexedJobs = await cache.list({ prefix: "refresh:jobs:v2:" });
+  assert.equal(indexedJobs.keys.length, 1);
+  const snapshot = JSON.parse(
+    (await cache.get(sentJobs[0]?.targetSnapshotKey ?? "")) ?? "{}",
+  ) as RefreshJob;
+  assert.equal(snapshot.target?.key, key);
+  assert.equal((await cache.list({ prefix: "refresh:job:v1:" })).keys.length, 0);
+});
+
+test("worker Queue messages stay bounded when profile filters are large", async () => {
+  const key = dashboardCacheKey({
+    owner: "profiled",
+    includeUnreleased: true,
+    includeReleaseData: false,
+    schemaVersion: 6,
+  });
+  const profile = {
+    owner: "profiled",
+    includeOwners: [],
+    includeRepos: [],
+    hiddenOwners: [],
+    hiddenRepos: Array.from(
+      { length: 5000 },
+      (_, index) => `profiled/repository-${String(index).padStart(4, "0")}`,
+    ),
+    updatedAt: "2026-06-11T07:00:00Z",
+    updatedBy: "profiled",
+  };
+  const profileSnapshotKey = `refresh:profile-snapshot:v1:profiled:${encodeURIComponent(
+    profile.updatedAt,
+  )}`;
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "profiled",
+    owners: ["profiled"],
+    repos: [],
+    profileSnapshotKey,
+    includeReleaseData: false,
+    path: "/profiled",
+    priority: 100,
+    lastSeenAt: "2026-06-11T07:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2000-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const cache = kvStore({
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+    [profileSnapshotKey]: JSON.stringify(profile),
+  });
+  const sentJobs: RefreshJob[] = [];
+  const waits: Promise<unknown>[] = [];
+
+  await (
+    worker as unknown as {
+      scheduled(
+        event: { cron: string },
+        env: unknown,
+        context: { waitUntil(promise: Promise<unknown>): void },
+      ): Promise<void>;
+    }
+  ).scheduled(
+    { cron: "*/15 * * * *" },
+    {
+      DASHBOARD_CACHE: cache,
+      REFRESH_QUEUE: {
+        async send(job: RefreshJob) {
+          sentJobs.push(job);
+        },
+      },
+    },
+    { waitUntil: (promise) => waits.push(promise) },
+  );
+  await Promise.all(waits);
+
+  assert.equal(sentJobs.length, 1);
+  assert.equal(sentJobs[0]?.target, undefined);
+  assert.equal(JSON.stringify(sentJobs[0]).length < 4096, true);
+  const snapshot = JSON.parse(
+    (await cache.get(sentJobs[0]?.targetSnapshotKey ?? "")) ?? "{}",
+  ) as RefreshJob;
+  assert.equal(snapshot.target?.profileSnapshotKey, profileSnapshotKey);
+  assert.equal(JSON.stringify(snapshot.target).length < 4096, true);
+  const storedProfile = JSON.parse((await cache.get(profileSnapshotKey)) ?? "{}") as {
+    hiddenRepos?: string[];
+  };
+  assert.equal(storedProfile.hiddenRepos?.length, 5000);
+});
+
+test("worker scheduler terminalizes retryable refreshes when Queue is unavailable", async () => {
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "owner",
+    owners: ["owner"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/owner",
+    priority: 100,
+    lastSeenAt: "2026-06-11T06:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-06-11T06:00:00Z",
+    failureCount: 0,
+  };
+  const cached: DashboardPayload = {
+    ...testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]),
+    cache: {
+      state: "partial",
+      stale: true,
+      capped: false,
+      repoLimit: 200,
+      generatedAt: new Date().toISOString(),
+      progress: {
+        scanned: 12,
+        limit: 200,
+        done: false,
+      },
+    },
+  };
+  const cache = kvStore({
+    [key]: JSON.stringify(cached),
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+  });
+  let released = false;
+  const locks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async (request: Request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/job/reserve") {
+          return new Response(null, { status: 204 });
+        }
+        if (path === "/job/release") {
+          released = true;
+          return new Response(null, { status: 204 });
+        }
+        if (path === "/acquire") {
+          return new Response(null, { status: 409 });
+        }
+        return new Response(null, { status: 404 });
+      },
+    }),
+  };
+  const waits: Promise<unknown>[] = [];
+  await (
+    worker as unknown as {
+      scheduled(
+        event: { cron: string },
+        env: unknown,
+        context: { waitUntil(promise: Promise<unknown>): void },
+      ): Promise<void>;
+    }
+  ).scheduled(
+    { cron: "*/15 * * * *" },
+    {
+      DASHBOARD_CACHE: cache,
+      DASHBOARD_LOCKS: locks,
+    },
+    { waitUntil: (promise) => waits.push(promise) },
+  );
+
+  while (waits.length > 0) {
+    await Promise.all(waits.splice(0));
+  }
+
+  const indexedJobs = await cache.list({ prefix: "refresh:jobs:v2:" });
+  assert.equal(indexedJobs.keys.length, 1);
+  const indexed = JSON.parse(
+    (await cache.get(indexedJobs.keys[0]?.name ?? "")) ?? "{}",
+  ) as RefreshJob;
+  const stored = JSON.parse(
+    (await cache.get(`refresh:job:v1:${indexed.id}`)) ?? "{}",
+  ) as RefreshJob;
+  assert.equal(stored.status, "failed");
+  assert.match(stored.error ?? "", /Queue continuation unavailable/);
+  assert.equal(released, true);
 });
 
 test("dashboard build lock only releases the matching lease token", async () => {
@@ -5872,6 +6579,878 @@ test("dashboard build lock only releases the matching lease token", async () => 
     token: "second",
     expiresAt: (storage.get("lock") as { expiresAt: number }).expiresAt,
   });
+});
+
+test("dashboard build lock reserves one refresh job per dashboard", async () => {
+  const storage = new Map<string, unknown>();
+  const lock = new DashboardBuildLock(
+    {
+      storage: {
+        async get<T>(key: string) {
+          return storage.get(key) as T | undefined;
+        },
+        async put<T>(key: string, value: T) {
+          storage.set(key, value);
+        },
+        async delete(key: string) {
+          return storage.delete(key);
+        },
+      },
+    },
+    {},
+  );
+  const request = (path: string, jobId: string) =>
+    lock.fetch(
+      new Request(`https://releasebar.internal${path}`, {
+        method: "POST",
+        body: JSON.stringify({ jobId }),
+      }),
+    );
+
+  assert.equal((await request("/job/reserve", "first")).status, 204);
+  assert.equal((await request("/job/reserve", "second")).status, 409);
+  assert.equal((await request("/job/reserve", "first")).status, 204);
+  assert.equal((await request("/job/release", "second")).status, 204);
+  assert.equal((await request("/job/reserve", "second")).status, 409);
+  assert.equal((await request("/job/release", "first")).status, 204);
+  assert.equal((await request("/job/reserve", "second")).status, 204);
+});
+
+test("dashboard target mutations preserve terminal backoff across stale observations", async () => {
+  const storage = new Map<string, unknown>();
+  const cache = kvStore();
+  const lock = new DashboardBuildLock(
+    {
+      blockConcurrencyWhile: async (callback) => callback(),
+      storage: {
+        async get<T>(key: string) {
+          return storage.get(key) as T | undefined;
+        },
+        async put<T>(key: string, value: T) {
+          storage.set(key, value);
+        },
+        async delete(key: string) {
+          return storage.delete(key);
+        },
+      },
+    },
+    { DASHBOARD_CACHE: cache },
+  );
+  const input = {
+    key: "dashboard:v6:owner=target-race",
+    owner: "target-race",
+    owners: ["target-race"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/target-race",
+    priority: 100,
+  };
+  const mutate = async (snapshot: RefreshTarget | null, mutation: unknown) => {
+    const response = await lock.fetch(
+      new Request("https://releasebar.internal/target/mutate", {
+        method: "POST",
+        body: JSON.stringify({ snapshot, mutation }),
+      }),
+    );
+    assert.equal(response.status, 200);
+    return (await response.json()) as RefreshTarget;
+  };
+
+  const observed = await mutate(null, {
+    kind: "observe",
+    input,
+    observedAt: "2026-06-11T12:00:00Z",
+    profileProvided: false,
+  });
+  const failed = await mutate(observed, {
+    kind: "failure",
+    at: "2026-06-11T12:01:00Z",
+    message: "terminal failure",
+    terminal: true,
+  });
+  const observedAgain = await mutate(null, {
+    kind: "observe",
+    input,
+    observedAt: "2026-06-11T12:02:00Z",
+    profileProvided: false,
+  });
+
+  assert.equal(observedAgain.failureCount, 1);
+  assert.equal(observedAgain.nextDueAt, failed.nextDueAt);
+  assert.equal(observedAgain.terminalBackoffUntil, failed.nextDueAt);
+  assert.equal(observedAgain.message, "terminal failure");
+  const stored = JSON.parse(
+    (await cache.get(`refresh:target:v1:${input.key}`)) ?? "{}",
+  ) as RefreshTarget;
+  assert.equal(stored.terminalBackoffUntil, failed.nextDueAt);
+});
+
+test("dashboard build lock stores strongly consistent build progress", async () => {
+  const storage = new Map<string, unknown>();
+  const lock = new DashboardBuildLock(
+    {
+      storage: {
+        async get<T>(key: string) {
+          return storage.get(key) as T | undefined;
+        },
+        async put<T>(key: string, value: T) {
+          storage.set(key, value);
+        },
+        async delete(key: string) {
+          return storage.delete(key);
+        },
+      },
+    },
+    {},
+  );
+  const request = (path: string, body?: unknown) =>
+    lock.fetch(
+      new Request(`https://releasebar.internal${path}`, {
+        method: "POST",
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      }),
+    );
+  const progress = {
+    scannedRepos: ["owner/repo"],
+    projects: [testProject({ owner: "owner", name: "repo" })],
+    updatedAt: "2026-06-11T12:00:00Z",
+  };
+
+  const empty = await request("/progress/get");
+  assert.equal(empty.status, 204);
+  assert.equal(empty.headers.get("x-releasebar-progress"), "durable");
+  assert.equal((await request("/progress/put", progress)).status, 204);
+  const stored = await request("/progress/get");
+  assert.equal(stored.status, 200);
+  assert.equal(stored.headers.get("x-releasebar-progress"), "durable");
+  assert.deepEqual(await stored.json(), progress);
+  assert.equal((await request("/progress/delete")).status, 204);
+  assert.equal((await request("/progress/get")).status, 204);
+
+  assert.equal(
+    (
+      await request("/progress/put", {
+        ...progress,
+        updatedAt: "2020-01-01T00:00:00Z",
+      })
+    ).status,
+    204,
+  );
+  assert.equal((await request("/progress/get")).status, 204);
+  assert.equal(storage.has("build-progress"), false);
+});
+
+test("worker falls back to KV progress when the Durable Object is unavailable", async () => {
+  const cache = kvStore();
+  const waits: Array<Promise<unknown>> = [];
+  const originalFetch = globalThis.fetch;
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  globalThis.fetch = async (input) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/users/owner") {
+      return Response.json({ login: "owner", type: "User" });
+    }
+    if (path === "/graphql") {
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "User",
+            repositories: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [],
+            },
+          },
+        },
+      });
+    }
+    throw new Error(`unexpected fetch ${path}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/owner"),
+      {
+        DASHBOARD_CACHE: cache,
+        DASHBOARD_LOCKS: {
+          idFromName: (name: string) => name,
+          get: () => ({
+            fetch: async () => {
+              throw new Error("Durable Object unavailable");
+            },
+          }),
+        },
+        GITHUB_TOKEN: "shared-token",
+        REFRESH_QUEUE: {
+          send: async () => undefined,
+        },
+      },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    assert.equal(response.status, 200);
+    const fallback = JSON.parse((await cache.get(`progress:v1:${key}`)) ?? "{}") as {
+      durableFallback?: boolean;
+    };
+    assert.equal(fallback.durableFallback, true);
+    await Promise.all(waits);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker resumes marked KV progress after an authoritative Durable Object miss", async () => {
+  const key = dashboardCacheKey({
+    owner: "fallback",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "fallback",
+    owners: ["fallback"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/fallback",
+    priority: 100,
+    lastSeenAt: "2026-06-11T07:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-06-11T07:00:00Z",
+    failureCount: 0,
+  };
+  const job: RefreshJob = {
+    id: "job-kv-progress-fallback",
+    targetKey: key,
+    target,
+    kind: "dashboard",
+    status: "queued",
+    reason: "partial-cache",
+    createdAt: "2026-06-11T07:00:00Z",
+    updatedAt: "2026-06-11T07:00:00Z",
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const repos = Array.from({ length: 13 }, (_, index) => {
+    const name = `repo-${String(index + 1).padStart(2, "0")}`;
+    return {
+      owner: { login: "fallback" },
+      name,
+      full_name: `fallback/${name}`,
+      description: null,
+      html_url: `https://github.com/fallback/${name}`,
+      default_branch: "main",
+      language: null,
+      stargazers_count: 0,
+      forks_count: 0,
+      open_issues_count: 0,
+      archived: false,
+      pushed_at: "2026-06-11T06:00:00Z",
+      updated_at: "2026-06-11T06:00:00Z",
+      fork: false,
+      private: false,
+    };
+  });
+  const progressProjects = repos.slice(0, 12).map((repo) =>
+    testProject({
+      owner: "fallback",
+      name: repo.name,
+      pushedAt: repo.pushed_at,
+      updatedAt: repo.updated_at,
+      latestCommitDate: repo.updated_at,
+    }),
+  );
+  const cache = kvStore({
+    [`progress:v1:${key}`]: JSON.stringify({
+      scannedRepos: progressProjects.map((project) => project.fullName.toLowerCase()),
+      projects: progressProjects,
+      updatedAt: "2026-06-11T07:00:00Z",
+      durableFallback: true,
+    }),
+    [`refresh:job:v1:${job.id}`]: JSON.stringify(job),
+  });
+  const locks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async (request: Request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/progress/get") {
+          return new Response(null, {
+            status: 204,
+            headers: { "x-releasebar-progress": "durable" },
+          });
+        }
+        if (path === "/progress/delete" || path === "/progress/put") {
+          return new Response(null, {
+            status: 204,
+            headers: { "x-releasebar-progress": "durable" },
+          });
+        }
+        return new Response(null, { status: 204 });
+      },
+    }),
+  };
+  const originalFetch = globalThis.fetch;
+  const hydratedRepos: string[] = [];
+  let acked = false;
+  try {
+    globalThis.fetch = async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/users/fallback") {
+        return Response.json({ login: "fallback", type: "User" });
+      }
+      if (path === "/users/fallback/repos") {
+        return Response.json(repos);
+      }
+      if (path.endsWith("/releases")) {
+        hydratedRepos.push(path.split("/")[3] ?? "");
+        return Response.json([]);
+      }
+      if (path.endsWith("/commits/main")) {
+        return Response.json({
+          sha: "abcdef123456",
+          commit: { committer: { date: "2026-06-11T07:00:00Z" } },
+        });
+      }
+      if (path.endsWith("/pulls")) {
+        return Response.json([]);
+      }
+      if (path.endsWith("/check-runs")) {
+        return Response.json({ check_runs: [] });
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    };
+    await (
+      worker as unknown as {
+        queue(
+          batch: {
+            messages: Array<{
+              body: RefreshJob;
+              attempts?: number;
+              ack(): void;
+              retry(options?: { delaySeconds?: number }): void;
+            }>;
+          },
+          env: unknown,
+          context: unknown,
+        ): Promise<void>;
+      }
+    ).queue(
+      {
+        messages: [
+          {
+            body: job,
+            attempts: 1,
+            ack() {
+              acked = true;
+            },
+            retry() {
+              throw new Error("KV fallback progress should complete");
+            },
+          },
+        ],
+      },
+      { DASHBOARD_CACHE: cache, DASHBOARD_LOCKS: locks },
+      { waitUntil: () => undefined },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(acked, true);
+  assert.deepEqual(hydratedRepos, ["repo-13"]);
+  const dashboard = JSON.parse((await cache.get(key)) ?? "{}") as DashboardPayload;
+  assert.equal(dashboard.projects.length, 13);
+  assert.equal(dashboard.cache?.progress?.done, true);
+});
+
+test("worker does not restore stale KV progress after an authoritative Durable Object miss", async () => {
+  const key = dashboardCacheKey({
+    owner: "authoritative",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "authoritative",
+    owners: ["authoritative"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/authoritative",
+    priority: 100,
+    lastSeenAt: "2026-06-11T07:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-06-11T07:00:00Z",
+    failureCount: 0,
+  };
+  const job: RefreshJob = {
+    id: "job-authoritative-progress",
+    targetKey: key,
+    target,
+    kind: "dashboard",
+    status: "queued",
+    reason: "partial-cache",
+    createdAt: "2026-06-11T07:00:00Z",
+    updatedAt: "2026-06-11T07:00:00Z",
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const staleProject = testProject({ owner: "authoritative", name: "deleted" });
+  const cache = kvStore({
+    [`progress:v1:${key}`]: JSON.stringify({
+      scannedRepos: [staleProject.fullName.toLowerCase()],
+      projects: [staleProject],
+      updatedAt: "2026-06-11T07:00:00Z",
+    }),
+    [`refresh:job:v1:${job.id}`]: JSON.stringify(job),
+  });
+  const locks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async (request: Request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/progress/get") {
+          return new Response(null, {
+            status: 204,
+            headers: { "x-releasebar-progress": "durable" },
+          });
+        }
+        if (path === "/progress/put" || path === "/progress/delete") {
+          return new Response(null, {
+            status: 204,
+            headers: { "x-releasebar-progress": "durable" },
+          });
+        }
+        return new Response(null, { status: 204 });
+      },
+    }),
+  };
+  const originalFetch = globalThis.fetch;
+  let acked = false;
+  try {
+    globalThis.fetch = async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/users/authoritative") {
+        return Response.json({ login: "authoritative", type: "User" });
+      }
+      if (path === "/users/authoritative/repos") {
+        return Response.json([]);
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    };
+    await (
+      worker as unknown as {
+        queue(
+          batch: {
+            messages: Array<{
+              body: RefreshJob;
+              attempts?: number;
+              ack(): void;
+              retry(options?: { delaySeconds?: number }): void;
+            }>;
+          },
+          env: unknown,
+          context: unknown,
+        ): Promise<void>;
+      }
+    ).queue(
+      {
+        messages: [
+          {
+            body: job,
+            attempts: 1,
+            ack() {
+              acked = true;
+            },
+            retry() {
+              throw new Error("authoritative progress job should not retry");
+            },
+          },
+        ],
+      },
+      { DASHBOARD_CACHE: cache, DASHBOARD_LOCKS: locks },
+      { waitUntil: () => undefined },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(acked, true);
+  const dashboard = JSON.parse((await cache.get(key)) ?? "{}") as DashboardPayload;
+  assert.deepEqual(dashboard.projects, []);
+  const tombstone = JSON.parse((await cache.get(`progress:tombstone:v1:${key}`)) ?? "{}") as {
+    clearedAt?: string;
+  };
+  assert.equal(typeof tombstone.clearedAt, "string");
+});
+
+test("worker does not persist delayed progress older than its tombstone", async () => {
+  const key = dashboardCacheKey({
+    owner: "delayed-progress",
+    includeUnreleased: true,
+    includeReleaseData: false,
+    schemaVersion: 6,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "delayed-progress",
+    owners: ["delayed-progress"],
+    repos: [],
+    includeReleaseData: false,
+    path: "/delayed-progress",
+    priority: 100,
+    lastSeenAt: new Date().toISOString(),
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: new Date().toISOString(),
+    failureCount: 0,
+  };
+  const job: RefreshJob = {
+    id: "job-delayed-progress",
+    targetKey: key,
+    target,
+    kind: "dashboard",
+    status: "queued",
+    reason: "partial-cache",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const repos = Array.from({ length: 13 }, (_, index) => {
+    const name = `repo-${String(index + 1).padStart(2, "0")}`;
+    return {
+      owner: { login: "delayed-progress" },
+      name,
+      full_name: `delayed-progress/${name}`,
+      description: null,
+      html_url: `https://github.com/delayed-progress/${name}`,
+      default_branch: "main",
+      language: null,
+      stargazers_count: 0,
+      forks_count: 0,
+      open_issues_count: 0,
+      archived: false,
+      pushed_at: "2026-06-11T06:00:00Z",
+      updated_at: "2026-06-11T06:00:00Z",
+      fork: false,
+      private: false,
+    };
+  });
+  const cache = kvStore({
+    [`progress:tombstone:v1:${key}`]: JSON.stringify({
+      clearedAt: "2999-01-01T00:00:00Z",
+    }),
+    [`refresh:job:v1:${job.id}`]: JSON.stringify(job),
+  });
+  const originalFetch = globalThis.fetch;
+  let retryDelaySeconds: number | undefined;
+
+  globalThis.fetch = async (input) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/users/delayed-progress") {
+      return Response.json({ login: "delayed-progress", type: "User" });
+    }
+    if (path === "/users/delayed-progress/repos") {
+      return Response.json(repos);
+    }
+    throw new Error(`unexpected fetch ${path}`);
+  };
+
+  try {
+    await (
+      worker as unknown as {
+        queue(
+          batch: {
+            messages: Array<{
+              body: RefreshJob;
+              attempts?: number;
+              ack(): void;
+              retry(options?: { delaySeconds?: number }): void;
+            }>;
+          },
+          env: unknown,
+          context: unknown,
+        ): Promise<void>;
+      }
+    ).queue(
+      {
+        messages: [
+          {
+            body: job,
+            attempts: 1,
+            ack() {
+              throw new Error("partial delayed progress should retry");
+            },
+            retry(options) {
+              retryDelaySeconds = options?.delaySeconds;
+            },
+          },
+        ],
+      },
+      { DASHBOARD_CACHE: cache },
+      { waitUntil: () => undefined },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(retryDelaySeconds, 2);
+  assert.equal(await cache.get(`progress:v1:${key}`), null);
+  const dashboard = JSON.parse((await cache.get(key)) ?? "{}") as DashboardPayload;
+  assert.equal(dashboard.cache?.progress?.scanned, 12);
+  assert.equal(dashboard.cache?.progress?.done, false);
+});
+
+test("worker tombstones failed Durable Object progress deletion before publishing fresh cache", async () => {
+  const originalFetch = globalThis.fetch;
+  const key = dashboardCacheKey({
+    owner: "delete-failure",
+    includeUnreleased: false,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const progressStorageKey = `progress:v1:${key}`;
+  const progressTombstoneStorageKey = `progress:tombstone:v1:${key}`;
+  const storedProgress = JSON.stringify({
+    scannedRepos: [],
+    projects: [],
+    updatedAt: new Date().toISOString(),
+  });
+  const cache = kvStore({ [progressStorageKey]: storedProgress });
+  const staleProject = testProject({
+    owner: "delete-failure",
+    name: "repo",
+    version: "v0.1.0",
+    releaseDate: "2025-01-01T00:00:00Z",
+  });
+  let released = false;
+  let deleteAttempts = 0;
+  let deleteFails = true;
+  let durableProgressPresent = false;
+  const locks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async (request: Request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/acquire") {
+          return new Response(null, { status: 204 });
+        }
+        if (path === "/release") {
+          released = true;
+          return new Response(null, { status: 204 });
+        }
+        if (path === "/progress/get") {
+          return durableProgressPresent
+            ? Response.json(
+                {
+                  scannedRepos: [staleProject.fullName.toLowerCase()],
+                  projects: [staleProject],
+                  updatedAt: "2026-06-10T00:00:00Z",
+                },
+                { headers: { "x-releasebar-progress": "durable" } },
+              )
+            : new Response(null, {
+                status: 204,
+                headers: { "x-releasebar-progress": "durable" },
+              });
+        }
+        if (path === "/progress/delete") {
+          deleteAttempts += 1;
+          if (!deleteFails) {
+            durableProgressPresent = false;
+            return new Response(null, {
+              status: 204,
+              headers: { "x-releasebar-progress": "durable" },
+            });
+          }
+          durableProgressPresent = true;
+          return new Response(null, {
+            status: 503,
+            headers: { "x-releasebar-progress": "durable" },
+          });
+        }
+        if (path === "/job/reserve" || path === "/job/release") {
+          return new Response(null, { status: 204 });
+        }
+        return new Response(null, { status: 404 });
+      },
+    }),
+  };
+  globalThis.fetch = async (input) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/users/delete-failure") {
+      return Response.json({ login: "delete-failure", type: "User" });
+    }
+    if (path === "/users/delete-failure/repos") {
+      return Response.json([
+        {
+          owner: { login: "delete-failure" },
+          name: "repo",
+          full_name: "delete-failure/repo",
+          description: null,
+          html_url: "https://github.com/delete-failure/repo",
+          default_branch: "main",
+          language: null,
+          stargazers_count: 0,
+          forks_count: 0,
+          open_issues_count: 0,
+          archived: false,
+          pushed_at: "2026-06-11T06:00:00Z",
+          updated_at: "2026-06-11T06:00:00Z",
+          fork: false,
+          private: false,
+        },
+      ]);
+    }
+    if (path.endsWith("/releases")) {
+      return Response.json([
+        {
+          tag_name: "v1.0.0",
+          name: null,
+          html_url: "https://github.com/delete-failure/repo/releases/v1.0.0",
+          draft: false,
+          published_at: "2026-06-10T00:00:00Z",
+        },
+      ]);
+    }
+    if (path.endsWith("/commits/main")) {
+      return Response.json({
+        sha: "abcdef123456",
+        commit: { committer: { date: "2026-06-11T00:00:00Z" } },
+      });
+    }
+    if (path.includes("/compare/")) {
+      return Response.json({
+        total_commits: 0,
+        html_url: "https://github.com/delete-failure/repo/compare",
+      });
+    }
+    if (path.endsWith("/pulls")) {
+      return Response.json([]);
+    }
+    if (path.endsWith("/check-runs")) {
+      return Response.json({ check_runs: [] });
+    }
+    throw new Error(`unexpected fetch ${path}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/delete-failure?unreleased=false"),
+      {
+        DASHBOARD_CACHE: cache,
+        DASHBOARD_LOCKS: locks,
+      },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.cache?.state, "fresh");
+    assert.equal(body.projects[0]?.version, "v1.0.0");
+    const tombstone = JSON.parse((await cache.get(progressTombstoneStorageKey)) ?? "{}") as {
+      clearedAt?: string;
+    };
+    assert.equal(typeof tombstone.clearedAt, "string");
+    const cached = JSON.parse((await cache.get(key)) ?? "{}") as DashboardPayload;
+    assert.equal(cached.cache?.state, "fresh");
+    assert.equal(deleteAttempts, 1);
+    assert.equal(released, true);
+
+    deleteFails = false;
+    const target: RefreshTarget = {
+      key,
+      kind: "dashboard",
+      owner: "delete-failure",
+      owners: ["delete-failure"],
+      repos: [],
+      includeReleaseData: true,
+      path: "/delete-failure?unreleased=false",
+      priority: 100,
+      lastSeenAt: new Date().toISOString(),
+      lastAttemptAt: null,
+      lastSuccessAt: null,
+      nextDueAt: new Date().toISOString(),
+      failureCount: 0,
+    };
+    const job: RefreshJob = {
+      id: "job-delete-failure-recovery",
+      targetKey: key,
+      target,
+      kind: "dashboard",
+      status: "queued",
+      reason: "error-cache",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      startedAt: null,
+      finishedAt: null,
+      attempts: 0,
+      durationMs: null,
+    };
+    let acked = false;
+    await (
+      worker as unknown as {
+        queue(
+          batch: {
+            messages: Array<{
+              body: RefreshJob;
+              attempts?: number;
+              ack(): void;
+              retry(options?: { delaySeconds?: number }): void;
+            }>;
+          },
+          env: unknown,
+          context: unknown,
+        ): Promise<void>;
+      }
+    ).queue(
+      {
+        messages: [
+          {
+            body: job,
+            attempts: 1,
+            ack() {
+              acked = true;
+            },
+            retry() {
+              throw new Error("recovered progress deletion should not retry");
+            },
+          },
+        ],
+      },
+      {
+        DASHBOARD_CACHE: cache,
+        DASHBOARD_LOCKS: locks,
+      },
+      { waitUntil: () => undefined },
+    );
+
+    assert.equal(acked, true);
+    const recovered = JSON.parse((await cache.get(key)) ?? "{}") as DashboardPayload;
+    assert.equal(recovered.cache?.state, "fresh");
+    assert.equal(recovered.projects[0]?.version, "v1.0.0");
+    const recoveredTombstone = JSON.parse(
+      (await cache.get(progressTombstoneStorageKey)) ?? "{}",
+    ) as { clearedAt?: string };
+    assert.equal(typeof recoveredTombstone.clearedAt, "string");
+    assert.equal(deleteAttempts >= 2, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("worker rejects oversized custom source requests", async () => {
@@ -6749,6 +8328,8 @@ test("worker keeps signed-in mixed-account dashboards on shared release scans", 
   const sessionId = "session-mixed-dashboard";
   const exp = Math.floor(Date.now() / 1000) + 600;
   const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const sentJobs: RefreshJob[] = [];
+  const waits: Promise<unknown>[] = [];
   const env = {
     AUTH_COOKIE_SECRET: "test-secret",
     DASHBOARD_CACHE: kvStore({
@@ -6768,6 +8349,11 @@ test("worker keeps signed-in mixed-account dashboards on shared release scans", 
     GITHUB_APP_ID: "123",
     GITHUB_APP_PRIVATE_KEY: "private-key",
     GITHUB_TOKEN: "shared-token",
+    REFRESH_QUEUE: {
+      async send(job: RefreshJob) {
+        sentJobs.push(job);
+      },
+    },
   };
   const graphqlIncludeReleases: boolean[] = [];
   const originalFetch = globalThis.fetch;
@@ -6822,11 +8408,14 @@ test("worker keeps signed-in mixed-account dashboards on shared release scans", 
         headers: { cookie: `rd_session=${authCookie}` },
       }),
       env,
-      { waitUntil: () => undefined },
+      { waitUntil: (promise) => waits.push(promise) },
     );
     assert.equal(response.status, 200);
     const body = (await response.json()) as DashboardPayload;
-    assert.deepEqual(graphqlIncludeReleases, [true, true]);
+    await Promise.all(waits);
+    assert.deepEqual(graphqlIncludeReleases, [false, false]);
+    assert.equal(sentJobs.length, 1);
+    assert.equal(sentJobs[0]?.reason, "cold-metadata");
     assert.equal(body.cache?.quota?.source, "shared");
     assert.equal(body.cache?.quota?.remaining, 4996);
     assert.doesNotMatch(body.cache?.message ?? "", /release scan skipped/);
@@ -6889,6 +8478,8 @@ test("worker keeps unsynced app-configured owner dashboards metadata-only", asyn
     assert.equal(response.headers.get("vary"), "cookie");
     assert.equal(body.projects[0]?.version, "repo search");
     assert.equal(body.projects[0]?.commitsSinceRelease, null);
+    assert.equal(body.projects[0]?.openIssues, null);
+    assert.equal(body.projects[0]?.openPullRequests, null);
     assert.match(body.cache?.message ?? "", /release scan skipped/);
     assert.equal(await env.DASHBOARD_CACHE.get("hot:index:v3"), null);
   } finally {
@@ -6928,6 +8519,7 @@ test("worker uses GitHub App installation token for cold owner dashboards", asyn
     GITHUB_APP_SLUG: "releasebar-app",
   };
   const originalFetch = globalThis.fetch;
+  const waits: Promise<unknown>[] = [];
   let ownerResolvedWithInstallationToken = false;
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
@@ -6992,11 +8584,12 @@ test("worker uses GitHub App installation token for cold owner dashboards", asyn
         headers: { cookie: `rd_session=${authCookie}` },
       }),
       env,
-      { waitUntil: () => undefined },
+      { waitUntil: (promise) => waits.push(promise) },
     );
     assert.equal(response.status, 200);
     assert.equal(ownerResolvedWithInstallationToken, true);
     const body = (await response.json()) as DashboardPayload;
+    await Promise.all(waits);
     assert.equal(body.cache?.quota?.source, "app");
     assert.equal(body.cache?.quota?.account, "openclaw");
     assert.equal(body.cache?.quota?.remaining, 4997);
@@ -7032,6 +8625,7 @@ test("worker uses registered source-owned app tokens for anonymous owner dashboa
   const originalFetch = globalThis.fetch;
   const originalLog = console.log;
   const auditLogs: unknown[] = [];
+  const waits: Promise<unknown>[] = [];
   let ownerResolvedWithInstallationToken = false;
   console.log = (message?: unknown) => {
     if (typeof message === "string" && message.includes("github_token_use")) {
@@ -7078,11 +8672,12 @@ test("worker uses registered source-owned app tokens for anonymous owner dashboa
   };
   try {
     const response = await worker.fetch(new Request("https://release.bar/api/openclaw"), env, {
-      waitUntil: () => undefined,
+      waitUntil: (promise) => waits.push(promise),
     });
     assert.equal(response.status, 200);
     assert.equal(ownerResolvedWithInstallationToken, true);
     const body = (await response.json()) as DashboardPayload;
+    await Promise.all(waits);
     assert.equal(body.cache?.quota?.source, "app");
     assert.equal(body.cache?.quota?.account, "openclaw");
     assert.equal(body.cache?.quota?.remaining, 4998);
@@ -7118,6 +8713,7 @@ test("worker discovers and stores source-owned app installs for anonymous dashbo
   };
   const originalFetch = globalThis.fetch;
   const originalLog = console.log;
+  const waits: Promise<unknown>[] = [];
   console.log = () => undefined;
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
@@ -7165,10 +8761,11 @@ test("worker discovers and stores source-owned app installs for anonymous dashbo
   };
   try {
     const response = await worker.fetch(new Request("https://release.bar/api/openclaw"), env, {
-      waitUntil: () => undefined,
+      waitUntil: (promise) => waits.push(promise),
     });
     assert.equal(response.status, 200);
     const body = (await response.json()) as DashboardPayload;
+    await Promise.all(waits);
     assert.equal(body.cache?.quota?.source, "app");
     assert.equal(body.cache?.quota?.account, "openclaw");
     const stored = JSON.parse((await cache.get("auth:installation:v1:openclaw")) ?? "{}");
@@ -7204,6 +8801,7 @@ test("worker saves owner public defaults and applies them to clean owner URLs", 
     GITHUB_TOKEN: "shared-token",
   };
   const originalFetch = globalThis.fetch;
+  const waits: Promise<unknown>[] = [];
   globalThis.fetch = async (input) => {
     const url = new URL(String(input));
     const path = url.pathname;
@@ -7297,10 +8895,11 @@ test("worker saves owner public defaults and applies them to clean owner URLs", 
     assert.deepEqual(saved.profile.includeRepos, ["openclaw/peekaboo"]);
 
     const response = await worker.fetch(new Request("https://release.bar/api/steipete"), env, {
-      waitUntil: () => undefined,
+      waitUntil: (promise) => waits.push(promise),
     });
     assert.equal(response.status, 200, await response.clone().text());
     const body = (await response.json()) as DashboardPayload;
+    await Promise.all(waits);
     assert.equal(body.profile?.owner, "steipete");
     assert.equal(body.projects[0]?.fullName, "openclaw/peekaboo");
   } finally {
@@ -7397,10 +8996,11 @@ test("worker admin scheduler requires an admin session and reports refresh targe
   const sessionId = "session-admin";
   const otherSessionId = "session-admin-other";
   const exp = Math.floor(Date.now() / 1000) + 600;
+  const activeAt = new Date().toISOString();
   const authCookie = await signedJson("test-secret", { id: sessionId, exp });
   const otherAuthCookie = await signedJson("test-secret", { id: otherSessionId, exp });
   const target: RefreshTarget = {
-    key: "dashboard:v5:owner=openclaw",
+    key: "dashboard:v6:owner=openclaw",
     kind: "dashboard",
     owner: "openclaw",
     owners: ["openclaw"],
@@ -7414,14 +9014,15 @@ test("worker admin scheduler requires an admin session and reports refresh targe
     nextDueAt: "2026-05-15T13:00:00Z",
     failureCount: 0,
   };
+  const legacyTarget = { ...target, key: "dashboard:v5:owner=legacy", owner: "legacy" };
   const activeJob: RefreshJob = {
     id: "job-active",
     targetKey: target.key,
     kind: "dashboard",
     status: "queued",
     reason: "scheduled",
-    createdAt: "2026-05-15T12:59:00Z",
-    updatedAt: "2026-05-15T12:59:00Z",
+    createdAt: activeAt,
+    updatedAt: activeAt,
     startedAt: null,
     finishedAt: null,
     attempts: 0,
@@ -7454,6 +9055,7 @@ test("worker admin scheduler requires an admin session and reports refresh targe
       exp,
     }),
     [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+    [`refresh:target:v1:${legacyTarget.key}`]: JSON.stringify(legacyTarget),
     [`refresh:job:v1:${activeJob.id}`]: JSON.stringify(activeJob),
     "refresh:jobs:index:v1": JSON.stringify([activeJob.id]),
     [`github:access:v1:${accessHour}:dashboard:shared:_:graphql:200:graphql`]: JSON.stringify({
@@ -7536,6 +9138,80 @@ test("worker admin scheduler requires an admin session and reports refresh targe
   assert.equal(runBody.enqueued, 0);
   assert.equal(runBody.due, 0);
   assert.deepEqual(sentJobs, []);
+});
+
+test("worker queue skips jobs from obsolete dashboard schemas", async () => {
+  const key = "dashboard:v5:owner=legacy";
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "legacy",
+    owners: ["legacy"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/legacy",
+    priority: 100,
+    lastSeenAt: new Date().toISOString(),
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: new Date().toISOString(),
+    failureCount: 0,
+  };
+  const job: RefreshJob = {
+    id: "job-obsolete-schema",
+    targetKey: key,
+    target,
+    kind: "dashboard",
+    status: "queued",
+    reason: "scheduled",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const cache = kvStore({
+    [`refresh:job:v1:${job.id}`]: JSON.stringify(job),
+  });
+  let acked = false;
+
+  await (
+    worker as unknown as {
+      queue(
+        batch: {
+          messages: Array<{
+            body: RefreshJob;
+            ack(): void;
+            retry(options?: { delaySeconds?: number }): void;
+          }>;
+        },
+        env: unknown,
+        context: unknown,
+      ): Promise<void>;
+    }
+  ).queue(
+    {
+      messages: [
+        {
+          body: job,
+          ack() {
+            acked = true;
+          },
+          retry() {
+            throw new Error("obsolete jobs should not retry");
+          },
+        },
+      ],
+    },
+    { DASHBOARD_CACHE: cache },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(acked, true);
+  const stored = JSON.parse((await cache.get(`refresh:job:v1:${job.id}`)) ?? "{}") as RefreshJob;
+  assert.equal(stored.status, "skipped");
+  assert.equal(stored.error, "obsolete dashboard schema");
 });
 
 test("worker admin installation sync removes stale registry entries", async () => {
@@ -7774,7 +9450,7 @@ test("worker admin scheduler counts missing caches as due even before nextDueAt"
   const exp = Math.floor(Date.now() / 1000) + 600;
   const authCookie = await signedJson("test-secret", { id: sessionId, exp });
   const target: RefreshTarget = {
-    key: "dashboard:v5:owner=openclaw",
+    key: "dashboard:v6:owner=openclaw",
     kind: "dashboard",
     owner: "openclaw",
     owners: ["openclaw"],
@@ -7820,12 +9496,64 @@ test("worker admin scheduler counts missing caches as due even before nextDueAt"
   assert.equal(body.status.dueTargets, 1);
 });
 
+test("worker admin scheduler respects transient failure retry delay", async () => {
+  const sessionId = "session-admin-retry-delay";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const target: RefreshTarget = {
+    key: "dashboard:v6:owner=retrying",
+    kind: "dashboard",
+    owner: "retrying",
+    owners: ["retrying"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/retrying",
+    priority: 100,
+    lastSeenAt: new Date().toISOString(),
+    lastAttemptAt: new Date().toISOString(),
+    lastSuccessAt: null,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 1,
+    terminalBackoffUntil: null,
+  };
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler", {
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    {
+      AUTH_COOKIE_SECRET: "test-secret",
+      DASHBOARD_CACHE: cache,
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as SchedulerAdminPayload;
+  assert.equal(body.status.dueTargets, 0);
+});
+
 test("worker scheduler skips shared cold targets while GraphQL is backed off", async () => {
   const sessionId = "session-admin-graphql-backoff";
   const exp = Math.floor(Date.now() / 1000) + 600;
   const authCookie = await signedJson("test-secret", { id: sessionId, exp });
   const target: RefreshTarget = {
-    key: "dashboard:v5:owner=backedoff",
+    key: "dashboard:v6:owner=backedoff",
     kind: "dashboard",
     owner: "backedoff",
     owners: ["backedoff"],
@@ -7898,7 +9626,7 @@ test("worker scheduler keeps dormant shared targets on weekly cadence after succ
     owner: "sleepy",
     includeUnreleased: true,
     includeReleaseData: false,
-    schemaVersion: 5,
+    schemaVersion: 6,
   });
   const lastRefreshAt = new Date(now - 25 * 60 * 60 * 1000).toISOString();
   const target: RefreshTarget = {
@@ -7965,7 +9693,7 @@ test("worker scheduler still rebuilds missing dormant shared caches", async () =
   const authCookie = await signedJson("test-secret", { id: sessionId, exp });
   const now = Date.now();
   const target: RefreshTarget = {
-    key: "dashboard:v5:owner=sleepy-missing",
+    key: "dashboard:v6:owner=sleepy-missing",
     kind: "dashboard",
     owner: "sleepy-missing",
     owners: ["sleepy-missing"],
@@ -8005,6 +9733,249 @@ test("worker scheduler still rebuilds missing dormant shared caches", async () =
       AUTH_COOKIE_SECRET: "test-secret",
       DASHBOARD_CACHE: cache,
       GITHUB_TOKEN: "shared-token",
+      REFRESH_QUEUE: {
+        async send(job: RefreshJob) {
+          sentJobs.push(job);
+        },
+      },
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { due: number; enqueued: number };
+  assert.equal(body.due, 1);
+  assert.equal(body.enqueued, 1);
+  assert.equal(sentJobs.length, 1);
+});
+
+test("worker scheduler preserves queued backlog jobs until reservation expiry", async () => {
+  const sessionId = "session-admin-stale-queued";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const target: RefreshTarget = {
+    key: "dashboard:v6:owner=stale-queued",
+    kind: "dashboard",
+    owner: "stale-queued",
+    owners: ["stale-queued"],
+    repos: [],
+    includeReleaseData: false,
+    path: "/stale-queued",
+    priority: 100,
+    lastSeenAt: new Date().toISOString(),
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const queuedJob: RefreshJob = {
+    id: "queued-backlog-job",
+    targetKey: target.key,
+    target,
+    kind: "dashboard",
+    status: "queued",
+    reason: "partial-cache",
+    createdAt: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
+    updatedAt: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
+    startedAt: null,
+    finishedAt: null,
+    attempts: 1,
+    durationMs: null,
+    error: "dashboard incomplete",
+  };
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+    [`refresh:job:v1:${queuedJob.id}`]: JSON.stringify(queuedJob),
+    "refresh:jobs:index:v1": JSON.stringify([queuedJob.id]),
+  });
+  const sentJobs: RefreshJob[] = [];
+
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: cache,
+    REFRESH_QUEUE: {
+      async send(job: RefreshJob) {
+        sentJobs.push(job);
+      },
+    },
+  };
+  const request = () =>
+    new Request("https://release.bar/api/admin/scheduler/run", {
+      method: "POST",
+      headers: { cookie: `rd_session=${authCookie}` },
+    });
+
+  const activeResponse = await worker.fetch(request(), env, { waitUntil: () => undefined });
+  assert.equal(activeResponse.status, 200);
+  const activeBody = (await activeResponse.json()) as { due: number; enqueued: number };
+  assert.equal(activeBody.due, 0);
+  assert.equal(activeBody.enqueued, 0);
+  assert.equal(sentJobs.length, 0);
+
+  const expiredJob = {
+    ...queuedJob,
+    createdAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+    updatedAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+  };
+  await cache.put(`refresh:job:v1:${queuedJob.id}`, JSON.stringify(expiredJob));
+
+  const expiredResponse = await worker.fetch(request(), env, { waitUntil: () => undefined });
+
+  assert.equal(expiredResponse.status, 200);
+  const expiredBody = (await expiredResponse.json()) as { due: number; enqueued: number };
+  assert.equal(expiredBody.due, 1);
+  assert.equal(expiredBody.enqueued, 1);
+  assert.equal(sentJobs.length, 1);
+  assert.notEqual(sentJobs[0]?.id, queuedJob.id);
+});
+
+test("worker clears fallback reservations after active-job scans fail", async () => {
+  const sessionId = "session-admin-reservation-scan-failure";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const target: RefreshTarget = {
+    key: "dashboard:v6:owner=reservation-scan-failure",
+    kind: "dashboard",
+    owner: "reservation-scan-failure",
+    owners: ["reservation-scan-failure"],
+    repos: [],
+    includeReleaseData: false,
+    path: "/reservation-scan-failure",
+    priority: 100,
+    lastSeenAt: new Date().toISOString(),
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2000-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const backingCache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+  });
+  let refreshJobListCalls = 0;
+  const cache = {
+    ...backingCache,
+    async list(options: { prefix?: string; limit?: number; cursor?: string } = {}) {
+      if (options.prefix?.startsWith("refresh:job")) {
+        refreshJobListCalls += 1;
+      }
+      if (refreshJobListCalls === 3) {
+        throw new Error("active job scan failed");
+      }
+      return backingCache.list(options);
+    },
+  };
+  const unavailableLocks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async () => new Response(null, { status: 500 }),
+    }),
+  };
+  const sentJobs: RefreshJob[] = [];
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: cache,
+    DASHBOARD_LOCKS: unavailableLocks,
+    REFRESH_QUEUE: {
+      async send(job: RefreshJob) {
+        sentJobs.push(job);
+      },
+    },
+  };
+  const request = () =>
+    new Request("https://release.bar/api/admin/scheduler/run", {
+      method: "POST",
+      headers: { cookie: `rd_session=${authCookie}` },
+    });
+
+  await assert.rejects(
+    worker.fetch(request(), env, { waitUntil: () => undefined }),
+    /active job scan failed/,
+  );
+  assert.equal(sentJobs.length, 0);
+
+  const response = await worker.fetch(request(), env, { waitUntil: () => undefined });
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { due: number; enqueued: number };
+  assert.equal(body.due, 1);
+  assert.equal(body.enqueued, 1);
+  assert.equal(sentJobs.length, 1);
+});
+
+test("worker scheduler falls back when the reservation Durable Object is unavailable", async () => {
+  const sessionId = "session-admin-reservation-fallback";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const target: RefreshTarget = {
+    key: "dashboard:v6:owner=reservation-fallback",
+    kind: "dashboard",
+    owner: "reservation-fallback",
+    owners: ["reservation-fallback"],
+    repos: [],
+    includeReleaseData: false,
+    path: "/reservation-fallback",
+    priority: 100,
+    lastSeenAt: new Date().toISOString(),
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2000-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+  });
+  const sentJobs: RefreshJob[] = [];
+  const unavailableLocks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async () => new Response(null, { status: 500 }),
+    }),
+  };
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler/run", {
+      method: "POST",
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    {
+      AUTH_COOKIE_SECRET: "test-secret",
+      DASHBOARD_CACHE: cache,
+      DASHBOARD_LOCKS: unavailableLocks,
       REFRESH_QUEUE: {
         async send(job: RefreshJob) {
           sentJobs.push(job);
@@ -8129,7 +10100,7 @@ test("worker admin scheduler defers shared quota paused targets even with missin
   const exp = Math.floor(Date.now() / 1000) + 600;
   const authCookie = await signedJson("test-secret", { id: sessionId, exp });
   const target: RefreshTarget = {
-    key: "dashboard:v5:owner=openclaw",
+    key: "dashboard:v6:owner=openclaw",
     kind: "dashboard",
     owner: "openclaw",
     owners: ["openclaw"],
@@ -8190,7 +10161,7 @@ test("worker admin scheduler lets app-token targets bypass shared quota pauses",
   const exp = Math.floor(Date.now() / 1000) + 600;
   const authCookie = await signedJson("test-secret", { id: sessionId, exp });
   const target: RefreshTarget = {
-    key: "dashboard:v5:owner=openclaw",
+    key: "dashboard:v6:owner=openclaw",
     kind: "dashboard",
     owner: "openclaw",
     owners: ["openclaw"],
@@ -8264,7 +10235,7 @@ test("worker admin scheduler uses app registry coverage without minting tokens",
   const exp = Math.floor(Date.now() / 1000) + 600;
   const authCookie = await signedJson("test-secret", { id: sessionId, exp });
   const target: RefreshTarget = {
-    key: "dashboard:v5:owner=openclaw",
+    key: "dashboard:v6:owner=openclaw",
     kind: "dashboard",
     owner: "openclaw",
     owners: ["openclaw"],
@@ -8340,7 +10311,7 @@ test("worker admin scheduler bypasses shared quota defer time with app coverage"
     owner: "openclaw",
     includeUnreleased: true,
     includeReleaseData: true,
-    schemaVersion: 5,
+    schemaVersion: 6,
   });
   const target: RefreshTarget = {
     key,
@@ -8419,7 +10390,7 @@ test("worker scheduler marks jobs failed when queue delivery fails", async () =>
   const exp = Math.floor(Date.now() / 1000) + 600;
   const authCookie = await signedJson("test-secret", { id: sessionId, exp });
   const target: RefreshTarget = {
-    key: "dashboard:v5:owner=openclaw",
+    key: "dashboard:v6:owner=openclaw",
     kind: "dashboard",
     owner: "openclaw",
     owners: ["openclaw"],
@@ -8469,9 +10440,14 @@ test("worker scheduler marks jobs failed when queue delivery fails", async () =>
     /queue unavailable/,
   );
 
-  const ids = JSON.parse((await cache.get("refresh:jobs:index:v1")) ?? "[]") as string[];
-  assert.equal(ids.length, 1);
-  const stored = JSON.parse((await cache.get(`refresh:job:v1:${ids[0]}`)) ?? "{}") as RefreshJob;
+  const indexedJobs = await cache.list({ prefix: "refresh:jobs:v2:" });
+  assert.equal(indexedJobs.keys.length, 1);
+  const indexed = JSON.parse(
+    (await cache.get(indexedJobs.keys[0]?.name ?? "")) ?? "{}",
+  ) as RefreshJob;
+  const stored = JSON.parse(
+    (await cache.get(`refresh:job:v1:${indexed.id}`)) ?? "{}",
+  ) as RefreshJob;
   assert.equal(stored.status, "failed");
   assert.match(stored.error ?? "", /queue unavailable/);
 });
@@ -8481,7 +10457,7 @@ test("worker refresh jobs can use shared quota when no source app token exists",
     owner: "openclaw",
     includeUnreleased: true,
     includeReleaseData: true,
-    schemaVersion: 5,
+    schemaVersion: 6,
   });
   const target: RefreshTarget = {
     key,
@@ -8501,6 +10477,7 @@ test("worker refresh jobs can use shared quota when no source app token exists",
   const job: RefreshJob = {
     id: "job-shared",
     targetKey: key,
+    target,
     kind: "dashboard",
     status: "queued",
     reason: "scheduled",
@@ -8512,7 +10489,6 @@ test("worker refresh jobs can use shared quota when no source app token exists",
     durationMs: null,
   };
   const cache = kvStore({
-    [`refresh:target:v1:${key}`]: JSON.stringify(target),
     [`refresh:job:v1:${job.id}`]: JSON.stringify(job),
   });
   const originalFetch = globalThis.fetch;
@@ -8596,12 +10572,1003 @@ test("worker refresh jobs can use shared quota when no source app token exists",
   assert.deepEqual(paths, ["/users/openclaw", "/graphql"]);
 });
 
+test("worker refresh jobs preserve profile filters from the queued target snapshot", async () => {
+  const key = dashboardCacheKey({
+    owner: "profiled",
+    includeUnreleased: true,
+    includeReleaseData: false,
+    schemaVersion: 6,
+  });
+  const profile = {
+    owner: "profiled",
+    includeOwners: [],
+    includeRepos: [],
+    hiddenOwners: [],
+    hiddenRepos: ["profiled/secret"],
+    updatedAt: "2026-06-11T07:00:00Z",
+    updatedBy: "profiled",
+  };
+  const profileSnapshotKey = `refresh:profile-snapshot:v1:profiled:${encodeURIComponent(
+    profile.updatedAt,
+  )}`;
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "profiled",
+    owners: ["profiled"],
+    repos: [],
+    profileSnapshotKey,
+    includeReleaseData: false,
+    path: "/profiled",
+    priority: 100,
+    lastSeenAt: "2026-06-11T07:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-06-11T07:00:00Z",
+    failureCount: 0,
+  };
+  const targetSnapshotKey = `refresh:jobs:v2:${String(
+    Number.MAX_SAFE_INTEGER - Date.parse("2026-06-11T07:00:00Z"),
+  ).padStart(16, "0")}:job-profile-snapshot`;
+  const job: RefreshJob = {
+    id: "job-profile-snapshot",
+    targetKey: key,
+    target,
+    targetSnapshotKey,
+    kind: "dashboard",
+    status: "queued",
+    reason: "cold-metadata",
+    createdAt: "2026-06-11T07:00:00Z",
+    updatedAt: "2026-06-11T07:00:00Z",
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const latestLastSeenAt = "2026-06-11T07:30:00Z";
+  const latestPath = "/profiled?sort=prs&dir=desc";
+  const backingCache = kvStore({
+    [targetSnapshotKey]: JSON.stringify(job),
+    [profileSnapshotKey]: JSON.stringify(profile),
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+  });
+  let mutableJobWrites = 0;
+  const cache = {
+    ...backingCache,
+    async put(storageKey: string, value: string) {
+      if (storageKey === `refresh:job:v1:${job.id}`) {
+        mutableJobWrites += 1;
+      }
+      await backingCache.put(storageKey, value);
+    },
+  };
+  const originalFetch = globalThis.fetch;
+  let releaseOwnerFetch: (() => void) | undefined;
+  const ownerFetchGate = new Promise<void>((resolve) => {
+    releaseOwnerFetch = resolve;
+  });
+  let markOwnerFetchStarted: (() => void) | undefined;
+  const ownerFetchStarted = new Promise<void>((resolve) => {
+    markOwnerFetchStarted = resolve;
+  });
+  const repo = (name: string) => ({
+    owner: { login: "profiled" },
+    name,
+    full_name: `profiled/${name}`,
+    description: null,
+    html_url: `https://github.com/profiled/${name}`,
+    default_branch: "main",
+    language: "TypeScript",
+    stargazers_count: 1,
+    forks_count: 0,
+    open_issues_count: 0,
+    archived: false,
+    pushed_at: "2026-06-11T06:00:00Z",
+    updated_at: "2026-06-11T06:00:00Z",
+    fork: false,
+    private: false,
+  });
+  let acked = false;
+  try {
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/users/profiled") {
+        await cache.put(
+          `refresh:target:v1:${key}`,
+          JSON.stringify({
+            ...target,
+            lastSeenAt: latestLastSeenAt,
+            path: latestPath,
+          }),
+        );
+        markOwnerFetchStarted?.();
+        await ownerFetchGate;
+        return Response.json({ login: "profiled", type: "User" });
+      }
+      if (url.pathname === "/users/profiled/repos") {
+        return Response.json([repo("visible"), repo("secret")]);
+      }
+      throw new Error(`unexpected fetch ${url.pathname}`);
+    };
+
+    const processing = (
+      worker as unknown as {
+        queue(
+          batch: {
+            messages: Array<{
+              body: RefreshJob;
+              attempts?: number;
+              ack(): void;
+              retry(options?: { delaySeconds?: number }): void;
+            }>;
+          },
+          env: unknown,
+          context: unknown,
+        ): Promise<void>;
+      }
+    ).queue(
+      {
+        messages: [
+          {
+            body: { ...job, target: undefined },
+            attempts: 1,
+            ack() {
+              acked = true;
+            },
+            retry() {
+              throw new Error("profile snapshot job should not retry");
+            },
+          },
+        ],
+      },
+      { DASHBOARD_CACHE: cache },
+      { waitUntil: () => undefined },
+    );
+    await ownerFetchStarted;
+    const deliveries = await cache.list({ prefix: "refresh:job-deliveries:v1:" });
+    assert.equal(deliveries.keys.length, 1);
+    const running = JSON.parse(
+      (await cache.get(deliveries.keys[0]?.name ?? "")) ?? "{}",
+    ) as RefreshJob;
+    assert.equal(running.status, "running");
+    assert.notEqual(running.startedAt, null);
+    releaseOwnerFetch?.();
+    await processing;
+  } finally {
+    releaseOwnerFetch?.();
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(acked, true);
+  assert.equal(mutableJobWrites, 1);
+  const dashboard = JSON.parse((await cache.get(key)) ?? "{}") as DashboardPayload;
+  assert.deepEqual(dashboard.profile, profile);
+  assert.deepEqual(
+    dashboard.projects.map((project) => project.fullName),
+    ["profiled/visible"],
+  );
+  const updatedTarget = JSON.parse(
+    (await cache.get(`refresh:target:v1:${key}`)) ?? "{}",
+  ) as RefreshTarget;
+  assert.equal(updatedTarget.lastSeenAt, latestLastSeenAt);
+  assert.equal(updatedTarget.path, latestPath);
+});
+
+test("worker retries refresh jobs when the dashboard build lock is busy", async () => {
+  const key = dashboardCacheKey({
+    owner: "openclaw",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "openclaw",
+    owners: ["openclaw"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/openclaw",
+    priority: 100,
+    lastSeenAt: "2026-05-15T12:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-05-15T13:00:00Z",
+    failureCount: 0,
+  };
+  const job: RefreshJob = {
+    id: "job-locked",
+    targetKey: key,
+    kind: "dashboard",
+    status: "queued",
+    reason: "partial-cache",
+    createdAt: "2026-05-15T13:00:00Z",
+    updatedAt: "2026-05-15T13:00:00Z",
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const cache = kvStore({
+    [key]: JSON.stringify(
+      testDashboard("openclaw", [testProject({ owner: "openclaw", name: "repo" })]),
+    ),
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+    [`refresh:job:v1:${job.id}`]: JSON.stringify(job),
+  });
+  const busyLocks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async (request: Request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/job/reserve") {
+          return new Response(null, { status: 204 });
+        }
+        if (path === "/acquire") {
+          return new Response(null, { status: 409 });
+        }
+        return new Response(null, { status: 204 });
+      },
+    }),
+  };
+  let acked = false;
+  let retryDelaySeconds: number | undefined;
+
+  await (
+    worker as unknown as {
+      queue(
+        batch: {
+          messages: Array<{
+            body: RefreshJob;
+            ack(): void;
+            retry(options?: { delaySeconds?: number }): void;
+          }>;
+        },
+        env: unknown,
+        context: unknown,
+      ): Promise<void>;
+    }
+  ).queue(
+    {
+      messages: [
+        {
+          body: job,
+          ack() {
+            acked = true;
+          },
+          retry(options) {
+            retryDelaySeconds = options?.delaySeconds;
+          },
+        },
+      ],
+    },
+    { DASHBOARD_CACHE: cache, DASHBOARD_LOCKS: busyLocks },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(acked, false);
+  assert.equal(retryDelaySeconds, 60);
+  const updated = JSON.parse((await cache.get(`refresh:job:v1:${job.id}`)) ?? "{}") as RefreshJob;
+  assert.equal(updated.status, "queued");
+  assert.equal(updated.startedAt, null);
+  assert.equal(updated.finishedAt, null);
+  assert.equal(updated.durationMs, null);
+  assert.equal(updated.error, "dashboard locked");
+});
+
+test("worker stops and retries stalled progressive dashboard scans", async () => {
+  const key = dashboardCacheKey({
+    owner: "stalled",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const projects = Array.from({ length: 100 }, (_, index) =>
+    testProject({
+      owner: "stalled",
+      name: `repo-${String(index + 1).padStart(3, "0")}`,
+    }),
+  );
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "stalled",
+    owners: ["stalled"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/stalled",
+    priority: 100,
+    lastSeenAt: "2026-06-11T07:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-06-11T07:00:00Z",
+    failureCount: 0,
+  };
+  const job: RefreshJob = {
+    id: "job-stalled",
+    targetKey: key,
+    target,
+    kind: "dashboard",
+    status: "queued",
+    reason: "partial-cache",
+    createdAt: "2026-06-11T07:00:00Z",
+    updatedAt: "2026-06-11T07:00:00Z",
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const dashboard = {
+    ...testDashboard("stalled", projects),
+    cache: {
+      state: "partial" as const,
+      stale: true,
+      generatedAt: "2026-06-11T07:00:00Z",
+      progress: { scanned: 100, limit: 200, done: false },
+    },
+  };
+  const cache = kvStore({
+    [key]: JSON.stringify(dashboard),
+    [`progress:v1:${key}`]: JSON.stringify({
+      scannedRepos: projects.map((project) => project.fullName.toLowerCase()),
+      projects,
+      updatedAt: "2026-06-11T07:00:00Z",
+    }),
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+    [`refresh:job:v1:${job.id}`]: JSON.stringify(job),
+  });
+  const repoRows = projects.map((project) => ({
+    owner: { login: "stalled" },
+    name: project.name,
+    full_name: project.fullName,
+    description: null,
+    html_url: project.url,
+    default_branch: "main",
+    language: null,
+    stargazers_count: 0,
+    forks_count: 0,
+    open_issues_count: 0,
+    archived: false,
+    pushed_at: "2026-06-11T06:00:00Z",
+    updated_at: "2026-06-11T06:00:00Z",
+    fork: false,
+    private: false,
+  }));
+  const originalFetch = globalThis.fetch;
+  let repoPages = 0;
+  let retryDelaySeconds: number | undefined;
+  try {
+    globalThis.fetch = async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/users/stalled/repos") {
+        repoPages += 1;
+        return Response.json(repoRows);
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    };
+    await (
+      worker as unknown as {
+        queue(
+          batch: {
+            messages: Array<{
+              body: RefreshJob;
+              attempts?: number;
+              ack(): void;
+              retry(options?: { delaySeconds?: number }): void;
+            }>;
+          },
+          env: unknown,
+          context: unknown,
+        ): Promise<void>;
+      }
+    ).queue(
+      {
+        messages: [
+          {
+            body: job,
+            attempts: 1,
+            ack() {
+              throw new Error("stalled job should not be acknowledged");
+            },
+            retry(options) {
+              retryDelaySeconds = options?.delaySeconds;
+            },
+          },
+        ],
+      },
+      { DASHBOARD_CACHE: cache },
+      { waitUntil: () => undefined },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(repoPages, 2);
+  assert.equal(retryDelaySeconds, 60);
+  const updated = JSON.parse((await cache.get(`refresh:job:v1:${job.id}`)) ?? "{}") as RefreshJob;
+  assert.equal(updated.status, "queued");
+  assert.equal(updated.error, "dashboard stalled");
+});
+
+test("worker aborts Queue hydration at the delivery deadline", async () => {
+  const key = dashboardCacheKey({
+    owner: "deadline",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "deadline",
+    owners: ["deadline"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/deadline",
+    priority: 100,
+    lastSeenAt: "2026-06-11T07:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-06-11T07:00:00Z",
+    failureCount: 0,
+  };
+  const job: RefreshJob = {
+    id: "job-deadline",
+    targetKey: key,
+    target,
+    kind: "dashboard",
+    status: "queued",
+    reason: "partial-cache",
+    createdAt: "2026-06-11T07:00:00Z",
+    updatedAt: "2026-06-11T07:00:00Z",
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const cached = {
+    ...testDashboard("deadline", []),
+    cache: {
+      state: "partial" as const,
+      stale: true,
+      generatedAt: "2026-06-11T07:00:00Z",
+      progress: { scanned: 0, limit: 200, done: false },
+    },
+  };
+  const cache = kvStore({
+    [key]: JSON.stringify(cached),
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+    [`refresh:job:v1:${job.id}`]: JSON.stringify(job),
+  });
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  let aborted = false;
+  let retryDelaySeconds: number | undefined;
+  globalThis.setTimeout = ((callback: TimerHandler, delay?: number) =>
+    originalSetTimeout(callback, delay === 12 * 60 * 1000 ? 0 : delay)) as typeof setTimeout;
+  globalThis.fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/users/deadline/repos") {
+      return new Promise<Response>((_resolve, reject) => {
+        if (init?.signal?.aborted) {
+          aborted = true;
+          reject(new DOMException("Aborted", "AbortError"));
+          return;
+        }
+        init?.signal?.addEventListener(
+          "abort",
+          () => {
+            aborted = true;
+            reject(new DOMException("Aborted", "AbortError"));
+          },
+          { once: true },
+        );
+      });
+    }
+    throw new Error(`unexpected fetch ${path}`);
+  };
+
+  try {
+    await (
+      worker as unknown as {
+        queue(
+          batch: {
+            messages: Array<{
+              body: RefreshJob;
+              attempts?: number;
+              ack(): void;
+              retry(options?: { delaySeconds?: number }): void;
+            }>;
+          },
+          env: unknown,
+          context: unknown,
+        ): Promise<void>;
+      }
+    ).queue(
+      {
+        messages: [
+          {
+            body: job,
+            attempts: 1,
+            ack() {
+              throw new Error("deadline job should not be acknowledged");
+            },
+            retry(options) {
+              retryDelaySeconds = options?.delaySeconds;
+            },
+          },
+        ],
+      },
+      { DASHBOARD_CACHE: cache },
+      { waitUntil: () => undefined },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+
+  assert.equal(aborted, true);
+  assert.equal(retryDelaySeconds, 60);
+  const updated = JSON.parse((await cache.get(`refresh:job:v1:${job.id}`)) ?? "{}") as RefreshJob;
+  assert.equal(updated.status, "queued");
+  assert.equal(updated.error, "dashboard deadline reached");
+  assert.equal(updated.finishedAt, null);
+});
+
+test("worker aborts Queue GitHub App token lookup at the delivery deadline", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs1", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const key = dashboardCacheKey({
+    owner: "credential-deadline",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "credential-deadline",
+    owners: ["credential-deadline"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/credential-deadline",
+    priority: 100,
+    lastSeenAt: "2026-06-11T07:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-06-11T07:00:00Z",
+    failureCount: 0,
+  };
+  const job: RefreshJob = {
+    id: "job-credential-deadline",
+    targetKey: key,
+    target,
+    kind: "dashboard",
+    status: "queued",
+    reason: "partial-cache",
+    createdAt: "2026-06-11T07:00:00Z",
+    updatedAt: "2026-06-11T07:00:00Z",
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const cache = kvStore({
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+    [`refresh:job:v1:${job.id}`]: JSON.stringify(job),
+  });
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  let credentialAborted = false;
+  let retryDelaySeconds: number | undefined;
+  globalThis.setTimeout = ((callback: TimerHandler, delay?: number) =>
+    originalSetTimeout(callback, delay === 12 * 60 * 1000 ? 0 : delay)) as typeof setTimeout;
+  globalThis.fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/app/installations") {
+      return new Promise<Response>((_resolve, reject) => {
+        if (init?.signal?.aborted) {
+          credentialAborted = true;
+          reject(new DOMException("Aborted", "AbortError"));
+          return;
+        }
+        init?.signal?.addEventListener(
+          "abort",
+          () => {
+            credentialAborted = true;
+            reject(new DOMException("Aborted", "AbortError"));
+          },
+          { once: true },
+        );
+      });
+    }
+    throw new Error(`unexpected fetch ${path}`);
+  };
+
+  try {
+    await (
+      worker as unknown as {
+        queue(
+          batch: {
+            messages: Array<{
+              body: RefreshJob;
+              attempts?: number;
+              ack(): void;
+              retry(options?: { delaySeconds?: number }): void;
+            }>;
+          },
+          env: unknown,
+          context: unknown,
+        ): Promise<void>;
+      }
+    ).queue(
+      {
+        messages: [
+          {
+            body: job,
+            attempts: 1,
+            ack() {
+              throw new Error("credential deadline job should not be acknowledged");
+            },
+            retry(options) {
+              retryDelaySeconds = options?.delaySeconds;
+            },
+          },
+        ],
+      },
+      {
+        DASHBOARD_CACHE: cache,
+        GITHUB_APP_ID: "123",
+        GITHUB_APP_PRIVATE_KEY: privateKey,
+      },
+      { waitUntil: () => undefined },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+
+  assert.equal(credentialAborted, true);
+  assert.equal(retryDelaySeconds, 60);
+  const updated = JSON.parse((await cache.get(`refresh:job:v1:${job.id}`)) ?? "{}") as RefreshJob;
+  assert.equal(updated.status, "queued");
+  assert.equal(updated.error, "dashboard deadline reached");
+});
+
+test("worker terminalizes exhausted refresh retries before dead-lettering", async () => {
+  const key = dashboardCacheKey({
+    owner: "openclaw",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "openclaw",
+    owners: ["openclaw"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/openclaw",
+    priority: 100,
+    lastSeenAt: "2026-05-15T12:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-05-15T13:00:00Z",
+    failureCount: 0,
+  };
+  const job: RefreshJob = {
+    id: "job-lock-exhausted",
+    targetKey: key,
+    target,
+    kind: "dashboard",
+    status: "queued",
+    reason: "partial-cache",
+    createdAt: "2026-05-15T13:00:00Z",
+    updatedAt: "2026-05-15T13:00:00Z",
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const backingCache = kvStore({
+    [key]: JSON.stringify(
+      testDashboard("openclaw", [testProject({ owner: "openclaw", name: "repo" })]),
+    ),
+    [`refresh:job:v1:${job.id}`]: JSON.stringify(job),
+  });
+  let jobWrites = 0;
+  const cache = {
+    ...backingCache,
+    async put(storageKey: string, value: string) {
+      if (storageKey === `refresh:job:v1:${job.id}`) {
+        jobWrites += 1;
+      }
+      await backingCache.put(storageKey, value);
+    },
+  };
+  let released = false;
+  const busyLocks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async (request: Request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/job/reserve") {
+          return new Response(null, { status: 204 });
+        }
+        if (path === "/job/release") {
+          released = true;
+          return new Response(null, { status: 204 });
+        }
+        if (path === "/acquire") {
+          return new Response(null, { status: 409 });
+        }
+        return new Response(null, { status: 204 });
+      },
+    }),
+  };
+  let retryDelaySeconds: number | undefined;
+
+  const deliver = async (attempts: number) =>
+    (
+      worker as unknown as {
+        queue(
+          batch: {
+            messages: Array<{
+              body: RefreshJob;
+              attempts?: number;
+              ack(): void;
+              retry(options?: { delaySeconds?: number }): void;
+            }>;
+          },
+          env: unknown,
+          context: unknown,
+        ): Promise<void>;
+      }
+    ).queue(
+      {
+        messages: [
+          {
+            body: job,
+            attempts,
+            ack() {
+              throw new Error("exhausted job should be retried into the DLQ");
+            },
+            retry(options) {
+              retryDelaySeconds = options?.delaySeconds;
+            },
+          },
+        ],
+      },
+      { DASHBOARD_CACHE: cache, DASHBOARD_LOCKS: busyLocks },
+      { waitUntil: () => undefined },
+    );
+
+  await deliver(9);
+  assert.equal(retryDelaySeconds, 60);
+  assert.equal(released, false);
+  const retrying = JSON.parse((await cache.get(`refresh:job:v1:${job.id}`)) ?? "{}") as RefreshJob;
+  assert.equal(retrying.status, "queued");
+  assert.equal(retrying.error, "dashboard locked");
+
+  await deliver(10);
+  assert.equal(retryDelaySeconds, 60);
+  assert.equal(released, false);
+  const finalRetry = JSON.parse(
+    (await cache.get(`refresh:job:v1:${job.id}`)) ?? "{}",
+  ) as RefreshJob;
+  assert.equal(finalRetry.status, "queued");
+  assert.equal(finalRetry.error, "dashboard locked");
+
+  await deliver(11);
+  assert.equal(retryDelaySeconds, 60);
+  assert.equal(released, true);
+  const updated = JSON.parse((await cache.get(`refresh:job:v1:${job.id}`)) ?? "{}") as RefreshJob;
+  assert.equal(updated.status, "failed");
+  assert.match(updated.error ?? "", /after 11 Queue attempts/);
+  assert.equal(updated.attempts, 11);
+  assert.equal(jobWrites, 3);
+
+  const failedTarget = JSON.parse(
+    (await cache.get(`refresh:target:v1:${target.key}`)) ?? "{}",
+  ) as RefreshTarget;
+  assert.equal(failedTarget.failureCount, 1);
+  assert.equal(Date.parse(failedTarget.nextDueAt) > Date.now(), true);
+  assert.equal(failedTarget.terminalBackoffUntil, failedTarget.nextDueAt);
+  assert.match(failedTarget.message ?? "", /after 11 Queue attempts/);
+
+  const originalFetch = globalThis.fetch;
+  const waits: Promise<unknown>[] = [];
+  const sentJobs: RefreshJob[] = [];
+  globalThis.fetch = async (input) => {
+    throw new Error(`backed-off dashboard should not fetch ${String(input)}`);
+  };
+  try {
+    const staleResponse = await worker.fetch(
+      new Request("https://release.bar/api/openclaw"),
+      {
+        DASHBOARD_CACHE: cache,
+        DASHBOARD_LOCKS: busyLocks,
+        REFRESH_QUEUE: {
+          async send(sent: RefreshJob) {
+            sentJobs.push(sent);
+          },
+        },
+      },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    assert.equal(staleResponse.status, 200);
+    await Promise.all(waits.splice(0));
+    assert.equal(sentJobs.length, 0);
+
+    await cache.delete(key);
+    const coldResponse = await worker.fetch(
+      new Request("https://release.bar/api/openclaw"),
+      {
+        DASHBOARD_CACHE: cache,
+        DASHBOARD_LOCKS: busyLocks,
+        REFRESH_QUEUE: {
+          async send(sent: RefreshJob) {
+            sentJobs.push(sent);
+          },
+        },
+      },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    assert.equal(coldResponse.status, 202);
+    const coldBody = (await coldResponse.json()) as DashboardPayload;
+    assert.equal(coldBody.cache?.state, "rebuilding");
+    assert.match(coldBody.cache?.message ?? "", /refresh paused after repeated failures/);
+    await Promise.all(waits);
+    assert.equal(sentJobs.length, 0);
+
+    await cache.put(
+      `refresh:target:v1:${target.key}`,
+      JSON.stringify({ ...failedTarget, terminalBackoffUntil: null }),
+    );
+    await cache.put(
+      key,
+      JSON.stringify(testDashboard("openclaw", [testProject({ owner: "openclaw", name: "repo" })])),
+    );
+    const transientFailureResponse = await worker.fetch(
+      new Request("https://release.bar/api/openclaw"),
+      {
+        DASHBOARD_CACHE: cache,
+        DASHBOARD_LOCKS: busyLocks,
+        REFRESH_QUEUE: {
+          async send(sent: RefreshJob) {
+            sentJobs.push(sent);
+          },
+        },
+      },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    assert.equal(transientFailureResponse.status, 200);
+    await Promise.all(waits.splice(0));
+    assert.equal(sentJobs.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker terminalizes final-delivery queue handler failures", async () => {
+  const key = dashboardCacheKey({
+    owner: "openclaw",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "openclaw",
+    owners: ["openclaw"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/openclaw",
+    priority: 100,
+    lastSeenAt: "2026-06-11T07:00:00Z",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2026-06-11T07:00:00Z",
+    failureCount: 0,
+  };
+  const job: RefreshJob = {
+    id: "job-handler-failure",
+    targetKey: key,
+    target,
+    kind: "dashboard",
+    status: "queued",
+    reason: "partial-cache",
+    createdAt: "2026-06-11T07:00:00Z",
+    updatedAt: "2026-06-11T07:00:00Z",
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const backingCache = kvStore();
+  let failJobRead = true;
+  const cache = {
+    ...backingCache,
+    async get(key: string) {
+      if (key === `refresh:job:v1:${job.id}` && failJobRead) {
+        failJobRead = false;
+        throw new Error("refresh job read failed");
+      }
+      return backingCache.get(key);
+    },
+  };
+  let released = false;
+  const locks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async (request: Request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/job/reserve") {
+          return new Response(null, { status: 204 });
+        }
+        if (path === "/job/release") {
+          released = true;
+          return new Response(null, { status: 204 });
+        }
+        return new Response(null, { status: 404 });
+      },
+    }),
+  };
+  let retryDelaySeconds: number | undefined;
+
+  await (
+    worker as unknown as {
+      queue(
+        batch: {
+          messages: Array<{
+            body: RefreshJob;
+            attempts?: number;
+            ack(): void;
+            retry(options?: { delaySeconds?: number }): void;
+          }>;
+        },
+        env: unknown,
+        context: unknown,
+      ): Promise<void>;
+    }
+  ).queue(
+    {
+      messages: [
+        {
+          body: job,
+          attempts: 11,
+          ack() {
+            throw new Error("failed handler should not acknowledge");
+          },
+          retry(options) {
+            retryDelaySeconds = options?.delaySeconds;
+          },
+        },
+      ],
+    },
+    { DASHBOARD_CACHE: cache, DASHBOARD_LOCKS: locks },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(retryDelaySeconds, 300);
+  assert.equal(released, true);
+  const stored = JSON.parse((await cache.get(`refresh:job:v1:${job.id}`)) ?? "{}") as RefreshJob;
+  assert.equal(stored.status, "failed");
+  assert.equal(stored.attempts, 11);
+  assert.match(stored.error ?? "", /refresh job read failed/);
+});
+
 test("worker refresh jobs defer shared work while shared quota is paused", async () => {
   const key = dashboardCacheKey({
     owner: "openclaw",
     includeUnreleased: true,
     includeReleaseData: true,
-    schemaVersion: 5,
+    schemaVersion: 6,
   });
   const target: RefreshTarget = {
     key,
@@ -8698,7 +11665,7 @@ test("worker refresh jobs defer shared work while GraphQL is backed off", async 
     owner: "openclaw",
     includeUnreleased: true,
     includeReleaseData: true,
-    schemaVersion: 5,
+    schemaVersion: 6,
   });
   const target: RefreshTarget = {
     key,
@@ -8795,7 +11762,7 @@ test("worker skips request-triggered progressive rebuilds while shared quota is 
     owner: "owner",
     includeUnreleased: true,
     includeReleaseData: true,
-    schemaVersion: 5,
+    schemaVersion: 6,
   });
   const dashboard = testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]);
   const cache = kvStore({
@@ -8843,7 +11810,7 @@ test("worker serves cached dashboards to crawlers without scheduling refreshes",
     owner: "owner",
     includeUnreleased: true,
     includeReleaseData: false,
-    schemaVersion: 5,
+    schemaVersion: 6,
   });
   const dashboard: DashboardPayload = {
     ...testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]),
@@ -8929,7 +11896,7 @@ test("worker serves cache-only cold dashboard status to crawlers", async () => {
     owner: "coldbot",
     includeUnreleased: true,
     includeReleaseData: true,
-    schemaVersion: 5,
+    schemaVersion: 6,
   });
   const baseCache = kvStore({
     "auth:installation:v1:coldbot": JSON.stringify({
@@ -9175,26 +12142,26 @@ test("cache keys include owner, schema, and visibility flags", () => {
       includeForks: true,
       includeArchived: false,
       includeUnreleased: true,
-      schemaVersion: 5,
+      schemaVersion: 6,
     }),
-    "dashboard:v5:openclaw:forks-noarchived-unreleased-release",
+    "dashboard:v6:openclaw:forks-noarchived-unreleased-release",
   );
   assert.equal(
     dashboardCacheKey({
       owner: "openclaw",
       owners: ["Steipete"],
       repos: ["Steipete/Oracle"],
-      schemaVersion: 5,
+      schemaVersion: 6,
     }),
-    "dashboard:v5:openclaw:noforks-noarchived-released-release:sources-2dgec2fqc87xi",
+    "dashboard:v6:openclaw:noforks-noarchived-released-release:sources-2dgec2fqc87xi",
   );
   assert.equal(
     dashboardCacheKey({
       owner: "openclaw",
       includeReleaseData: false,
-      schemaVersion: 5,
+      schemaVersion: 6,
     }),
-    "dashboard:v5:openclaw:noforks-noarchived-released-metadata",
+    "dashboard:v6:openclaw:noforks-noarchived-released-metadata",
   );
   assert.equal(
     dashboardCacheKey({
@@ -9612,6 +12579,188 @@ test("dashboard build can add explicit public repositories without an owner scan
 
   assert.equal(payload.totals.repos, 1);
   assert.equal(payload.projects[0]?.fullName, "other/repo");
+});
+
+test("dashboard metadata splits explicit repository issue and PR counts", async () => {
+  const requested: string[] = [];
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    includeReleaseData: false,
+    includeRepos: ["other/repo"],
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      requested.push(path);
+      if (path === "/repos/other/repo") {
+        return Response.json({
+          owner: { login: "other" },
+          name: "repo",
+          full_name: "other/repo",
+          description: null,
+          html_url: "https://github.com/other/repo",
+          default_branch: "main",
+          language: null,
+          stargazers_count: 1,
+          forks_count: 0,
+          open_issues_count: 7,
+          archived: false,
+          pushed_at: null,
+          updated_at: null,
+          fork: false,
+          private: false,
+        });
+      }
+      if (path === "/repos/other/repo/pulls") {
+        return Response.json([{}], {
+          headers: {
+            link: '<https://api.github.com/repos/other/repo/pulls?state=open&per_page=1&page=3>; rel="last"',
+          },
+        });
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+  });
+
+  assert.equal(payload.projects[0]?.openIssues, 4);
+  assert.equal(payload.projects[0]?.openPullRequests, 3);
+  assert.deepEqual(requested, ["/repos/other/repo", "/repos/other/repo/pulls"]);
+});
+
+test("dashboard metadata splits authenticated REST owner issue and PR counts", async () => {
+  const requested: string[] = [];
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    includeReleaseData: false,
+    repoLimit: 1,
+    repoScanLimit: 0,
+    repoScanTarget: 1,
+    token: "token",
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      requested.push(path);
+      if (path === "/graphql") {
+        return new Response(null, { status: 500 });
+      }
+      if (path === "/users/owner/repos") {
+        return Response.json([
+          {
+            owner: { login: "owner" },
+            name: "repo",
+            full_name: "owner/repo",
+            description: null,
+            html_url: "https://github.com/owner/repo",
+            default_branch: "main",
+            language: null,
+            stargazers_count: 1,
+            forks_count: 0,
+            open_issues_count: 7,
+            archived: false,
+            pushed_at: null,
+            updated_at: null,
+            fork: false,
+            private: false,
+          },
+        ]);
+      }
+      if (path === "/repos/owner/repo/pulls") {
+        return Response.json([{}], {
+          headers: {
+            link: '<https://api.github.com/repos/owner/repo/pulls?state=open&per_page=1&page=3>; rel="last"',
+          },
+        });
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+  });
+
+  assert.equal(payload.projects[0]?.openIssues, 4);
+  assert.equal(payload.projects[0]?.openPullRequests, 3);
+  assert.equal(payload.cache?.capped, false);
+  assert.deepEqual(requested, ["/graphql", "/users/owner/repos", "/repos/owner/repo/pulls"]);
+});
+
+test("dashboard REST hydration only splits counts for the hydrated batch", async () => {
+  const requested: string[] = [];
+  const repos = ["one", "two", "three"].map((name) => ({
+    owner: { login: "owner" },
+    name,
+    full_name: `owner/${name}`,
+    description: null,
+    html_url: `https://github.com/owner/${name}`,
+    default_branch: "main",
+    language: null,
+    stargazers_count: 1,
+    forks_count: 0,
+    open_issues_count: 7,
+    archived: false,
+    pushed_at: "2026-01-02T00:00:00Z",
+    updated_at: "2026-01-02T00:00:00Z",
+    fork: false,
+    private: false,
+  }));
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    includeReleaseData: true,
+    repoLimit: 3,
+    repoScanLimit: 1,
+    repoScanTarget: 3,
+    token: "token",
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      requested.push(path);
+      if (path === "/graphql") {
+        return new Response(null, { status: 500 });
+      }
+      if (path === "/users/owner/repos") {
+        return Response.json(repos);
+      }
+      if (path === "/repos/owner/one/releases") {
+        return Response.json([]);
+      }
+      if (path === "/repos/owner/one/commits/main") {
+        return Response.json({
+          sha: "abcdef123456",
+          commit: { committer: { date: "2026-01-02T00:00:00Z" } },
+        });
+      }
+      if (path === "/repos/owner/one/pulls") {
+        return Response.json([{}]);
+      }
+      if (path === "/repos/owner/one/commits/abcdef123456/check-runs") {
+        return Response.json({ check_runs: [] });
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+  });
+
+  assert.deepEqual(
+    requested.filter((path) => path.endsWith("/pulls")),
+    ["/repos/owner/one/pulls"],
+  );
+  assert.equal(payload.projects.find((project) => project.name === "one")?.openIssues, 6);
+  assert.equal(payload.projects.find((project) => project.name === "one")?.openPullRequests, 1);
+  assert.equal(payload.projects.find((project) => project.name === "two")?.openIssues, null);
+  assert.equal(
+    payload.projects.find((project) => project.name === "three")?.openPullRequests,
+    null,
+  );
 });
 
 test("dashboard build uses GraphQL owner metadata when token is available", async () => {
@@ -10056,7 +13205,15 @@ test("dashboard cached hydration keeps fresh owner issue and PR totals", async (
 });
 
 test("dashboard build reuses cached repo fragments when metadata is unchanged", async () => {
-  const cache = kvStore();
+  const backingCache = kvStore();
+  const writtenKeys: string[] = [];
+  const cache = {
+    ...backingCache,
+    async put(key: string, value: string) {
+      writtenKeys.push(key);
+      await backingCache.put(key, value);
+    },
+  };
   let fanoutCalls = 0;
   const build = () =>
     buildDashboard({
@@ -10139,6 +13296,10 @@ test("dashboard build reuses cached repo fragments when metadata is unchanged", 
   assert.equal((await build()).totals.repos, 1);
   assert.equal((await build()).totals.repos, 1);
   assert.equal(fanoutCalls, 3);
+  assert.equal(
+    writtenKeys.some((key) => key.startsWith("repo:v2:owner/repo:")),
+    true,
+  );
 });
 
 test("dashboard build ignores explicit private repositories", async () => {
@@ -10605,6 +13766,528 @@ test("dashboard repo cap applies to visible rows before release hydration", asyn
   assert.equal(payload.cache?.capped, true);
 });
 
+test("dashboard hydration advances across a metadata-seeded 200-repo cap", async () => {
+  const repos = Array.from({ length: 200 }, (_, index) => {
+    const name = `repo-${String(index + 1).padStart(3, "0")}`;
+    return {
+      owner: { login: "owner" },
+      name,
+      full_name: `owner/${name}`,
+      description: null,
+      html_url: `https://github.com/owner/${name}`,
+      default_branch: "main",
+      language: null,
+      stargazers_count: 0,
+      forks_count: 0,
+      open_issues_count: index === 150 ? 99 : 0,
+      open_issues_total: index === 150 ? 99 : 0,
+      open_pull_requests_total: 0,
+      archived: false,
+      pushed_at: "2026-01-02T00:00:00Z",
+      updated_at: "2026-01-02T00:00:00Z",
+      fork: false,
+      private: false,
+    };
+  });
+  const fetcher: typeof fetch = async (url) => {
+    const parsed = new URL(String(url));
+    const path = parsed.pathname;
+    if (path === "/users/owner/repos") {
+      const page = Number(parsed.searchParams.get("page") ?? "1");
+      return Response.json(repos.slice((page - 1) * 100, page * 100));
+    }
+    if (path.endsWith("/releases")) {
+      return Response.json([
+        {
+          tag_name: "v1.0.0",
+          name: null,
+          html_url: "https://github.com/owner/repo/releases/v1.0.0",
+          draft: false,
+          published_at: "2026-01-01T00:00:00Z",
+        },
+      ]);
+    }
+    if (path.endsWith("/commits/main")) {
+      return Response.json({
+        sha: "abcdef123456",
+        commit: { committer: { date: "2026-01-02T00:00:00Z" } },
+      });
+    }
+    if (path.includes("/compare/")) {
+      return Response.json({
+        total_commits: 0,
+        html_url: "https://github.com/owner/repo/compare",
+      });
+    }
+    if (path.endsWith("/pulls")) {
+      return Response.json([]);
+    }
+    if (path.endsWith("/check-runs")) {
+      return Response.json({ check_runs: [] });
+    }
+    throw new Error(`unexpected ${path}`);
+  };
+  const baseOptions = {
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user" as const, login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    repoLimit: 200,
+    repoScanTarget: 200,
+    hydrateSort: "issues" as const,
+    hydrateDirection: "desc" as const,
+    fetch: fetcher,
+  };
+  const metadata = await buildDashboard({
+    ...baseOptions,
+    includeReleaseData: false,
+    repoScanLimit: 0,
+  });
+  assert.equal(metadata.projects.length, 200);
+
+  const firstScanned: string[] = [];
+  const first = await buildDashboard({
+    ...baseOptions,
+    includeReleaseData: true,
+    repoScanLimit: 12,
+    initialProjects: metadata.projects,
+    onProgress: async (_payload, progress) => {
+      if (progress.scannedRepo) firstScanned.push(progress.scannedRepo);
+    },
+  });
+  assert.equal(firstScanned.length, 12);
+  assert.equal(firstScanned[0], "owner/repo-151");
+  assert.equal(first.cache?.progress?.scanned, 12);
+  assert.equal(first.cache?.progress?.done, false);
+
+  const secondScanned: string[] = [];
+  const second = await buildDashboard({
+    ...baseOptions,
+    includeReleaseData: true,
+    repoScanLimit: 12,
+    initialProjects: first.projects,
+    skipRepos: firstScanned,
+    onProgress: async (_payload, progress) => {
+      if (progress.scannedRepo) secondScanned.push(progress.scannedRepo);
+    },
+  });
+  assert.equal(secondScanned.length, 12);
+  assert.equal(
+    secondScanned.some((repo) => firstScanned.includes(repo)),
+    false,
+  );
+  assert.equal(second.cache?.progress?.scanned, 24);
+  assert.equal(second.cache?.progress?.done, false);
+});
+
+test("dashboard hydration reconciles new repositories into a cached 200-repo set", async () => {
+  const repo = (name: string, pushedAt: string) => ({
+    owner: { login: "owner" },
+    name,
+    full_name: `owner/${name}`,
+    description: null,
+    html_url: `https://github.com/owner/${name}`,
+    default_branch: "main",
+    language: null,
+    stargazers_count: 0,
+    forks_count: 0,
+    open_issues_count: 0,
+    archived: false,
+    pushed_at: pushedAt,
+    updated_at: pushedAt,
+    fork: false,
+    private: false,
+  });
+  const oldRepos = Array.from({ length: 200 }, (_, index) =>
+    repo(
+      `repo-${String(index + 1).padStart(3, "0")}`,
+      new Date(Date.UTC(2026, 0, 1) + (200 - index) * 1000).toISOString(),
+    ),
+  );
+  const liveRepos = [repo("repo-new", "2026-06-11T07:00:00Z"), ...oldRepos.slice(0, 199)];
+  const initialProjects = oldRepos.map((item) =>
+    testProject({
+      owner: item.owner.login,
+      name: item.name,
+      pushedAt: item.pushed_at,
+      updatedAt: item.updated_at,
+      latestCommitDate: item.updated_at,
+    }),
+  );
+  const scanned: string[] = [];
+  const removed: string[] = [];
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    includeReleaseData: true,
+    repoLimit: 200,
+    repoScanLimit: 12,
+    repoScanTarget: 200,
+    initialProjects,
+    skipRepos: oldRepos.map((item) => item.full_name),
+    fetch: async (url) => {
+      const parsed = new URL(String(url));
+      const path = parsed.pathname;
+      if (path === "/users/owner/repos") {
+        const page = Number(parsed.searchParams.get("page") ?? "1");
+        return Response.json(liveRepos.slice((page - 1) * 100, page * 100));
+      }
+      if (path.endsWith("/releases")) {
+        return Response.json([]);
+      }
+      if (path.endsWith("/commits/main")) {
+        return Response.json({
+          sha: "abcdef123456",
+          commit: { committer: { date: "2026-06-11T07:00:00Z" } },
+        });
+      }
+      if (path.endsWith("/pulls")) {
+        return Response.json([]);
+      }
+      if (path.endsWith("/check-runs")) {
+        return Response.json({ check_runs: [] });
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+    onProgress: (_partial, progress) => {
+      if (progress.scannedRepo) scanned.push(progress.scannedRepo);
+      removed.push(...(progress.removedRepos ?? []));
+    },
+  });
+
+  assert.equal(payload.projects.length, 200);
+  assert.equal(
+    payload.projects.some((project) => project.fullName === "owner/repo-new"),
+    true,
+  );
+  assert.equal(
+    payload.projects.some((project) => project.fullName === "owner/repo-200"),
+    false,
+  );
+  assert.deepEqual(scanned, ["owner/repo-new"]);
+  assert.deepEqual(removed, ["owner/repo-200"]);
+  assert.equal(payload.cache?.progress?.scanned, 200);
+  assert.equal(payload.cache?.progress?.done, true);
+});
+
+test("dashboard hydration removes vanished repositories after complete owner enumeration", async () => {
+  const repo = (name: string) => ({
+    owner: { login: "owner" },
+    name,
+    full_name: `owner/${name}`,
+    description: null,
+    html_url: `https://github.com/owner/${name}`,
+    default_branch: "main",
+    language: null,
+    stargazers_count: 0,
+    forks_count: 0,
+    open_issues_count: 0,
+    archived: false,
+    pushed_at: "2026-06-11T07:00:00Z",
+    updated_at: "2026-06-11T07:00:00Z",
+    fork: false,
+    private: false,
+  });
+  const initialProjects = ["keep", "old-name"].map((name) =>
+    testProject({
+      owner: "owner",
+      name,
+      pushedAt: "2026-06-10T07:00:00Z",
+      updatedAt: "2026-06-10T07:00:00Z",
+      latestCommitDate: "2026-06-10T07:00:00Z",
+    }),
+  );
+  const removed: string[] = [];
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    includeReleaseData: true,
+    repoLimit: 200,
+    repoScanLimit: 12,
+    repoScanTarget: 2,
+    initialProjects,
+    skipRepos: ["owner/keep", "owner/old-name"],
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      if (path === "/users/owner/repos") {
+        return Response.json([repo("keep"), repo("new-name")]);
+      }
+      if (path.endsWith("/releases")) {
+        return Response.json([]);
+      }
+      if (path.endsWith("/commits/main")) {
+        return Response.json({
+          sha: "abcdef123456",
+          commit: { committer: { date: "2026-06-11T07:00:00Z" } },
+        });
+      }
+      if (path.endsWith("/pulls")) {
+        return Response.json([]);
+      }
+      if (path.endsWith("/check-runs")) {
+        return Response.json({ check_runs: [] });
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+    onProgress: (_partial, progress) => {
+      removed.push(...(progress.removedRepos ?? []));
+    },
+  });
+
+  assert.deepEqual(payload.projects.map((project) => project.fullName).sort(), [
+    "owner/keep",
+    "owner/new-name",
+  ]);
+  assert.deepEqual(removed, ["owner/old-name"]);
+  assert.equal(payload.cache?.progress?.scanned, 2);
+  assert.equal(payload.cache?.progress?.done, true);
+});
+
+test("dashboard reconciliation preserves live repositories later on a short page", async () => {
+  const repo = (name: string) => ({
+    owner: { login: "owner" },
+    name,
+    full_name: `owner/${name}`,
+    description: null,
+    html_url: `https://github.com/owner/${name}`,
+    default_branch: "main",
+    language: null,
+    stargazers_count: 0,
+    forks_count: 0,
+    open_issues_count: 0,
+    archived: false,
+    pushed_at: "2026-06-11T07:00:00Z",
+    updated_at: "2026-06-11T07:00:00Z",
+    fork: false,
+    private: false,
+  });
+  const initialProjects = Array.from({ length: 200 }, (_, index) => {
+    const name = `repo-${String(index + 1).padStart(3, "0")}`;
+    return testProject({
+      owner: "owner",
+      name,
+      pushedAt: "2026-06-10T07:00:00Z",
+      updatedAt: "2026-06-10T07:00:00Z",
+      latestCommitDate: "2026-06-10T07:00:00Z",
+    });
+  });
+  const liveRepos = Array.from({ length: 20 }, (_, index) =>
+    repo(`repo-${String(index + 1).padStart(3, "0")}`),
+  );
+  const removed = new Set<string>();
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    includeReleaseData: true,
+    repoLimit: 200,
+    repoScanLimit: 12,
+    repoScanTarget: 200,
+    initialProjects,
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      if (path === "/users/owner/repos") {
+        return Response.json(liveRepos);
+      }
+      if (path.endsWith("/releases")) {
+        return Response.json([]);
+      }
+      if (path.endsWith("/commits/main")) {
+        return Response.json({
+          sha: "abcdef123456",
+          commit: { committer: { date: "2026-06-11T07:00:00Z" } },
+        });
+      }
+      if (path.endsWith("/pulls")) {
+        return Response.json([]);
+      }
+      if (path.endsWith("/check-runs")) {
+        return Response.json({ check_runs: [] });
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+    onProgress: (_partial, progress) => {
+      for (const fullName of progress.removedRepos ?? []) {
+        removed.add(fullName);
+      }
+    },
+  });
+
+  assert.equal(payload.projects.length, 20);
+  assert.equal(
+    payload.projects.some((project) => project.fullName === "owner/repo-020"),
+    true,
+  );
+  assert.equal(removed.size, 180);
+  assert.equal(payload.cache?.progress?.scanned, 12);
+  assert.equal(payload.cache?.progress?.done, false);
+});
+
+test("dashboard reconciliation follows GraphQL pagination when a page contains null nodes", async () => {
+  const repoNode = (name: string) => ({
+    owner: { login: "owner", __typename: "User" },
+    name,
+    nameWithOwner: `owner/${name}`,
+    description: null,
+    url: `https://github.com/owner/${name}`,
+    defaultBranchRef: { name: "main" },
+    primaryLanguage: null,
+    repositoryTopics: { nodes: [] },
+    stargazerCount: 0,
+    forkCount: 0,
+    issues: { totalCount: 0 },
+    pullRequests: { totalCount: 0 },
+    isArchived: false,
+    isFork: false,
+    isPrivate: false,
+    pushedAt: "2026-06-11T07:00:00Z",
+    updatedAt: "2026-06-11T07:00:00Z",
+    releases: { nodes: [] },
+  });
+  const initialProjects = ["keep", "later"].map((name) =>
+    testProject({
+      owner: "owner",
+      name,
+      pushedAt: "2026-06-10T07:00:00Z",
+      updatedAt: "2026-06-10T07:00:00Z",
+      latestCommitDate: "2026-06-10T07:00:00Z",
+    }),
+  );
+  let graphqlPages = 0;
+
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    includeReleaseData: true,
+    repoLimit: 200,
+    repoScanLimit: 0,
+    repoScanTarget: 2,
+    initialProjects,
+    skipRepos: ["owner/keep", "owner/later"],
+    token: "token",
+    fetch: async (url, init) => {
+      const path = new URL(String(url)).pathname;
+      if (path !== "/graphql") {
+        throw new Error(`unexpected ${path}`);
+      }
+      graphqlPages += 1;
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        variables?: { after?: string | null };
+      };
+      const after = body.variables?.after;
+      const finalPage = after === "page-3";
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "User",
+            repositories: {
+              pageInfo: finalPage
+                ? { hasNextPage: false, endCursor: null }
+                : { hasNextPage: true, endCursor: after === "page-2" ? "page-3" : "page-2" },
+              nodes: finalPage ? [repoNode("keep"), repoNode("later")] : [null],
+            },
+          },
+        },
+      });
+    },
+  });
+
+  assert.equal(graphqlPages, 3);
+  assert.deepEqual(payload.projects.map((project) => project.fullName).sort(), [
+    "owner/keep",
+    "owner/later",
+  ]);
+});
+
+test("dashboard metadata scan follows GraphQL pagination past all-null pages", async () => {
+  const repoNode = {
+    owner: { login: "owner", __typename: "User" },
+    name: "repo",
+    nameWithOwner: "owner/repo",
+    description: null,
+    url: "https://github.com/owner/repo",
+    defaultBranchRef: { name: "main" },
+    primaryLanguage: null,
+    repositoryTopics: { nodes: [] },
+    stargazerCount: 0,
+    forkCount: 0,
+    issues: { totalCount: 4 },
+    pullRequests: { totalCount: 2 },
+    isArchived: false,
+    isFork: false,
+    isPrivate: false,
+    pushedAt: "2026-06-11T07:00:00Z",
+    updatedAt: "2026-06-11T07:00:00Z",
+    releases: { nodes: [] },
+  };
+  let graphqlPages = 0;
+
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    includeReleaseData: false,
+    repoLimit: 1,
+    token: "token",
+    fetch: async (url, init) => {
+      const path = new URL(String(url)).pathname;
+      if (path !== "/graphql") {
+        throw new Error(`unexpected ${path}`);
+      }
+      graphqlPages += 1;
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        variables?: { after?: string | null };
+      };
+      const after = body.variables?.after;
+      const finalPage = after === "page-3";
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "User",
+            repositories: {
+              pageInfo: finalPage
+                ? { hasNextPage: false, endCursor: null }
+                : { hasNextPage: true, endCursor: after === "page-2" ? "page-3" : "page-2" },
+              nodes: finalPage ? [repoNode] : [null],
+            },
+          },
+        },
+      });
+    },
+  });
+
+  assert.equal(graphqlPages, 3);
+  assert.equal(payload.projects[0]?.fullName, "owner/repo");
+  assert.equal(payload.projects[0]?.openIssues, 4);
+  assert.equal(payload.projects[0]?.openPullRequests, 2);
+});
+
 test("dashboard released-only repo cap scans past unreleased repositories", async () => {
   const repo = (name: string) => ({
     owner: { login: "owner" },
@@ -10808,6 +14491,7 @@ test("dashboard metadata-only mode skips release hydration", async () => {
     ["repo search", "repo search"],
   );
   assert.equal(payload.projects[0]?.commitsSinceRelease, null);
+  assert.equal(payload.cache?.capped, true);
   assert.match(payload.cache?.message ?? "", /release scan skipped/);
 });
 

@@ -152,6 +152,16 @@
   let manualRefreshLoading = false;
 
   const numberFormat = new Intl.NumberFormat("en", { notation: "compact" });
+
+  function countLabel(value: number | null): string {
+    return value === null ? "—" : numberFormat.format(value);
+  }
+
+  function openWorkCount(project: Project): number | null {
+    return project.openIssues === null || project.openPullRequests === null
+      ? null
+      : project.openIssues + project.openPullRequests;
+  }
   const dateFormat = new Intl.DateTimeFormat("en", {
     month: "short",
     day: "numeric",
@@ -1923,7 +1933,7 @@
       {
         actionId: `issues:${project.fullName}`,
         title: `Open issues`,
-        subTitle: `${project.fullName} · ${project.openIssues}`,
+        subTitle: `${project.fullName} · ${countLabel(project.openIssues)}`,
         group: "Repos",
         keywords: ["bugs", "issues", project.fullName],
         onRun: () => openUrl(project.issuesUrl),
@@ -1931,7 +1941,7 @@
       {
         actionId: `prs:${project.fullName}`,
         title: `Open pull requests`,
-        subTitle: `${project.fullName} · ${project.openPullRequests}`,
+        subTitle: `${project.fullName} · ${countLabel(project.openPullRequests)}`,
         group: "Repos",
         keywords: ["prs", "pulls", "pull requests", project.fullName],
         onRun: () => openUrl(project.pullRequestsUrl),
@@ -2852,12 +2862,12 @@
             <div>
               <span class="panel-kicker">open work</span>
               <strong
-                style={detailValueStyle(numberFormat.format(repoDetail.project.openIssues + repoDetail.project.openPullRequests))}
-                use:fitDetailValue={numberFormat.format(repoDetail.project.openIssues + repoDetail.project.openPullRequests)}
+                style={detailValueStyle(countLabel(openWorkCount(repoDetail.project)))}
+                use:fitDetailValue={countLabel(openWorkCount(repoDetail.project))}
               >
-                {numberFormat.format(repoDetail.project.openIssues + repoDetail.project.openPullRequests)}
+                {countLabel(openWorkCount(repoDetail.project))}
               </strong>
-              <small>{repoDetail.project.openIssues} issues · {repoDetail.project.openPullRequests} PRs</small>
+              <small>{countLabel(repoDetail.project.openIssues)} issues · {countLabel(repoDetail.project.openPullRequests)} PRs</small>
             </div>
             <div>
               <span class="panel-kicker">cadence</span>
@@ -3679,11 +3689,11 @@
             <span>{project.latestCommitSha || project.defaultBranch}</span>
           </div>
           <div class="issues-cell dev-only">
-            <a class="external-link" href={project.issuesUrl} target="_blank" rel="noreferrer">{project.openIssues}</a>
+            <a class="external-link" href={project.issuesUrl} target="_blank" rel="noreferrer">{countLabel(project.openIssues)}</a>
           </div>
           <div class="prs-cell dev-only">
             <a class="external-link" href={project.pullRequestsUrl} target="_blank" rel="noreferrer">
-              {project.openPullRequests}
+              {countLabel(project.openPullRequests)}
             </a>
           </div>
           <div class="ci-cell dev-only" data-ci={project.ciState}>

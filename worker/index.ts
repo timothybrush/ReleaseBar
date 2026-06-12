@@ -124,6 +124,13 @@ type GitHubWebhookJob = {
   attempts?: number;
 };
 
+type StoredWebhookPending = {
+  key: string;
+  revision: string;
+  job: GitHubWebhookJob;
+  deliveries: string[];
+};
+
 type WebhookTargetAction = {
   reason: string;
   includeReleaseDataOnly: boolean;
@@ -321,6 +328,10 @@ const githubWebhookDeliveryLimit = 2000;
 const githubWebhookProcessingLeaseMs = 12 * 60 * 1000;
 const githubWebhookBodyLimitBytes = 2 * 1024 * 1024;
 const githubWebhookRequeueLimit = 48;
+const githubWebhookCoalescingWaitMs = 250;
+const githubWebhookCoalescingBatchSize = 8;
+const githubWebhookPendingLimit = 256;
+const githubWebhookPendingLimitBytes = 96 * 1024;
 const manualRefreshCooldownPrefix = `refresh:manual:v1:`;
 const manualRefreshCooldownSeconds = 10 * 60;
 const refreshTargetListLimit = 5000;
@@ -525,6 +536,8 @@ type StoredWebhookDelivery = {
 };
 
 type StoredWebhookProcessing = {
+  jobId?: string;
+  leaseId?: string;
   delivery: string;
   expiresAt: number;
 };
@@ -14230,11 +14243,14 @@ export class DashboardBuildLock {
       url.pathname === "/webhook/abandon"
     ) {
       const body = (await request.json().catch(() => null)) as {
+        id?: unknown;
         event?: unknown;
         delivery?: unknown;
         payload?: unknown;
         createdAt?: unknown;
+        attempts?: unknown;
       } | null;
+      const jobId = typeof body?.id === "string" ? body.id : "";
       const event = typeof body?.event === "string" ? body.event : "";
       const delivery = typeof body?.delivery === "string" ? body.delivery : "";
       const payload =
@@ -14246,11 +14262,29 @@ export class DashboardBuildLock {
       }
       if (url.pathname === "/webhook/abandon") {
         const abandonDelivery = async () => {
-          const [accepted, processed, active] = await Promise.all([
+          const now = Date.now();
+          const [accepted, processed, active, storedPending] = await Promise.all([
             this.state.storage.get<StoredWebhookDelivery[]>("webhook-accepted"),
             this.state.storage.get<StoredWebhookDelivery[]>("webhook-deliveries"),
             this.state.storage.get<StoredWebhookProcessing>("webhook-active"),
+            this.state.storage.get<StoredWebhookPending[]>("webhook-pending"),
           ]);
+          const pending = (storedPending ?? []).flatMap((entry) => {
+            const deliveries = entry.deliveries.filter((item) => item !== delivery);
+            if (deliveries.length === 0) return [];
+            return [
+              {
+                ...entry,
+                job:
+                  entry.job.delivery === delivery
+                    ? { ...entry.job, delivery: deliveries.at(-1)! }
+                    : entry.job,
+                deliveries,
+              },
+            ];
+          });
+          const releaseActive =
+            active?.delivery === delivery || Boolean(active && active.expiresAt <= now);
           await Promise.all([
             this.state.storage.put(
               "webhook-accepted",
@@ -14260,8 +14294,20 @@ export class DashboardBuildLock {
               "webhook-deliveries",
               (processed ?? []).filter((item) => item.id !== delivery),
             ),
-            ...(active?.delivery === delivery ? [this.state.storage.delete("webhook-active")] : []),
+            this.state.storage.put("webhook-pending", pending),
+            ...(releaseActive ? [this.state.storage.delete("webhook-active")] : []),
           ]);
+          if ((!active || releaseActive) && pending.length > 0) {
+            if (!this.env.REFRESH_QUEUE) {
+              throw new Error("webhook queue unavailable");
+            }
+            const next = pendingWebhookBatch(pending, "")[0]!;
+            await this.env.REFRESH_QUEUE.send({
+              ...next.job,
+              id: randomNonce(),
+              attempts: 0,
+            });
+          }
           return new Response(null, { status: 204 });
         };
         return this.state.blockConcurrencyWhile
@@ -14304,21 +14350,67 @@ export class DashboardBuildLock {
           ? this.state.blockConcurrencyWhile(enqueueDelivery)
           : enqueueDelivery();
       }
+      if (!jobId) return new Response(null, { status: 400 });
+      const job = {
+        kind: "github-webhook",
+        id: jobId,
+        event,
+        delivery,
+        payload: payload!,
+        createdAt: typeof body?.createdAt === "string" ? body.createdAt : new Date().toISOString(),
+        attempts: typeof body?.attempts === "number" ? body.attempts : 0,
+      } satisfies GitHubWebhookJob;
+      let processingLeaseId: string | null = null;
       const reserveProcessing = async () => {
         const now = Date.now();
         const deliveries = (
           (await this.state.storage.get<StoredWebhookDelivery[]>("webhook-deliveries")) ?? []
         ).filter((item) => now - item.processedAt < githubWebhookDeliveryTtlMs);
-        if (deliveries.some((item) => item.id === delivery)) {
+        const storedPending =
+          (await this.state.storage.get<StoredWebhookPending[]>("webhook-pending")) ?? [];
+        const currentPending = storedPending.filter(
+          (entry) => now - safeIso(entry.job.createdAt) < githubWebhookDeliveryTtlMs,
+        );
+        const processed = deliveries.some((item) => item.id === delivery);
+        const pending = processed ? currentPending : mergePendingWebhook(currentPending, job);
+        if (!pendingWebhookFits(pending)) return "capacity" as const;
+        const active = await this.state.storage.get<StoredWebhookProcessing>("webhook-active");
+        if (processed && pending.length === 0) {
+          if (
+            active &&
+            (active.jobId === jobId || active.delivery === delivery || active.expiresAt <= now)
+          ) {
+            await this.state.storage.delete("webhook-active");
+          }
           return "duplicate" as const;
         }
-        const active = await this.state.storage.get<StoredWebhookProcessing>("webhook-active");
-        if (active && active.expiresAt > now) return "busy" as const;
-        await this.state.storage.put("webhook-active", {
-          delivery,
-          expiresAt: now + githubWebhookProcessingLeaseMs,
-        } satisfies StoredWebhookProcessing);
-        return "reserved" as const;
+        if (active && active.expiresAt > now) {
+          await this.state.storage.put("webhook-pending", pending);
+          if (processed && active.jobId === jobId) {
+            processingLeaseId = randomNonce();
+            await this.state.storage.put("webhook-active", {
+              jobId,
+              leaseId: processingLeaseId,
+              delivery,
+              expiresAt: now + githubWebhookProcessingLeaseMs,
+            } satisfies StoredWebhookProcessing);
+            return "leader" as const;
+          }
+          // Keep the active delivery retryable after a crash; followers are now durably covered.
+          if (!active.jobId || active.jobId === jobId) return "retry" as const;
+          return "coalesced" as const;
+        }
+        processingLeaseId = randomNonce();
+        await Promise.all([
+          this.state.storage.put("webhook-pending", pending),
+          this.state.storage.put("webhook-active", {
+            jobId,
+            leaseId: processingLeaseId,
+            delivery,
+            expiresAt: now + githubWebhookProcessingLeaseMs,
+          } satisfies StoredWebhookProcessing),
+        ]);
+        return "leader" as const;
       };
       const reservation = this.state.blockConcurrencyWhile
         ? await this.state.blockConcurrencyWhile(reserveProcessing)
@@ -14328,50 +14420,104 @@ export class DashboardBuildLock {
           "cache-control": "no-store",
         });
       }
-      if (reservation === "busy") {
+      if (reservation === "capacity") {
+        return jsonResponse({ error: "webhook coalescer full" }, 429, {
+          "cache-control": "no-store",
+        });
+      }
+      if (reservation === "retry") {
         return jsonResponse({ error: "webhook processor busy" }, 409, {
           "cache-control": "no-store",
         });
       }
+      if (reservation === "coalesced") {
+        return jsonResponse({ ok: true, coalesced: true }, 202, {
+          "cache-control": "no-store",
+        });
+      }
       try {
-        const waits: Promise<unknown>[] = [];
-        await processGitHubWebhook(
-          event,
-          delivery,
-          payload!,
-          typeof body?.createdAt === "string" ? body.createdAt : new Date().toISOString(),
-          this.env,
-          {
-            waitUntil: (promise) => waits.push(promise),
-          },
-        );
-        await Promise.all(waits);
-        const completeProcessing = async () => {
-          const now = Date.now();
-          const deliveries = (
-            (await this.state.storage.get<StoredWebhookDelivery[]>("webhook-deliveries")) ?? []
-          ).filter((item) => now - item.processedAt < githubWebhookDeliveryTtlMs);
-          if (!deliveries.some((item) => item.id === delivery)) {
-            deliveries.push({ id: delivery, processedAt: now });
+        await sleep(githubWebhookCoalescingWaitMs);
+        const pending =
+          (await this.state.storage.get<StoredWebhookPending[]>("webhook-pending")) ?? [];
+        const batch = pendingWebhookBatch(pending, delivery);
+        for (const entry of batch) {
+          const waits: Promise<unknown>[] = [];
+          await processGitHubWebhook(
+            entry.job.event,
+            entry.job.delivery,
+            entry.job.payload,
+            entry.job.createdAt,
+            this.env,
+            {
+              waitUntil: (promise) => waits.push(promise),
+            },
+          );
+          await Promise.all(waits);
+          const completeEntry = async () => {
+            const now = Date.now();
+            const deliveries = (
+              (await this.state.storage.get<StoredWebhookDelivery[]>("webhook-deliveries")) ?? []
+            ).filter((item) => now - item.processedAt < githubWebhookDeliveryTtlMs);
+            const completed = new Set(entry.deliveries);
+            for (const completedDelivery of completed) {
+              if (!deliveries.some((item) => item.id === completedDelivery)) {
+                deliveries.push({ id: completedDelivery, processedAt: now });
+              }
+            }
+            const current =
+              (await this.state.storage.get<StoredWebhookPending[]>("webhook-pending")) ?? [];
+            const next = current.flatMap((candidate) => {
+              if (candidate.key !== entry.key) return [candidate];
+              if (candidate.revision === entry.revision) return [];
+              // A newer event arrived while this entry ran; retain only its unprocessed deliveries.
+              const remainingDeliveries = candidate.deliveries.filter(
+                (item) => !completed.has(item),
+              );
+              return remainingDeliveries.length > 0
+                ? [{ ...candidate, deliveries: remainingDeliveries }]
+                : [];
+            });
+            await Promise.all([
+              this.state.storage.put(
+                "webhook-deliveries",
+                deliveries.slice(-githubWebhookDeliveryLimit),
+              ),
+              this.state.storage.put("webhook-pending", next),
+            ]);
+          };
+          if (this.state.blockConcurrencyWhile) {
+            await this.state.blockConcurrencyWhile(completeEntry);
+          } else {
+            await completeEntry();
           }
-          await Promise.all([
-            this.state.storage.put(
-              "webhook-deliveries",
-              deliveries.slice(-githubWebhookDeliveryLimit),
-            ),
-            this.state.storage.delete("webhook-active"),
-          ]);
-        };
-        if (this.state.blockConcurrencyWhile) {
-          await this.state.blockConcurrencyWhile(completeProcessing);
-        } else {
-          await completeProcessing();
         }
-        return jsonResponse({ ok: true }, 202, { "cache-control": "no-store" });
+        const completeProcessing = async () => {
+          const active = await this.state.storage.get<StoredWebhookProcessing>("webhook-active");
+          if (active?.leaseId !== processingLeaseId) return false;
+          const pending =
+            (await this.state.storage.get<StoredWebhookPending[]>("webhook-pending")) ?? [];
+          if (pending.length > 0) {
+            if (!this.env.REFRESH_QUEUE) throw new Error("webhook queue unavailable");
+            const next = pendingWebhookBatch(pending, "")[0]!;
+            await this.env.REFRESH_QUEUE.send({
+              ...next.job,
+              id: randomNonce(),
+              attempts: 0,
+            });
+          }
+          await this.state.storage.delete("webhook-active");
+          return pending.length > 0;
+        };
+        const remaining = this.state.blockConcurrencyWhile
+          ? await this.state.blockConcurrencyWhile(completeProcessing)
+          : await completeProcessing();
+        return jsonResponse({ ok: true, coalesced: batch.length, remaining }, 202, {
+          "cache-control": "no-store",
+        });
       } catch (error) {
         const releaseProcessing = async () => {
           const active = await this.state.storage.get<StoredWebhookProcessing>("webhook-active");
-          if (active?.delivery === delivery) {
+          if (active?.leaseId === processingLeaseId) {
             await this.state.storage.delete("webhook-active");
           }
         };
@@ -14512,6 +14658,70 @@ function releaseWebhookAffectsDashboard(payload: Record<string, unknown>): boole
   const action = String(payload.action ?? "");
   if (!release || (release.draft === true && action !== "unpublished")) return false;
   return Boolean(action);
+}
+
+function githubWebhookCoalescingKey(job: GitHubWebhookJob): string {
+  const repo = webhookRepo(job.payload);
+  if (!repo) return `delivery:${job.delivery}`;
+  const action = String(job.payload.action ?? "");
+  if (
+    (job.event === "issues" &&
+      ["opened", "reopened", "closed", "deleted", "transferred"].includes(action)) ||
+    (job.event === "pull_request" && ["opened", "reopened", "closed", "deleted"].includes(action))
+  ) {
+    return `counts:${repo.fullName}`;
+  }
+  if (
+    (job.event === "push" &&
+      job.payload.deleted !== true &&
+      (!repo.defaultBranch || job.payload.ref === `refs/heads/${repo.defaultBranch}`)) ||
+    (job.event === "release" && releaseWebhookAffectsDashboard(job.payload))
+  ) {
+    return `release:${repo.fullName}`;
+  }
+  return `delivery:${job.delivery}`;
+}
+
+function mergePendingWebhook(
+  pending: StoredWebhookPending[],
+  job: GitHubWebhookJob,
+): StoredWebhookPending[] {
+  const key = githubWebhookCoalescingKey(job);
+  const existingIndex = pending.findIndex((entry) => entry.key === key);
+  const next: StoredWebhookPending = {
+    key,
+    revision: randomNonce(),
+    job,
+    deliveries:
+      existingIndex >= 0
+        ? [...new Set([...pending[existingIndex]!.deliveries, job.delivery])]
+        : [job.delivery],
+  };
+  if (existingIndex < 0) return [...pending, next];
+  return pending.map((entry, index) => (index === existingIndex ? next : entry));
+}
+
+function pendingWebhookFits(pending: StoredWebhookPending[]): boolean {
+  return (
+    pending.length <= githubWebhookPendingLimit &&
+    new TextEncoder().encode(JSON.stringify(pending)).byteLength <= githubWebhookPendingLimitBytes
+  );
+}
+
+function pendingWebhookBatch(
+  pending: StoredWebhookPending[],
+  leaderDelivery: string,
+): StoredWebhookPending[] {
+  const sorted = [...pending].sort(
+    (left, right) => safeIso(left.job.createdAt) - safeIso(right.job.createdAt),
+  );
+  const leader = sorted.find((entry) => entry.deliveries.includes(leaderDelivery));
+  const others = sorted.filter((entry) => entry !== leader);
+  // Finish with the leader so any earlier failure leaves its queue delivery retryable.
+  return [
+    ...others.slice(0, Math.max(0, githubWebhookCoalescingBatchSize - (leader ? 1 : 0))),
+    ...(leader ? [leader] : []),
+  ];
 }
 
 type WebhookTargetPage = {
@@ -15517,15 +15727,18 @@ export default {
             : (webhookJob.attempts ?? 0) + 1;
           const expired = Date.now() - safeIso(webhookJob.createdAt) >= githubWebhookDeliveryTtlMs;
           if (attempts > githubWebhookRequeueLimit || expired) {
-            await abandonGitHubWebhookDelivery(env, webhookJob.delivery, webhookJob.payload).catch(
-              async (abandonError) =>
-                auditSyncEvent(env, {
-                  event: "github_webhook_admission_abandon_failed",
-                  status: "failed",
-                  reason: errorMessage(abandonError),
-                  detail: `githubEvent=${webhookJob.event} delivery=${webhookJob.delivery}`,
-                }),
-            );
+            try {
+              await abandonGitHubWebhookDelivery(env, webhookJob.delivery, webhookJob.payload);
+            } catch (abandonError) {
+              await auditSyncEvent(env, {
+                event: "github_webhook_admission_abandon_failed",
+                status: "failed",
+                reason: errorMessage(abandonError),
+                detail: `githubEvent=${webhookJob.event} delivery=${webhookJob.delivery}`,
+              });
+              message.retry({ delaySeconds: webhookPriorityFanoutRetrySeconds });
+              continue;
+            }
             await auditSyncEvent(env, {
               event: "github_webhook_failed",
               status: "failed",
@@ -15540,7 +15753,7 @@ export default {
             await env.REFRESH_QUEUE.send(
               {
                 ...webhookJob,
-                id: randomNonce(),
+                id: webhookJob.id,
                 attempts,
               },
               { delaySeconds },

@@ -11998,7 +11998,7 @@ test("worker retries refresh jobs when the dashboard build lock is busy", async 
           ack() {
             acked = true;
           },
-          retry(options) {
+          retry(options?: { delaySeconds?: number }) {
             retryDelaySeconds = options?.delaySeconds;
           },
         },
@@ -12707,7 +12707,7 @@ test("worker terminalizes final-delivery queue handler failures", async () => {
           ack() {
             throw new Error("failed handler should not acknowledge");
           },
-          retry(options) {
+          retry(options?: { delaySeconds?: number }) {
             retryDelaySeconds = options?.delaySeconds;
           },
         },
@@ -17953,7 +17953,7 @@ test("signed private repository webhooks are ignored before durable admission", 
   assert.deepEqual(await response.json(), { ok: true, ignored: true });
 });
 
-test("signed GitHub webhooks serialize mutations and enqueue authoritative refreshes", async () => {
+test("signed GitHub webhooks coalesce bursts and enqueue authoritative refreshes", async () => {
   const secret = "webhook-secret";
   const now = new Date().toISOString();
   const key = dashboardCacheKey({
@@ -18193,10 +18193,12 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
   let exactIssues = 2;
   let exactArchived = false;
   let failCounts = false;
+  let countRefreshes = 0;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input) => {
     const url = new URL(String(input));
     if (url.pathname === "/graphql") {
+      countRefreshes += 1;
       if (failCounts) throw new Error("count refresh failed");
       return Response.json({
         data: {
@@ -18263,7 +18265,8 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
       (message) =>
         Boolean(message) &&
         typeof message === "object" &&
-        (message as { kind?: unknown }).kind === "github-webhook",
+        (message as { kind?: unknown; delivery?: unknown }).kind === "github-webhook" &&
+        (message as { delivery?: unknown }).delivery === delivery,
     );
     if (index >= 0) {
       const [message] = queued.splice(index, 1);
@@ -18318,6 +18321,12 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
     pushed_at: "2026-06-11T00:00:00Z",
     updated_at: new Date(Date.parse(now) + 1_000).toISOString(),
   };
+  let repositoryObservation = Date.parse(repository.updated_at);
+  const observedRepository = (overrides: Record<string, unknown> = {}) => ({
+    ...repository,
+    ...overrides,
+    updated_at: new Date((repositoryObservation += 1_000)).toISOString(),
+  });
   const readDashboard = async (url = "https://release.bar/api/owner") => {
     const response = await worker.fetch(new Request(url), env, {
       waitUntil: () => undefined,
@@ -18385,10 +18394,12 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
     assert.equal(deduplicated.projects[0]?.openIssues, 4);
 
     exactIssues = 5;
+    const refreshesBeforeBurst = countRefreshes;
     await Promise.all([
       send("issues", "delivery-2", { action: "opened", repository }),
       send("issues", "delivery-3", { action: "opened", repository }),
     ]);
+    assert.equal(countRefreshes - refreshesBeforeBurst, 1);
     const serialized = await readDashboard();
     assert.equal(serialized.projects[0]?.openIssues, 5);
 
@@ -18406,6 +18417,10 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
       )?.attempts,
       1,
     );
+    const redeliveryJobs = queuedWebhooks.filter(
+      (message) => message.delivery === "delivery-redelivery",
+    );
+    assert.equal(redeliveryJobs.at(-1)?.id, redeliveryJobs[0]?.id);
     failCounts = false;
     exactIssues = 6;
     await send("issues", "delivery-redelivery", { action: "opened", repository });
@@ -18415,28 +18430,36 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
     failCounts = true;
     await send("repository", "delivery-archive-fallback", {
       action: "archived",
-      repository: { ...repository, archived: true },
+      repository: observedRepository({ archived: true }),
     });
     failCounts = false;
+    const fallbackSnapshot = JSON.parse((await cache.get("owner-metadata:v1:owner")) ?? "{}") as {
+      projects?: Project[];
+    };
+    assert.equal(
+      fallbackSnapshot.projects?.find((candidate) => candidate.fullName === "owner/repo")?.archived,
+      true,
+    );
+    assert.notEqual(await cache.get(key), null);
     assert.equal((await readDashboard()).projects.length, 0);
 
     exactArchived = false;
     await send("repository", "delivery-archive-fallback-restore", {
       action: "unarchived",
-      repository,
+      repository: observedRepository(),
     });
 
     exactArchived = true;
     await send("repository", "delivery-4", {
       action: "archived",
-      repository: { ...repository, archived: true },
+      repository: observedRepository({ archived: true }),
     });
     assert.equal((await readDashboard()).projects.length, 0);
 
     exactArchived = false;
     await send("repository", "delivery-5", {
       action: "unarchived",
-      repository,
+      repository: observedRepository(),
     });
     assert.equal((await readDashboard()).projects[0]?.archived, false);
 
@@ -18576,7 +18599,7 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
     await cache.delete("owner-metadata:v1:owner");
     await send("repository", "delivery-10", {
       action: "privatized",
-      repository,
+      repository: observedRepository(),
     });
     assert.equal(await cache.get(key), null);
     await cache.put(key, JSON.stringify(dashboard));
@@ -18727,10 +18750,7 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
 
     await send("repository", "delivery-publicized-new", {
       action: "publicized",
-      repository: {
-        ...repository,
-        updated_at: new Date(Date.parse(now) + 2_000).toISOString(),
-      },
+      repository: observedRepository(),
     });
     assert.equal((await readDashboard()).projects.length, 1);
 
@@ -19865,6 +19885,150 @@ test("worker acknowledges webhook jobs after the durable requeue limit", async (
   assert.equal(abandoned, true);
   assert.equal(acknowledged, true);
   assert.equal(retried, false);
+});
+
+test("processed webhook retries take over followers behind a stale matching lease", async () => {
+  const now = new Date().toISOString();
+  const values = new Map<string, unknown>([
+    ["webhook-deliveries", [{ id: "delivery-leader", processedAt: Date.now() }]],
+    [
+      "webhook-active",
+      {
+        jobId: "job-leader",
+        leaseId: "stale-lease",
+        delivery: "delivery-leader",
+        expiresAt: Date.now() + 60_000,
+      },
+    ],
+    [
+      "webhook-pending",
+      [
+        {
+          key: "delivery:delivery-follower",
+          revision: "follower-revision",
+          job: {
+            kind: "github-webhook",
+            id: "job-follower",
+            event: "status",
+            delivery: "delivery-follower",
+            payload: {
+              repository: {
+                full_name: "owner/repo",
+                default_branch: "main",
+              },
+            },
+            createdAt: now,
+            attempts: 0,
+          },
+          deliveries: ["delivery-follower"],
+        },
+      ],
+    ],
+  ]);
+  const lock = new DashboardBuildLock(
+    {
+      storage: {
+        async get<T>(key: string) {
+          return values.get(key) as T | undefined;
+        },
+        async put<T>(key: string, value: T) {
+          values.set(key, value);
+        },
+        async delete(key: string) {
+          return values.delete(key);
+        },
+      },
+      async blockConcurrencyWhile<T>(callback: () => Promise<T>) {
+        return callback();
+      },
+    },
+    {},
+  );
+
+  const response = await lock.fetch(
+    new Request("https://releasebar.internal/webhook/process", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "github-webhook",
+        id: "job-leader",
+        event: "issues",
+        delivery: "delivery-leader",
+        payload: {
+          action: "opened",
+          repository: {
+            full_name: "owner/repo",
+            default_branch: "main",
+          },
+        },
+        createdAt: now,
+        attempts: 1,
+      }),
+    }),
+  );
+
+  assert.equal(response.status, 202);
+  assert.deepEqual(values.get("webhook-pending"), []);
+  assert.equal(values.has("webhook-active"), false);
+  assert.equal(
+    (values.get("webhook-deliveries") as Array<{ id: string }>).some(
+      (delivery) => delivery.id === "delivery-follower",
+    ),
+    true,
+  );
+});
+
+test("worker retries terminal webhook jobs when durable abandonment fails", async () => {
+  let acknowledged = false;
+  let retryDelaySeconds: number | undefined;
+  const locks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async (request: Request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/webhook/process" || path === "/webhook/abandon") {
+          return new Response(null, { status: 500 });
+        }
+        return new Response(null, { status: 404 });
+      },
+    }),
+  };
+
+  await worker.queue(
+    {
+      messages: [
+        {
+          body: {
+            kind: "github-webhook",
+            id: "job-terminal-abandon-failed",
+            event: "issues",
+            delivery: "delivery-terminal-abandon-failed",
+            payload: {
+              action: "opened",
+              repository: {
+                full_name: "owner/repo",
+                default_branch: "main",
+              },
+            },
+            createdAt: new Date().toISOString(),
+            attempts: 48,
+          },
+          attempts: 1,
+          ack() {
+            acknowledged = true;
+          },
+          retry(options?: { delaySeconds?: number }) {
+            retryDelaySeconds = options?.delaySeconds;
+          },
+        } as never,
+      ],
+    },
+    { DASHBOARD_LOCKS: locks },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(acknowledged, false);
+  assert.equal(retryDelaySeconds, 20);
 });
 
 test("worker quickly requeues busy webhook jobs without consuming their failure budget", async () => {

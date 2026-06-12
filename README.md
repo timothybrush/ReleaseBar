@@ -80,7 +80,7 @@ Configure these Worker secrets before enabling login:
 
 Set the GitHub App setup URL to `https://release.bar/api/auth/install` and enable redirect-on-update so users return to their dashboard after installing or changing repository access.
 
-Set the GitHub App webhook URL to `https://release.bar/api/github/webhook`, use the same value as the `GITHUB_WEBHOOK_SECRET` Worker secret, and subscribe to `Issues`, `Pull requests`, `Push`, `Releases`, and `Repository` events. Signed deliveries up to 2 MiB enter Cloudflare Queue before acknowledgement. Count and archive events run lean authoritative refreshes, while push/release events invalidate affected release/CI fragments and enqueue deep refreshes.
+Set the GitHub App webhook URL to `https://release.bar/api/github/webhook`, use the same value as the `GITHUB_WEBHOOK_SECRET` Worker secret, and subscribe to `Issues`, `Pull requests`, `Push`, `Releases`, and `Repository` events. Signed deliveries up to 2 MiB enter Cloudflare Queue before acknowledgement. Count and archive events run lean authoritative refreshes, while push/release events invalidate affected release/CI fragments and enqueue deep refreshes for release-enabled dashboard variants viewed in the last 24 hours. Up to 25 recently viewed matching candidates from the available target indexes enter an immediate batch; fanout waits for that batch to drain, capped at two minutes, before the remaining recent variants follow through a stable key-ordered sweep. Older variants refresh on demand.
 
 ### AI Release Summaries
 

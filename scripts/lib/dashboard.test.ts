@@ -18055,8 +18055,50 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
       ];
     }),
   );
+  const repoMatchedLegacyTargets = Array.from({ length: 30 }, (_, index) => {
+    const suffix = String(index).padStart(2, "0");
+    const legacyKey = `dashboard:v6:aaa${suffix}:noforks-noarchived-unreleased-release`;
+    return {
+      key: legacyKey,
+      storageKey: `refresh:target:v1:${legacyKey}`,
+      target: {
+        ...target,
+        key: legacyKey,
+        owner: `aaa${suffix}`,
+        owners: [],
+        repos: ["owner/repo"],
+        path: `/?repos=owner/repo&variant=${suffix}`,
+      } satisfies RefreshTarget,
+    };
+  });
+  const ownerLegacyPriorityTargets = Array.from({ length: 30 }, (_, index) => {
+    const suffix = String(index).padStart(2, "0");
+    const legacyKey = `dashboard:v6:owner:noforks-noarchived-unreleased-release:sources-priority-${suffix}`;
+    return {
+      key: legacyKey,
+      storageKey: `refresh:target:v1:${legacyKey}`,
+      target: {
+        ...target,
+        key: legacyKey,
+        path: `/owner?priority=${suffix}`,
+        lastSeenAt: new Date(Date.parse(now) - (30 - index) * 1_000).toISOString(),
+      } satisfies RefreshTarget,
+    };
+  });
   const cache = kvStore({
     ...legacyTargets,
+    ...Object.fromEntries(
+      repoMatchedLegacyTargets.map(({ storageKey, target: matchedTarget }) => [
+        storageKey,
+        JSON.stringify(matchedTarget),
+      ]),
+    ),
+    ...Object.fromEntries(
+      ownerLegacyPriorityTargets.map(({ storageKey, target: priorityTarget }) => [
+        storageKey,
+        JSON.stringify(priorityTarget),
+      ]),
+    ),
     "owner:v1:owner": JSON.stringify({ type: "user", login: "owner" }),
     [key]: JSON.stringify(dashboard),
     [combinedKey]: JSON.stringify({
@@ -18098,6 +18140,9 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
     }),
   });
   const queued: unknown[] = [];
+  const queuedDashboardTargets: string[] = [];
+  let delivery7ImmediateTargets: string[] = [];
+  let delivery7ImmediateCaptured = false;
   const queuedWebhooks: Array<Record<string, unknown>> = [];
   const queuedWebhookDelays: Array<number | undefined> = [];
   const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
@@ -18110,10 +18155,28 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
         if (
           message &&
           typeof message === "object" &&
+          (message as { kind?: unknown }).kind === "dashboard" &&
+          typeof (message as { targetKey?: unknown }).targetKey === "string"
+        ) {
+          queuedDashboardTargets.push((message as { targetKey: string }).targetKey);
+        }
+        if (
+          message &&
+          typeof message === "object" &&
           (message as { kind?: unknown }).kind === "github-webhook"
         ) {
           queuedWebhooks.push(message as Record<string, unknown>);
           queuedWebhookDelays.push(options?.delaySeconds);
+        }
+        if (
+          !delivery7ImmediateCaptured &&
+          message &&
+          typeof message === "object" &&
+          (message as { kind?: unknown }).kind === "github-webhook-fanout" &&
+          (message as { delivery?: unknown }).delivery === "delivery-7"
+        ) {
+          delivery7ImmediateTargets = [...queuedDashboardTargets];
+          delivery7ImmediateCaptured = true;
         }
       },
     },
@@ -18159,6 +18222,27 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
     }
     throw new Error(`unexpected fetch ${url.pathname}`);
   };
+  const releaseQueuedDashboardJobs = async () => {
+    for (let queuedIndex = queued.length - 1; queuedIndex >= 0; queuedIndex -= 1) {
+      const queuedJob = queued[queuedIndex] as
+        | { id?: unknown; kind?: unknown; targetKey?: unknown }
+        | undefined;
+      if (
+        queuedJob?.kind !== "dashboard" ||
+        typeof queuedJob.id !== "string" ||
+        typeof queuedJob.targetKey !== "string"
+      ) {
+        continue;
+      }
+      queued.splice(queuedIndex, 1);
+      await env.DASHBOARD_LOCKS!.get(env.DASHBOARD_LOCKS!.idFromName(queuedJob.targetKey)).fetch(
+        new Request("https://releasebar.internal/job/release", {
+          method: "POST",
+          body: JSON.stringify({ jobId: queuedJob.id }),
+        }),
+      );
+    }
+  };
   const send = async (event: string, delivery: string, payload: unknown) => {
     const body = JSON.stringify(payload);
     const response = await worker.fetch(
@@ -18197,6 +18281,7 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
         env,
         { waitUntil: () => undefined },
       );
+      await releaseQueuedDashboardJobs();
       while (true) {
         const fanoutIndex = queued.findIndex(
           (queuedMessage) =>
@@ -18221,28 +18306,7 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
           { waitUntil: () => undefined },
         );
       }
-      for (let queuedIndex = queued.length - 1; queuedIndex >= 0; queuedIndex -= 1) {
-        const queuedJob = queued[queuedIndex] as
-          | { id?: unknown; kind?: unknown; targetKey?: unknown }
-          | undefined;
-        if (
-          queuedJob?.kind !== "dashboard" ||
-          typeof queuedJob.id !== "string" ||
-          typeof queuedJob.targetKey !== "string"
-        ) {
-          continue;
-        }
-        queued.splice(queuedIndex, 1);
-        const targetStub = env.DASHBOARD_LOCKS!.get(
-          env.DASHBOARD_LOCKS!.idFromName(queuedJob.targetKey),
-        );
-        await targetStub.fetch(
-          new Request("https://releasebar.internal/job/release", {
-            method: "POST",
-            body: JSON.stringify({ jobId: queuedJob.id }),
-          }),
-        );
-      }
+      await releaseQueuedDashboardJobs();
     }
     return response;
   };
@@ -18389,12 +18453,30 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
     const featurePush = JSON.parse((await cache.get(key)) ?? "{}") as DashboardPayload;
     assert.equal(featurePush.projects[0]?.latestCommitSha, "abcdef1");
 
+    queuedDashboardTargets.length = 0;
+    await cache.delete("refresh:target-index:v1:ready");
     await send("push", "delivery-7", {
       ref: "refs/heads/main",
       after: "22222223333333",
       head_commit: { timestamp: "2026-06-11T03:00:00Z" },
       repository,
     });
+    assert.equal(
+      repoMatchedLegacyTargets.every(({ key: matchedKey }) =>
+        queuedDashboardTargets.includes(matchedKey),
+      ),
+      true,
+    );
+    assert.equal(delivery7ImmediateTargets?.includes(key), true);
+    assert.equal(delivery7ImmediateTargets.length <= 25, true);
+    assert.equal(delivery7ImmediateTargets.includes(ownerLegacyPriorityTargets.at(-1)!.key), true);
+    assert.equal(delivery7ImmediateTargets.includes(ownerLegacyPriorityTargets[0]!.key), false);
+    assert.equal(
+      ownerLegacyPriorityTargets.every(({ key: priorityKey }) =>
+        queuedDashboardTargets.includes(priorityKey),
+      ),
+      true,
+    );
     assert.equal(await cache.get(key), null);
     assert.equal(await cache.get(secondaryKey), null);
     const activeLocks = env.DASHBOARD_LOCKS;
@@ -18666,7 +18748,7 @@ test("signed GitHub webhooks serialize mutations and enqueue authoritative refre
   }
 });
 
-test("GitHub webhooks fan out beyond the durable target hot-cache limit", async () => {
+test("GitHub push webhooks prioritize recent targets beyond the durable hot-cache limit", async () => {
   type QueuedWebhook = {
     kind: "github-webhook";
     id: string;
@@ -18687,14 +18769,39 @@ test("GitHub webhooks fan out beyond the durable target hot-cache limit", async 
       reason: string;
       includeReleaseDataOnly: boolean;
       invalidateDashboard: boolean;
+      recentTargetsOnly?: boolean;
+      prioritizedTargetKeys?: string[];
     };
-    source: "owner" | "repo" | "legacy";
+    source: "indexed" | "owner" | "repo" | "kv-owner" | "kv-repo" | "legacy";
+    priorityBatchStartedAt?: string;
     cursor?: string;
   };
   const secret = "fanout-webhook-secret";
   const owner = "fanout";
   const now = new Date().toISOString();
+  const fallbackTargetIndex = 0;
+  const staleTargetIndex = 204;
+  const firstReleaseTargetIndex = 26;
+  const movedTargetIndex = 201;
+  const newestTargetIndex = 202;
+  const durableOnlyTargetIndex = 203;
+  const metadataOnlyTargetIndexes = new Set(Array.from({ length: 25 }, (_, index) => index + 1));
   const project = testProject({ owner, name: "repo" });
+  const degradedRepoTarget = {
+    key: "dashboard:v6:custom:noforks-noarchived-unreleased-release:sources-degraded",
+    kind: "dashboard",
+    owner: "custom",
+    owners: [],
+    repos: [`${owner}/repo`],
+    includeReleaseData: true,
+    path: `/?repos=${owner}/repo`,
+    priority: 60,
+    lastSeenAt: new Date(Date.parse(now) - 23 * 60 * 60 * 1_000).toISOString(),
+    lastAttemptAt: null,
+    lastSuccessAt: now,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+  } satisfies RefreshTarget;
   const targets = Array.from({ length: 205 }, (_, index) => {
     const suffix = String(index).padStart(3, "0");
     const key = `dashboard:v6:${owner}:noforks-noarchived-unreleased-release:sources-${suffix}`;
@@ -18704,10 +18811,19 @@ test("GitHub webhooks fan out beyond the durable target hot-cache limit", async 
       owner,
       owners: [owner],
       repos: [],
-      includeReleaseData: true,
+      includeReleaseData: !metadataOnlyTargetIndexes.has(index),
       path: `/${owner}?variant=${suffix}`,
       priority: 60,
-      lastSeenAt: now,
+      lastSeenAt:
+        index === staleTargetIndex
+          ? new Date(Date.parse(now) - 2 * 24 * 60 * 60 * 1_000).toISOString()
+          : index === fallbackTargetIndex
+            ? new Date(Date.parse(now) - 23 * 60 * 60 * 1_000).toISOString()
+            : metadataOnlyTargetIndexes.has(index)
+              ? new Date(Date.parse(now) + 3_000).toISOString()
+              : index === newestTargetIndex
+                ? new Date(Date.parse(now) + 2_000).toISOString()
+                : now,
       lastAttemptAt: null,
       lastSuccessAt: now,
       nextDueAt: "2999-01-01T00:00:00Z",
@@ -18727,10 +18843,16 @@ test("GitHub webhooks fan out beyond the durable target hot-cache limit", async 
         [target.key, JSON.stringify(testDashboard(owner, [project]))],
       ]),
     ),
+    [`refresh:target:v1:${degradedRepoTarget.key}`]: JSON.stringify(degradedRepoTarget),
+    [degradedRepoTarget.key]: JSON.stringify(testDashboard("custom", [project])),
   });
   await cache.put(
     `refresh:target-index:v1:repo:${encodeURIComponent(`${owner}/repo`)}:duplicate`,
     JSON.stringify(targets[0]!.key),
+  );
+  await cache.put(
+    `refresh:target-index:v1:repo:${encodeURIComponent(`${owner}/repo`)}:degraded`,
+    JSON.stringify(degradedRepoTarget.key),
   );
   const queued: Array<RefreshJob | QueuedWebhook | QueuedFanout> = [];
   const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
@@ -18750,22 +18872,34 @@ test("GitHub webhooks fan out beyond the durable target hot-cache limit", async 
   const durableOwnerIndex = env.DASHBOARD_LOCKS.get(
     env.DASHBOARD_LOCKS.idFromName(`refresh-target-index:owner:${owner}`),
   );
-  for (const target of targets) {
+  for (const [index, target] of targets.entries()) {
+    const indexedTarget =
+      index === fallbackTargetIndex
+        ? {
+            ...target,
+            lastSeenAt: new Date(Date.parse(now) - 2 * 24 * 60 * 60 * 1_000).toISOString(),
+          }
+        : target;
     const indexed = await durableOwnerIndex.fetch(
       new Request("https://releasebar.internal/target-index/upsert", {
         method: "POST",
-        body: JSON.stringify(target),
+        body: JSON.stringify(indexedTarget),
       }),
     );
     assert.equal(indexed.status, 204);
   }
+  await cache.delete(`refresh:target:v1:${targets[durableOnlyTargetIndex]!.key}`);
   const durableRepoIndex = env.DASHBOARD_LOCKS.get(
     env.DASHBOARD_LOCKS.idFromName(`refresh-target-index:repo:${owner}/repo`),
   );
+  const staleRepoDuplicate = {
+    ...targets[newestTargetIndex]!,
+    lastSeenAt: new Date(Date.parse(now) - 2 * 24 * 60 * 60 * 1_000).toISOString(),
+  };
   const duplicate = await durableRepoIndex.fetch(
     new Request("https://releasebar.internal/target-index/upsert", {
       method: "POST",
-      body: JSON.stringify(targets[0]),
+      body: JSON.stringify(staleRepoDuplicate),
     }),
   );
   assert.equal(duplicate.status, 204);
@@ -18817,16 +18951,74 @@ test("GitHub webhooks fan out beyond the durable target hot-cache limit", async 
     env,
     { waitUntil: () => undefined },
   );
+  const initialDashboardJobs = queued.filter(
+    (message): message is RefreshJob => message.kind === "dashboard",
+  );
+  const firstFanout = queued.find(
+    (message): message is QueuedFanout => message.kind === "github-webhook-fanout",
+  );
+  assert.ok(firstFanout);
+  assert.equal(initialDashboardJobs.length, 25);
+  assert.equal(firstFanout.action.prioritizedTargetKeys?.length, 25);
+  assert.equal(typeof firstFanout.priorityBatchStartedAt, "string");
+  firstFanout.createdAt = new Date(Date.now() - 3 * 60 * 1_000).toISOString();
+  await cache.put(
+    "github:budget:v1:shared:_",
+    JSON.stringify({
+      active: true,
+      resource: "graphql",
+      remaining: 0,
+      limit: 5_000,
+      resetAt: new Date(Date.now() + 60 * 60 * 1_000).toISOString(),
+      reason: "test cooldown",
+    }),
+  );
+  let fanoutAcknowledged = false;
+  let fanoutRetryDelaySeconds: number | undefined;
+  await worker.queue(
+    {
+      messages: [
+        {
+          body: firstFanout,
+          attempts: 1,
+          ack: () => {
+            fanoutAcknowledged = true;
+          },
+          retry: (options) => {
+            fanoutRetryDelaySeconds = options?.delaySeconds;
+          },
+        },
+      ],
+    },
+    env,
+    { waitUntil: () => undefined },
+  );
+  assert.equal(fanoutAcknowledged, false);
+  assert.equal(fanoutRetryDelaySeconds, 20);
+  await cache.delete("github:budget:v1:shared:_");
+  for (const job of initialDashboardJobs) {
+    const releaseResponse: Response = await env.DASHBOARD_LOCKS.get(
+      env.DASHBOARD_LOCKS.idFromName(job.targetKey),
+    ).fetch(
+      new Request("https://releasebar.internal/job/release", {
+        method: "POST",
+        body: JSON.stringify({ jobId: job.id }),
+      }),
+    );
+    assert.equal(releaseResponse.status, 204);
+  }
   const moved = await durableOwnerIndex.fetch(
     new Request("https://releasebar.internal/target-index/upsert", {
       method: "POST",
       body: JSON.stringify({
-        ...targets[202]!,
-        lastSeenAt: new Date(Date.parse(now) + 1_000).toISOString(),
+        ...targets[movedTargetIndex]!,
+        lastSeenAt: new Date(Date.parse(now) + 4_000).toISOString(),
       }),
     }),
   );
   assert.equal(moved.status, 204);
+  const rebuiltPrioritizedCache = JSON.stringify(testDashboard(owner, [project]));
+  await cache.put(targets[newestTargetIndex]!.key, rebuiltPrioritizedCache);
   const pageSizes = [
     queued.filter((message): message is RefreshJob => message.kind === "dashboard").length,
   ];
@@ -18865,10 +19057,38 @@ test("GitHub webhooks fan out beyond the durable target hot-cache limit", async 
   assert.equal(acknowledged, true);
   assert.equal(pageSizes.length >= 2, true);
   assert.equal(Math.max(...pageSizes) <= 200, true);
-  assert.equal(new Set(dashboardJobs.map((job) => job.targetKey)).size, targets.length);
-  const firstJob = dashboardJobs.find((job) => job.targetKey === targets[0]!.key);
+  assert.equal(
+    new Set(dashboardJobs.map((job) => job.targetKey)).size,
+    targets.length - metadataOnlyTargetIndexes.size,
+  );
+  assert.equal(
+    dashboardJobs.some((job) => job.targetKey === targets[staleTargetIndex]!.key),
+    false,
+  );
+  assert.equal(
+    dashboardJobs.some((job) => job.targetKey === targets[fallbackTargetIndex]!.key),
+    true,
+  );
+  assert.equal(
+    dashboardJobs.some((job) => job.targetKey === targets[movedTargetIndex]!.key),
+    true,
+  );
+  assert.equal(
+    dashboardJobs.some((job) => job.targetKey === targets[durableOnlyTargetIndex]!.key),
+    true,
+  );
+  assert.equal(
+    dashboardJobs.some((job) => job.targetKey === degradedRepoTarget.key),
+    true,
+  );
+  assert.equal(dashboardJobs[0]?.targetKey, targets[newestTargetIndex]!.key);
+  const firstJob = dashboardJobs.find(
+    (job) => job.targetKey === targets[firstReleaseTargetIndex]!.key,
+  );
   assert.ok(firstJob);
-  const firstTargetStub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName(targets[0]!.key));
+  const firstTargetStub = env.DASHBOARD_LOCKS.get(
+    env.DASHBOARD_LOCKS.idFromName(targets[firstReleaseTargetIndex]!.key),
+  );
   const release = await firstTargetStub.fetch(
     new Request("https://releasebar.internal/job/release", {
       method: "POST",
@@ -18876,8 +19096,12 @@ test("GitHub webhooks fan out beyond the durable target hot-cache limit", async 
     }),
   );
   assert.equal(release.status, 204);
-  assert.equal(await cache.get(targets[0]!.key), null);
+  assert.equal(await cache.get(targets[staleTargetIndex]!.key), null);
+  assert.notEqual(await cache.get(targets[1]!.key), null);
+  assert.equal(await cache.get(targets[firstReleaseTargetIndex]!.key), null);
+  assert.equal(await cache.get(targets[newestTargetIndex]!.key), rebuiltPrioritizedCache);
   assert.equal(await cache.get(targets.at(-1)!.key), null);
+  assert.equal(await cache.get(degradedRepoTarget.key), null);
 });
 
 test("durable target indexes cap persistent variants per source", async () => {

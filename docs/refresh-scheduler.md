@@ -88,6 +88,8 @@ Audit events are stored in KV and logged to Worker logs with `area: "scheduler"`
 
 `POST /api/github/webhook` accepts payloads up to 2 MiB, verifies `X-Hub-Signature-256` with `GITHUB_WEBHOOK_SECRET`, accepts GitHub setup pings, and serializes delivery admission through `DASHBOARD_LOCKS`. It acknowledges event deliveries only after the payload is durably written to Cloudflare Queue. Queue consumers serialize cache mutations through the same Durable Object and deduplicate accepted and processed `X-GitHub-Delivery` values for 24 hours.
 
+Push and release deliveries eagerly invalidate and refresh release-enabled dashboard variants viewed in the last 24 hours. Up to 25 recently viewed matching candidates from the available target indexes enter an immediate batch; fanout waits for its Durable Object reservations to drain, capped at two minutes from batch creation, before remaining recent variants follow through a stable key-ordered sweep that cannot skip targets when view timestamps change. Older variants refresh when viewed. Repository privacy and archive events still fan out across every matching target so removal and visibility changes apply immediately.
+
 - `issues` and `pull_request` run one lean authoritative owner-count query, then patch known split counts
 - `repository` archive/unarchive events remove or restore rows according to dashboard visibility and enqueue a metadata refresh
 - `push` and `release` invalidate repository fragments and enqueue affected release dashboards for authoritative hydration

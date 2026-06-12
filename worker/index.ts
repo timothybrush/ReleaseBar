@@ -128,6 +128,8 @@ type WebhookTargetAction = {
   reason: string;
   includeReleaseDataOnly: boolean;
   invalidateDashboard: boolean;
+  recentTargetsOnly?: boolean;
+  prioritizedTargetKeys?: string[];
 };
 
 type GitHubWebhookFanoutJob = {
@@ -138,7 +140,8 @@ type GitHubWebhookFanoutJob = {
   payload: Record<string, unknown>;
   createdAt: string;
   action: WebhookTargetAction;
-  source: "owner" | "repo" | "legacy";
+  source: "indexed" | "owner" | "repo" | "kv-owner" | "kv-repo" | "legacy";
+  priorityBatchStartedAt?: string;
   cursor?: string;
   backfillFailed?: boolean;
 };
@@ -328,6 +331,10 @@ const durableRefreshTargetIndexLimitBytes = 1024 * 1024;
 const webhookTargetPageSize = 200;
 const webhookTargetBatchSize = 50;
 const webhookTargetConcurrency = 8;
+const webhookPriorityTargetLimit = 25;
+const webhookPriorityFanoutWaitMs = 2 * 60 * 1000;
+const webhookPriorityFanoutRetrySeconds = 20;
+const webhookRecentTargetMs = 24 * 60 * 60 * 1000;
 const refreshJobListLimit = 80;
 const refreshAuditListLimit = 80;
 const schedulerBatchLimit = 20;
@@ -5145,13 +5152,23 @@ function isGitHubWebhookFanoutJob(value: unknown): value is GitHubWebhookFanoutJ
     typeof job.event === "string" &&
     typeof job.delivery === "string" &&
     typeof job.createdAt === "string" &&
-    (job.source === "owner" || job.source === "repo" || job.source === "legacy") &&
+    (job.source === "indexed" ||
+      job.source === "owner" ||
+      job.source === "repo" ||
+      job.source === "kv-owner" ||
+      job.source === "kv-repo" ||
+      job.source === "legacy") &&
     job.payload &&
     typeof job.payload === "object" &&
     job.action &&
     typeof job.action.reason === "string" &&
     typeof job.action.includeReleaseDataOnly === "boolean" &&
-    typeof job.action.invalidateDashboard === "boolean",
+    typeof job.action.invalidateDashboard === "boolean" &&
+    (job.priorityBatchStartedAt === undefined || typeof job.priorityBatchStartedAt === "string") &&
+    (job.action.prioritizedTargetKeys === undefined ||
+      (Array.isArray(job.action.prioritizedTargetKeys) &&
+        job.action.prioritizedTargetKeys.length <= webhookPriorityTargetLimit &&
+        job.action.prioritizedTargetKeys.every((key) => typeof key === "string"))),
   );
 }
 
@@ -13980,9 +13997,9 @@ export class DashboardBuildLock {
     if (url.pathname === "/target-index/list") {
       const cutoff = Date.now() - dashboardStorageTtlSeconds * 1000;
       const stored = (await this.state.storage.get<RefreshTarget[]>("refresh-target-index")) ?? [];
-      const targets = stored.filter(
-        (target) => isRefreshTarget(target) && safeIso(target.lastSeenAt) >= cutoff,
-      );
+      const targets = stored
+        .filter((target) => isRefreshTarget(target) && safeIso(target.lastSeenAt) >= cutoff)
+        .sort(compareWebhookTargets);
       return Response.json(targets.slice(0, durableRefreshTargetIndexLimit));
     }
 
@@ -14161,6 +14178,15 @@ export class DashboardBuildLock {
         }
       }
       return new Response(null, { status: 204 });
+    }
+
+    if (url.pathname === "/job/status") {
+      const existing = await this.state.storage.get<StoredRefreshJobReservation>("refresh-job");
+      const active = Boolean(existing && existing.expiresAt > Date.now());
+      if (existing && !active) {
+        await this.state.storage.delete("refresh-job");
+      }
+      return Response.json({ active });
     }
 
     if (url.pathname === "/owner-metadata/mutate") {
@@ -14491,7 +14517,27 @@ function releaseWebhookAffectsDashboard(payload: Record<string, unknown>): boole
 type WebhookTargetPage = {
   targets: RefreshTarget[];
   next: Pick<GitHubWebhookFanoutJob, "source" | "cursor" | "backfillFailed"> | null;
+  prioritized?: boolean;
 };
+
+function compareWebhookTargets(left: RefreshTarget, right: RefreshTarget): number {
+  return (
+    safeIso(right.lastSeenAt) - safeIso(left.lastSeenAt) ||
+    right.priority - left.priority ||
+    left.key.localeCompare(right.key)
+  );
+}
+
+function freshestWebhookTargets(targets: RefreshTarget[]): RefreshTarget[] {
+  const freshest = new Map<string, RefreshTarget>();
+  for (const target of targets) {
+    const current = freshest.get(target.key);
+    if (!current || compareWebhookTargets(target, current) < 0) {
+      freshest.set(target.key, target);
+    }
+  }
+  return [...freshest.values()];
+}
 
 function webhookTargetMatches(target: RefreshTarget, owner: string, fullName: string): boolean {
   return target.owners.includes(owner) || target.repos.includes(fullName) || target.owner === owner;
@@ -14511,43 +14557,36 @@ async function indexedWebhookTargets(
   cursor?: string,
 ): Promise<WebhookTargetPage> {
   if (env.DASHBOARD_LOCKS) {
-    const id = env.DASHBOARD_LOCKS.idFromName(`refresh-target-index:${source}:${value}`);
-    const response = await env.DASHBOARD_LOCKS.get(id).fetch(
-      new Request("https://releasebar.internal/target-index/page", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ cursor, limit: webhookTargetPageSize }),
-      }),
-    );
-    if (!response.ok) {
-      throw new Error(`durable refresh target index returned ${response.status}`);
-    }
-    const stored = (await response.json()) as {
-      targets?: unknown;
-      nextCursor?: unknown;
-    };
-    if (!Array.isArray(stored.targets)) {
-      throw new Error("durable refresh target index returned invalid data");
-    }
-    const targets = [
-      ...new Map(
-        stored.targets
-          .filter((target): target is RefreshTarget => isRefreshTarget(target))
-          .map((target) => [target.key, target]),
-      ).values(),
-    ];
-    const nextCursor =
-      typeof stored.nextCursor === "string" && stored.nextCursor ? stored.nextCursor : undefined;
+    const { targets, nextCursor } = await durableIndexedWebhookTargets(env, source, value, cursor);
     return {
       targets,
       next: nextCursor
         ? { source, cursor: nextCursor, backfillFailed: undefined }
         : source === "owner"
           ? { source: "repo", cursor: undefined, backfillFailed: undefined }
-          : null,
+          : env.DASHBOARD_CACHE?.list
+            ? { source: "kv-owner", cursor: undefined, backfillFailed: undefined }
+            : null,
     };
   }
-  if (!env.DASHBOARD_CACHE?.list) return { targets: [], next: null };
+  const page = await kvIndexedWebhookTargets(env, source, value, cursor);
+  const next = page.nextCursor
+    ? { source, cursor: page.nextCursor, backfillFailed: undefined }
+    : source === "owner"
+      ? { source: "repo" as const, cursor: undefined, backfillFailed: undefined }
+      : env.DASHBOARD_CACHE?.list
+        ? { source: "kv-owner" as const, cursor: undefined, backfillFailed: undefined }
+        : null;
+  return { targets: page.targets, next };
+}
+
+async function kvIndexedWebhookTargets(
+  env: Env,
+  source: "owner" | "repo",
+  value: string,
+  cursor?: string,
+): Promise<{ targets: RefreshTarget[]; nextCursor?: string }> {
+  if (!env.DASHBOARD_CACHE?.list) return { targets: [] };
   const page = await env.DASHBOARD_CACHE.list({
     prefix: refreshTargetIndexSource(source, value),
     limit: webhookTargetPageSize,
@@ -14566,19 +14605,101 @@ async function indexedWebhookTargets(
           : null;
     return targetKey ? readRefreshTarget(env, targetKey) : null;
   });
-  const targets = [
-    ...new Map(
-      indexed
-        .filter((target): target is RefreshTarget => target !== null)
-        .map((target) => [target.key, target]),
-    ).values(),
-  ];
-  const next = page.list_complete
-    ? source === "owner"
-      ? { source: "repo" as const, cursor: undefined, backfillFailed: undefined }
-      : null
-    : { source, cursor: page.cursor, backfillFailed: undefined };
-  return { targets, next };
+  return {
+    targets: freshestWebhookTargets(
+      indexed.filter((target): target is RefreshTarget => target !== null),
+    ),
+    nextCursor: page.list_complete ? undefined : page.cursor,
+  };
+}
+
+async function currentWebhookTargets(env: Env, targets: RefreshTarget[]): Promise<RefreshTarget[]> {
+  if (!env.DASHBOARD_CACHE) return targets;
+  const current = await mapConcurrent(targets, 16, (target) => readRefreshTarget(env, target.key));
+  return freshestWebhookTargets([
+    ...current.filter((target): target is RefreshTarget => target !== null),
+    ...targets,
+  ]);
+}
+
+async function durableIndexedWebhookTargets(
+  env: Env,
+  source: "owner" | "repo",
+  value: string,
+  cursor?: string,
+): Promise<{ targets: RefreshTarget[]; nextCursor?: string }> {
+  if (!env.DASHBOARD_LOCKS) return { targets: [] };
+  const id = env.DASHBOARD_LOCKS.idFromName(`refresh-target-index:${source}:${value}`);
+  const response = await env.DASHBOARD_LOCKS.get(id).fetch(
+    new Request("https://releasebar.internal/target-index/page", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cursor, limit: webhookTargetPageSize }),
+    }),
+  );
+  if (!response.ok) {
+    throw new Error(`durable refresh target index returned ${response.status}`);
+  }
+  const stored = (await response.json()) as {
+    targets?: unknown;
+    nextCursor?: unknown;
+  };
+  if (!Array.isArray(stored.targets)) {
+    throw new Error("durable refresh target index returned invalid data");
+  }
+  const indexed = freshestWebhookTargets(
+    stored.targets.filter((target): target is RefreshTarget => isRefreshTarget(target)),
+  );
+  return {
+    targets: await currentWebhookTargets(env, indexed),
+    nextCursor:
+      typeof stored.nextCursor === "string" && stored.nextCursor ? stored.nextCursor : undefined,
+  };
+}
+
+async function prioritizedIndexedWebhookTargets(
+  env: Env,
+  owner: string,
+  fullName: string,
+  includeReleaseDataOnly: boolean,
+): Promise<WebhookTargetPage> {
+  if (!env.DASHBOARD_LOCKS) return { targets: [], next: null };
+  const read = async (source: "owner" | "repo", value: string): Promise<RefreshTarget[]> => {
+    const id = env.DASHBOARD_LOCKS!.idFromName(`refresh-target-index:${source}:${value}`);
+    const response = await env.DASHBOARD_LOCKS!.get(id).fetch(
+      new Request("https://releasebar.internal/target-index/list", {
+        method: "POST",
+      }),
+    );
+    if (!response.ok) {
+      throw new Error(`durable refresh target index returned ${response.status}`);
+    }
+    const stored = await response.json();
+    if (!Array.isArray(stored)) {
+      throw new Error("durable refresh target index returned invalid data");
+    }
+    return stored.filter((target): target is RefreshTarget => isRefreshTarget(target));
+  };
+  const [ownerTargets, repoTargets] = await Promise.all([
+    read("owner", owner),
+    read("repo", fullName),
+  ]);
+  const selected = freshestWebhookTargets(
+    [...ownerTargets, ...repoTargets]
+      .filter((target) => webhookTargetMatches(target, owner, fullName))
+      .filter((target) => !includeReleaseDataOnly || target.includeReleaseData),
+  )
+    .sort(compareWebhookTargets)
+    .slice(0, webhookPriorityTargetLimit);
+  const targets = freshestWebhookTargets(await currentWebhookTargets(env, selected))
+    .filter((target) => webhookTargetMatches(target, owner, fullName))
+    .filter((target) => !includeReleaseDataOnly || target.includeReleaseData)
+    .sort(compareWebhookTargets);
+  return {
+    targets,
+    next: { source: "owner", cursor: undefined, backfillFailed: undefined },
+    prioritized: true,
+  };
 }
 
 async function legacyWebhookTargets(
@@ -14630,14 +14751,18 @@ async function legacyOwnerWebhookSeedTargets(
   if (!env.DASHBOARD_CACHE?.list) return [];
   const page = await env.DASHBOARD_CACHE.list({
     prefix: `${refreshTargetPrefix}${dashboardCachePrefix}${owner}:`,
-    limit: 25,
+    limit: refreshTargetSourceLimit,
   });
   const targets = await mapConcurrent(page.keys, 8, async (key) => {
     const raw = await env.DASHBOARD_CACHE?.get(key.name);
     const target = raw ? tryJsonParse<RefreshTarget>(raw, `refresh target ${key.name}`) : null;
     return isRefreshTarget(target) && webhookTargetMatches(target, owner, fullName) ? target : null;
   });
-  return targets.filter((target): target is RefreshTarget => target !== null);
+  return freshestWebhookTargets(
+    targets.filter((target): target is RefreshTarget => target !== null),
+  )
+    .sort(compareWebhookTargets)
+    .slice(0, webhookPriorityTargetLimit);
 }
 
 async function webhookTargetPage(
@@ -14647,18 +14772,63 @@ async function webhookTargetPage(
   source?: GitHubWebhookFanoutJob["source"],
   cursor?: string,
   backfillFailed?: boolean,
+  priorityIncludeReleaseDataOnly = false,
 ): Promise<WebhookTargetPage> {
   if (!env.DASHBOARD_CACHE?.list && !env.DASHBOARD_LOCKS) return { targets: [], next: null };
   const indexReady =
     (await env.DASHBOARD_CACHE?.get(refreshTargetIndexReadyKey)) ===
     String(refreshTargetIndexVersion);
-  const selectedSource = source ?? (indexReady ? "owner" : "legacy");
+  const selectedSource =
+    source ?? (indexReady ? (env.DASHBOARD_LOCKS ? "indexed" : "owner") : "legacy");
   if (selectedSource === "legacy") {
-    return legacyWebhookTargets(env, owner, fullName, cursor, backfillFailed);
+    if (source === undefined && priorityIncludeReleaseDataOnly) {
+      return {
+        targets: [],
+        next: { source: "legacy", cursor: undefined, backfillFailed: undefined },
+        prioritized: true,
+      };
+    }
+    const page = await legacyWebhookTargets(env, owner, fullName, cursor, backfillFailed);
+    return page;
+  }
+  if (selectedSource === "indexed") {
+    if (source === undefined) {
+      return prioritizedIndexedWebhookTargets(env, owner, fullName, priorityIncludeReleaseDataOnly);
+    }
+    const page = await indexedWebhookTargets(env, "owner", owner, cursor);
+    return {
+      ...page,
+      targets: page.targets.filter((target) => webhookTargetMatches(target, owner, fullName)),
+    };
+  }
+  if (selectedSource === "kv-owner" || selectedSource === "kv-repo") {
+    const kvSource = selectedSource === "kv-owner" ? "owner" : "repo";
+    const value = kvSource === "owner" ? owner : fullName;
+    const page = await kvIndexedWebhookTargets(env, kvSource, value, cursor);
+    return {
+      targets: page.targets.filter(
+        (target) =>
+          target.indexVersion !== refreshTargetIndexVersion &&
+          webhookTargetMatches(target, owner, fullName) &&
+          (kvSource !== "repo" || !webhookTargetIndexedByOwner(target, owner)),
+      ),
+      next: page.nextCursor
+        ? { source: selectedSource, cursor: page.nextCursor, backfillFailed: undefined }
+        : selectedSource === "kv-owner"
+          ? { source: "kv-repo", cursor: undefined, backfillFailed: undefined }
+          : null,
+    };
+  }
+  if (source === undefined && priorityIncludeReleaseDataOnly) {
+    return {
+      targets: [],
+      next: { source: "owner", cursor: undefined, backfillFailed: undefined },
+      prioritized: true,
+    };
   }
   const value = selectedSource === "owner" ? owner : fullName;
   const page = await indexedWebhookTargets(env, selectedSource, value, cursor);
-  return {
+  const result: WebhookTargetPage = {
     ...page,
     targets: page.targets.filter(
       (target) =>
@@ -14666,6 +14836,7 @@ async function webhookTargetPage(
         (selectedSource !== "repo" || !webhookTargetIndexedByOwner(target, owner)),
     ),
   };
+  return result;
 }
 
 async function mapWebhookTargets<T>(
@@ -14683,6 +14854,19 @@ async function mapWebhookTargets<T>(
     );
   }
   return results;
+}
+
+function webhookTargetsForAction(
+  targets: RefreshTarget[],
+  action: WebhookTargetAction,
+  now = Date.now(),
+): RefreshTarget[] {
+  const recentCutoff = now - webhookRecentTargetMs;
+  return freshestWebhookTargets(
+    targets
+      .filter((target) => !action.includeReleaseDataOnly || target.includeReleaseData)
+      .filter((target) => !action.recentTargetsOnly || safeIso(target.lastSeenAt) >= recentCutoff),
+  ).sort(compareWebhookTargets);
 }
 
 async function invalidateRepoProjectCache(env: Env, fullName: string): Promise<void> {
@@ -14898,6 +15082,7 @@ async function prepareGitHubWebhookEvent(
     reason: `webhook:${event}`,
     includeReleaseDataOnly: true,
     invalidateDashboard: true,
+    recentTargetsOnly: true,
   };
 }
 
@@ -14907,11 +15092,23 @@ async function applyWebhookTargetAction(
   targets: RefreshTarget[],
   action: WebhookTargetAction,
 ): Promise<void> {
-  const selected = action.includeReleaseDataOnly
-    ? targets.filter((target) => target.includeReleaseData)
-    : targets;
+  const prioritized = new Set(action.prioritizedTargetKeys ?? []);
+  const matching = webhookTargetsForAction(targets, {
+    ...action,
+    recentTargetsOnly: false,
+  });
+  const selected = action.recentTargetsOnly
+    ? matching.filter(
+        (target) =>
+          safeIso(target.lastSeenAt) >= Date.now() - webhookRecentTargetMs &&
+          !prioritized.has(target.key),
+      )
+    : matching.filter((target) => !prioritized.has(target.key));
   if (action.invalidateDashboard) {
-    await invalidateDashboardTargets(env, selected);
+    await invalidateDashboardTargets(
+      env,
+      matching.filter((target) => !prioritized.has(target.key)),
+    );
   }
   await mapWebhookTargets(selected, (target) =>
     enqueueRefreshJob(env, context, target, action.reason),
@@ -14926,6 +15123,7 @@ async function enqueueWebhookFanout(
   createdAt: string,
   action: WebhookTargetAction,
   next: WebhookTargetPage["next"],
+  priorityBatchStartedAt?: string,
 ): Promise<void> {
   if (!next) return;
   if (!env.REFRESH_QUEUE) throw new Error("webhook queue unavailable");
@@ -14938,9 +15136,28 @@ async function enqueueWebhookFanout(
     createdAt,
     action,
     source: next.source,
+    ...(priorityBatchStartedAt ? { priorityBatchStartedAt } : {}),
     ...(next.cursor ? { cursor: next.cursor } : {}),
     ...(next.backfillFailed ? { backfillFailed: true } : {}),
   });
+}
+
+async function webhookPriorityBatchActive(env: Env, targetKeys: string[]): Promise<boolean> {
+  if (!env.DASHBOARD_LOCKS || targetKeys.length === 0) return false;
+  const active = await mapConcurrent(targetKeys, 8, async (targetKey) => {
+    const id = env.DASHBOARD_LOCKS!.idFromName(targetKey);
+    const response = await env.DASHBOARD_LOCKS!.get(id).fetch(
+      new Request("https://releasebar.internal/job/status", {
+        method: "POST",
+      }),
+    );
+    if (!response.ok) {
+      throw new Error(`priority refresh status returned ${response.status}`);
+    }
+    const body = (await response.json()) as { active?: unknown };
+    return body.active === true;
+  });
+  return active.some(Boolean);
 }
 
 async function processGitHubWebhookFanout(
@@ -14950,6 +15167,16 @@ async function processGitHubWebhookFanout(
 ): Promise<void> {
   const repo = webhookRepo(job.payload);
   if (!repo) return;
+  const priorityKeys = job.action.prioritizedTargetKeys ?? [];
+  const priorityBatchStartedAt = safeIso(job.priorityBatchStartedAt ?? job.createdAt);
+  if (
+    job.action.recentTargetsOnly &&
+    priorityKeys.length > 0 &&
+    Date.now() - priorityBatchStartedAt < webhookPriorityFanoutWaitMs &&
+    (await webhookPriorityBatchActive(env, priorityKeys))
+  ) {
+    throw new Error("webhook priority refreshes still active");
+  }
   const page = await webhookTargetPage(
     env,
     repo.owner,
@@ -14967,6 +15194,7 @@ async function processGitHubWebhookFanout(
     job.createdAt,
     job.action,
     page.next,
+    job.priorityBatchStartedAt,
   );
 }
 
@@ -14980,20 +15208,52 @@ async function processGitHubWebhook(
 ): Promise<void> {
   const repo = webhookRepo(payload);
   if (!repo) return;
-  const page = await webhookTargetPage(env, repo.owner, repo.fullName);
+  const page = await webhookTargetPage(
+    env,
+    repo.owner,
+    repo.fullName,
+    undefined,
+    undefined,
+    undefined,
+    event === "push" || event === "release",
+  );
   const ownerSeedTargets = await legacyOwnerWebhookSeedTargets(env, repo.owner, repo.fullName);
-  const seedTargets = [
-    ...new Map(
-      [...page.targets, ...ownerSeedTargets].map((target) => [target.key, target]),
-    ).values(),
-  ];
+  const seedTargets = freshestWebhookTargets([...page.targets, ...ownerSeedTargets]);
   const action = await prepareGitHubWebhookEvent(event, payload, env, context, repo, seedTargets);
   if (!action) return;
-  await applyWebhookTargetAction(env, context, seedTargets, action);
-  await enqueueWebhookFanout(env, event, delivery, payload, createdAt, action, page.next);
+  const fallbackTargets = webhookTargetsForAction(ownerSeedTargets, action);
+  const appliedTargets = page.prioritized
+    ? webhookTargetsForAction([...fallbackTargets, ...page.targets], action).slice(
+        0,
+        webhookPriorityTargetLimit,
+      )
+    : seedTargets;
+  const fanoutSkipKeys = page.prioritized
+    ? appliedTargets.map((target) => target.key)
+    : ownerSeedTargets.map((target) => target.key).slice(0, webhookPriorityTargetLimit);
+  await applyWebhookTargetAction(env, context, appliedTargets, action);
+  const priorityBatchStartedAt =
+    action.recentTargetsOnly && fanoutSkipKeys.length > 0 ? new Date().toISOString() : undefined;
+  await enqueueWebhookFanout(
+    env,
+    event,
+    delivery,
+    payload,
+    createdAt,
+    {
+      ...action,
+      prioritizedTargetKeys: fanoutSkipKeys.length > 0 ? fanoutSkipKeys : undefined,
+    },
+    page.next,
+    priorityBatchStartedAt,
+  );
 }
 
 async function githubWebhookRetryDelaySeconds(env: Env, error: unknown): Promise<number> {
+  const reason = errorMessage(error);
+  if (reason.includes("webhook priority refreshes still active")) {
+    return webhookPriorityFanoutRetrySeconds;
+  }
   const cooldown = await sharedQuotaCooldown(env).catch(() => null);
   if (cooldown?.active) {
     return Math.max(
@@ -15004,7 +15264,6 @@ async function githubWebhookRetryDelaySeconds(env: Env, error: unknown): Promise
       ),
     );
   }
-  const reason = errorMessage(error);
   if (
     reason.includes("dashboard locked") ||
     reason.includes("processor busy") ||

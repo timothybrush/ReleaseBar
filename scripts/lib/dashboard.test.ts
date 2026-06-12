@@ -19867,6 +19867,87 @@ test("worker acknowledges webhook jobs after the durable requeue limit", async (
   assert.equal(retried, false);
 });
 
+test("worker quickly requeues busy webhook jobs without consuming their failure budget", async () => {
+  let acknowledged = false;
+  let queuedDelaySeconds: number | undefined;
+  let queuedJob: { attempts?: number; delivery?: string } | undefined;
+  const locks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async (request: Request) => {
+        if (new URL(request.url).pathname === "/webhook/process") {
+          return new Response(null, { status: 409 });
+        }
+        return new Response(null, { status: 404 });
+      },
+    }),
+  };
+
+  await (
+    worker as unknown as {
+      queue(
+        batch: {
+          messages: Array<{
+            body: unknown;
+            attempts?: number;
+            ack(): void;
+            retry(options?: { delaySeconds?: number }): void;
+          }>;
+        },
+        env: unknown,
+        context: unknown,
+      ): Promise<void>;
+    }
+  ).queue(
+    {
+      messages: [
+        {
+          body: {
+            kind: "github-webhook",
+            id: "job-busy",
+            event: "issues",
+            delivery: "delivery-busy",
+            payload: {
+              action: "opened",
+              repository: {
+                full_name: "owner/repo",
+                default_branch: "main",
+              },
+            },
+            createdAt: new Date().toISOString(),
+            attempts: 48,
+          },
+          attempts: 1,
+          ack() {
+            acknowledged = true;
+          },
+          retry() {
+            throw new Error("durably requeued webhook should not retry the original message");
+          },
+        },
+      ],
+    },
+    {
+      DASHBOARD_LOCKS: locks,
+      REFRESH_QUEUE: {
+        async send(
+          job: { attempts?: number; delivery?: string },
+          options?: { delaySeconds?: number },
+        ) {
+          queuedJob = job;
+          queuedDelaySeconds = options?.delaySeconds;
+        },
+      },
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(acknowledged, true);
+  assert.equal(queuedJob?.delivery, "delivery-busy");
+  assert.equal(queuedJob?.attempts, 48);
+  assert.equal(queuedDelaySeconds, 20);
+});
+
 test("terminal webhook fanout clears admission and processing deduplication", async () => {
   const abandoned: string[] = [];
   let retried = false;

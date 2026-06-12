@@ -15249,9 +15249,17 @@ async function processGitHubWebhook(
   );
 }
 
+function githubWebhookProcessorBusy(error: unknown): boolean {
+  const reason = errorMessage(error);
+  return reason.includes("webhook processor returned 409") || reason.includes("processor busy");
+}
+
 async function githubWebhookRetryDelaySeconds(env: Env, error: unknown): Promise<number> {
   const reason = errorMessage(error);
-  if (reason.includes("webhook priority refreshes still active")) {
+  if (
+    reason.includes("webhook priority refreshes still active") ||
+    githubWebhookProcessorBusy(error)
+  ) {
     return webhookPriorityFanoutRetrySeconds;
   }
   const cooldown = await sharedQuotaCooldown(env).catch(() => null);
@@ -15264,11 +15272,7 @@ async function githubWebhookRetryDelaySeconds(env: Env, error: unknown): Promise
       ),
     );
   }
-  if (
-    reason.includes("dashboard locked") ||
-    reason.includes("processor busy") ||
-    reason.includes("target reserved")
-  ) {
+  if (reason.includes("dashboard locked") || reason.includes("target reserved")) {
     return 60;
   }
   if (reason.includes("GraphQL") || reason.includes("deferred")) {
@@ -15508,7 +15512,9 @@ export default {
           message.ack();
         } catch (error) {
           const delaySeconds = await githubWebhookRetryDelaySeconds(env, error);
-          const attempts = (webhookJob.attempts ?? 0) + 1;
+          const attempts = githubWebhookProcessorBusy(error)
+            ? (webhookJob.attempts ?? 0)
+            : (webhookJob.attempts ?? 0) + 1;
           const expired = Date.now() - safeIso(webhookJob.createdAt) >= githubWebhookDeliveryTtlMs;
           if (attempts > githubWebhookRequeueLimit || expired) {
             await abandonGitHubWebhookDelivery(env, webhookJob.delivery, webhookJob.payload).catch(

@@ -46,11 +46,12 @@ export function sortLabel(value: SortKey): string {
 }
 
 export function needsAttention(project: Project): boolean {
-  return attentionReasons(project).length > 0;
+  return !project.archived && attentionReasons(project).length > 0;
 }
 
 export function releaseDebtText(project: Project): string | null {
-  return project.releaseDate &&
+  return !project.archived &&
+    project.releaseDate &&
     project.commitsSinceRelease !== null &&
     project.commitsSinceRelease > releaseDebtCommits
     ? `${project.commitsSinceRelease} commits since release`
@@ -58,6 +59,7 @@ export function releaseDebtText(project: Project): string | null {
 }
 
 export function attentionReasons(project: Project, now = Date.now()): string[] {
+  if (project.archived) return [];
   const reasons: string[] = [];
   const releaseDebt = releaseDebtText(project);
   if (releaseDebt) {

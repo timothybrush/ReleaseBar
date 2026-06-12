@@ -31,6 +31,11 @@ export type DashboardBuildOptions = {
   token?: string;
   quotaSource?: ApiQuota["source"];
   quotaAccount?: string | null;
+  previousCountsUpdatedAt?: string | null;
+  previousProjectCountsUpdatedAt?: Record<string, string>;
+  previousReleasesUpdatedAt?: string | null;
+  previousCiUpdatedAt?: string | null;
+  generationStartedAt?: string;
   fetch?: typeof fetch;
   projectCache?: ProjectCache;
   onProgress?: (
@@ -41,9 +46,22 @@ export type DashboardBuildOptions = {
       done: boolean;
       phase: "metadata" | "hydrate" | "complete";
       removedRepos?: string[];
+      absentRepos?: string[];
+      observedProjects?: Project[];
     },
   ) => Promise<void> | void;
   log?: (message: string) => void;
+};
+
+export type OwnerRepoCount = {
+  fullName: string;
+  openIssues: number;
+  openPullRequests: number;
+  archived: boolean;
+  fork: boolean;
+  private: boolean;
+  pushedAt: string | null;
+  updatedAt: string | null;
 };
 
 type ProjectCache = {
@@ -435,6 +453,7 @@ function repoSearchProject(repo: GitHubRepo): Project {
     issuesUrl: `${repo.html_url}/issues`,
     pullRequestsUrl: `${repo.html_url}/pulls`,
     archived: repo.archived,
+    fork: repo.fork,
     pushedAt: repo.pushed_at,
     updatedAt: repo.updated_at,
     latestCommitSha: null,
@@ -484,6 +503,7 @@ function mergeRepoMetadata(
     issuesUrl: metadata.issuesUrl,
     pullRequestsUrl: metadata.pullRequestsUrl,
     archived: metadata.archived,
+    fork: metadata.fork,
     pushedAt: metadata.pushedAt,
     updatedAt: metadata.updatedAt,
   };
@@ -704,6 +724,125 @@ const ownerReposQuery = /* GraphQL */ `
     }
   }
 `;
+
+const ownerRepoCountsQuery = /* GraphQL */ `
+  query ReleaseBarOwnerCounts($login: String!, $first: Int!, $after: String) {
+    repositoryOwner(login: $login) {
+      repositories(
+        first: $first
+        after: $after
+        orderBy: { field: PUSHED_AT, direction: DESC }
+        ownerAffiliations: OWNER
+        privacy: PUBLIC
+      ) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          nameWithOwner
+          issues(states: OPEN) {
+            totalCount
+          }
+          pullRequests(states: OPEN) {
+            totalCount
+          }
+          isArchived
+          isFork
+          isPrivate
+          pushedAt
+          updatedAt
+        }
+      }
+    }
+  }
+`;
+
+type GraphQLRepoCountNode = {
+  nameWithOwner: string;
+  issues: { totalCount: number };
+  pullRequests: { totalCount: number };
+  isArchived: boolean;
+  isFork: boolean;
+  isPrivate: boolean;
+  pushedAt: string | null;
+  updatedAt: string | null;
+};
+
+type GraphQLRepoCountRepositories = {
+  pageInfo: {
+    hasNextPage: boolean;
+    endCursor: string | null;
+  };
+  nodes: Array<GraphQLRepoCountNode | null>;
+};
+
+type GraphQLRepoCountPage = {
+  data?: {
+    repositoryOwner?: null | {
+      repositories: GraphQLRepoCountRepositories;
+    };
+  };
+  errors?: Array<{ message?: string; type?: string }>;
+};
+
+export async function fetchOwnerRepoCounts(options: {
+  owner: string;
+  token?: string;
+  quotaSource?: ApiQuota["source"];
+  quotaAccount?: string | null;
+  fetch?: typeof fetch;
+  limit?: number;
+}): Promise<{ repos: OwnerRepoCount[]; quota: ApiQuota; complete: boolean }> {
+  const client = githubClient(
+    options.token,
+    options.fetch,
+    options.quotaSource,
+    options.quotaAccount,
+  );
+  const limit = Math.max(1, Math.min(500, Math.trunc(options.limit ?? 200)));
+  const repos: OwnerRepoCount[] = [];
+  let after: string | null = null;
+  let complete = false;
+  while (repos.length < limit) {
+    const first = Math.min(100, limit - repos.length);
+    const body: GraphQLRepoCountPage | null = await githubGraphql<GraphQLRepoCountPage>(
+      client,
+      ownerRepoCountsQuery,
+      {
+        login: options.owner,
+        first,
+        after,
+      },
+    );
+    const page: GraphQLRepoCountRepositories | undefined =
+      body?.data?.repositoryOwner?.repositories;
+    if (!page) {
+      throw new Error(`GitHub GraphQL owner count query failed for ${options.owner}`);
+    }
+    repos.push(
+      ...page.nodes
+        .filter((node): node is GraphQLRepoCountNode => Boolean(node))
+        .map((node) => ({
+          fullName: node.nameWithOwner,
+          openIssues: node.issues.totalCount,
+          openPullRequests: node.pullRequests.totalCount,
+          archived: node.isArchived,
+          fork: node.isFork,
+          private: node.isPrivate,
+          pushedAt: node.pushedAt,
+          updatedAt: node.updatedAt,
+        })),
+    );
+    if (!page.pageInfo.hasNextPage) {
+      complete = true;
+      break;
+    }
+    if (!page.pageInfo.endCursor) break;
+    after = page.pageInfo.endCursor;
+  }
+  return { repos, quota: client.quota, complete };
+}
 
 function graphQlRepo(node: GraphQLRepoNode): GitHubRepo {
   const latestRelease = node.releases?.nodes.find(
@@ -1221,6 +1360,7 @@ async function repoSummary(
     issuesUrl: `${repo.html_url}/issues`,
     pullRequestsUrl: `${repo.html_url}/pulls`,
     archived: repo.archived,
+    fork: repo.fork,
     pushedAt: repo.pushed_at,
     updatedAt: repo.updated_at,
     latestCommitSha: latestCommit?.sha?.slice(0, 7) ?? null,
@@ -1373,10 +1513,27 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
   let capped = false;
   let scanIncomplete = false;
   let scannedThisRun = 0;
+  let countsObservedAt: string | null = null;
+  let countsQueryPerformed = false;
+  const countedThisRun = new Set<string>();
   const seen = new Set<string>();
   const skippedRepos = new Set((options.skipRepos ?? []).map((repo) => repo.toLowerCase()));
+  const reusedCheckpointData = skippedRepos.size > 0;
   for (const project of projects) {
     seen.add(project.fullName.toLowerCase());
+  }
+
+  function beginCountQuery(): void {
+    countsQueryPerformed = true;
+    countsObservedAt ??= new Date().toISOString();
+  }
+
+  function observeCounts(repos: GitHubRepo[]): void {
+    for (const repo of repos) {
+      if (repo.open_issues_total !== undefined && repo.open_pull_requests_total !== undefined) {
+        countedThisRun.add(repo.full_name.toLowerCase());
+      }
+    }
   }
 
   function payload(state: NonNullable<DashboardPayload["cache"]>["state"]): DashboardPayload {
@@ -1386,8 +1543,33 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
       return bDate - aDate;
     });
     const generatedAt = new Date().toISOString();
+    const completedHydrationAt = (previous: string | null | undefined): string | null => {
+      if (options.generationStartedAt) {
+        return Date.parse(previous ?? "") > Date.parse(options.generationStartedAt)
+          ? (previous ?? null)
+          : options.generationStartedAt;
+      }
+      return reusedCheckpointData ? (previous ?? null) : generatedAt;
+    };
     const released = projects.filter((project) => project.releaseDate).length;
     const scanned = skippedRepos.size + scannedThisRun;
+    const countsAuthoritative =
+      countsQueryPerformed &&
+      sortedProjects.every(
+        (project) =>
+          countedThisRun.has(project.fullName.toLowerCase()) &&
+          project.openIssues !== null &&
+          project.openPullRequests !== null,
+      );
+    const projectCountsUpdatedAt = Object.fromEntries(
+      sortedProjects.flatMap((project) => {
+        const fullName = project.fullName.toLowerCase();
+        const updatedAt = countedThisRun.has(fullName)
+          ? countsObservedAt
+          : options.previousProjectCountsUpdatedAt?.[fullName];
+        return updatedAt ? [[fullName, updatedAt]] : [];
+      }),
+    );
     const progress = options.repoScanTarget
       ? {
           scanned,
@@ -1413,6 +1595,20 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
         capped,
         repoLimit: options.repoLimit ?? null,
         generatedAt,
+        countsUpdatedAt: countsAuthoritative
+          ? (countsObservedAt ?? options.previousCountsUpdatedAt ?? generatedAt)
+          : (options.previousCountsUpdatedAt ?? null),
+        projectCountsUpdatedAt,
+        releasesUpdatedAt: includeReleaseData
+          ? state === "fresh"
+            ? completedHydrationAt(options.previousReleasesUpdatedAt)
+            : (options.previousReleasesUpdatedAt ?? null)
+          : null,
+        ciUpdatedAt: includeReleaseData
+          ? state === "fresh"
+            ? completedHydrationAt(options.previousCiUpdatedAt)
+            : (options.previousCiUpdatedAt ?? null)
+          : null,
         quota: client.quota,
         ...(progress ? { progress } : {}),
         ...(!includeReleaseData
@@ -1525,7 +1721,10 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
         const hydrateQueue: GitHubRepo[] = [];
         const hydrationQueued = new Set<string>();
         const liveOwnerRepos = new Set<string>();
+        const observedOwnerRepos = new Set<string>();
         const removedRepos: string[] = [];
+        const absentRepos: string[] = [];
+        const observedArchivedProjects = new Map<string, Project>();
         const explicitRepos = new Set(
           (options.includeRepos ?? []).map((repo) => repo.toLowerCase()),
         );
@@ -1541,6 +1740,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
           (hasScanLimit && hydrateQueue.length < scanLimit) ||
           collectPriorityCandidates
         ) {
+          beginCountQuery();
           const ownerPage = await ownerReposPage(
             client,
             owner,
@@ -1549,6 +1749,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             ownerPageSize,
           );
           const repos = ownerPage.repos;
+          observeCounts(repos);
           const pageSignature =
             repos.length > 0
               ? repos.map((repo) => repo.full_name.toLowerCase()).join("\n")
@@ -1581,6 +1782,12 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
           let exhaustedPage = false;
           for (const [index, repo] of repos.entries()) {
             const fullName = repo.full_name.toLowerCase();
+            if (!repo.private) {
+              observedOwnerRepos.add(fullName);
+              if (repo.archived) {
+                observedArchivedProjects.set(fullName, repoSearchProject(repo));
+              }
+            }
             if (!filterRepo(repo, options)) {
               continue;
             }
@@ -1688,11 +1895,14 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             seen.delete(fullName);
             skippedRepos.delete(fullName);
             removedRepos.push(fullName);
+            if (!observedOwnerRepos.has(fullName)) {
+              absentRepos.push(fullName);
+            }
             ownerVisible -= 1;
             metadataChanged = true;
           }
         }
-        if (metadataChanged) {
+        if (metadataChanged || observedArchivedProjects.size > 0) {
           const progressPayload = payload("partial");
           if (progressPayload.cache?.progress) {
             progressPayload.cache.progress.done = false;
@@ -1703,6 +1913,8 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             done: false,
             phase: "metadata",
             removedRepos,
+            absentRepos,
+            observedProjects: [...observedArchivedProjects.values()],
           });
         }
         const prioritized = prioritizedHydrationQueue(hydrateQueue, options);
@@ -1719,26 +1931,35 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
           }
         }
         const graphqlDetails = await hydrateRepoDetailsOrEmpty(client, hydrationBatch);
-        for (const repo of hydrationBatch) {
-          const hydratedRepo = repoWithGraphqlDetails(repo, graphqlDetails);
-          hydratedThisOwner += 1;
-          scannedThisRun += 1;
-          await addRepo(hydratedRepo, `${owner.login} ${ownerVisible}/${options.repoLimit}`);
-          const progressPayload = payload("partial");
-          if (progressPayload.cache?.progress) {
-            progressPayload.cache.progress.done = false;
+        for (let index = 0; index < hydrationBatch.length; index += 4) {
+          const hydratedRepos = hydrationBatch
+            .slice(index, index + 4)
+            .map((repo) => repoWithGraphqlDetails(repo, graphqlDetails));
+          await Promise.all(
+            hydratedRepos.map((repo) =>
+              addRepo(repo, `${owner.login} ${ownerVisible}/${options.repoLimit}`),
+            ),
+          );
+          for (const hydratedRepo of hydratedRepos) {
+            hydratedThisOwner += 1;
+            scannedThisRun += 1;
+            const progressPayload = payload("partial");
+            if (progressPayload.cache?.progress) {
+              progressPayload.cache.progress.done = false;
+            }
+            await options.onProgress?.(progressPayload, {
+              scannedRepo: hydratedRepo.full_name,
+              scanned: skippedRepos.size + scannedThisRun,
+              done: false,
+              phase: "hydrate",
+            });
           }
-          await options.onProgress?.(progressPayload, {
-            scannedRepo: hydratedRepo.full_name,
-            scanned: skippedRepos.size + scannedThisRun,
-            done: false,
-            phase: "hydrate",
-          });
         }
         continue;
       }
       const pageSignatures = new Set<string>();
       while (ownerVisible < options.repoLimit || hydratedThisOwner < scanLimit) {
+        beginCountQuery();
         const ownerPage = await ownerReposPage(
           client,
           owner,
@@ -1747,6 +1968,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
           ownerPageSize,
         );
         const repos = ownerPage.repos;
+        observeCounts(repos);
         const pageSignature =
           repos.length > 0
             ? repos.map((repo) => repo.full_name.toLowerCase()).join("\n")
@@ -1876,7 +2098,10 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
   } else {
     const repos: GitHubRepo[] = [];
     for (const owner of options.owners) {
-      repos.push(...(await ownerRepos(client, owner, includeReleaseData)));
+      beginCountQuery();
+      const ownerResult = await ownerRepos(client, owner, includeReleaseData);
+      observeCounts(ownerResult);
+      repos.push(...ownerResult);
     }
 
     const uniqueRepos = [
@@ -1891,11 +2116,13 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
   }
 
   for (const fullName of options.includeRepos ?? []) {
+    beginCountQuery();
     let repo = await repoByFullName(client, fullName);
     if (repo && !includeReleaseData && options.includeUnreleased) {
       repo = await repoWithSplitIssueCounts(client, repo);
     }
     if (repo) {
+      observeCounts([repo]);
       await addRepo(repo, `custom`, true);
     }
   }

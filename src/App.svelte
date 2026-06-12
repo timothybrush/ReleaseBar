@@ -907,11 +907,20 @@
       ? `capped at ${numberFormat.format(data.cache.repoLimit ?? data.projects.length)}`
       : "";
     const quota = quotaLabel(data.cache?.quota);
+    const freshness = [
+      data.cache?.countsUpdatedAt
+        ? `counts ${relativeDate(data.cache.countsUpdatedAt)}`
+        : "",
+      data.cache?.releasesUpdatedAt
+        ? `releases ${relativeDate(data.cache.releasesUpdatedAt)}`
+        : "",
+      data.cache?.ciUpdatedAt ? `CI ${relativeDate(data.cache.ciUpdatedAt)}` : "",
+    ].filter(Boolean);
     generatedLabel =
       cacheState === "partial"
         ? `updating · cached ${relativeDate(data.generatedAt)}`
         : `updated ${relativeDate(data.generatedAt)}`;
-    generatedDetail = [cacheState, stale, capped, quota, data.cache?.message ?? ""]
+    generatedDetail = [cacheState, stale, capped, ...freshness, quota, data.cache?.message ?? ""]
       .filter(Boolean)
       .join(" · ");
   }

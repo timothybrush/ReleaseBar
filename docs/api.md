@@ -29,6 +29,9 @@ type CacheState = {
   state: "fresh" | "stale" | "partial" | "warming" | "error";
   stale: boolean;
   generatedAt: string;
+  countsUpdatedAt?: string | null;
+  releasesUpdatedAt?: string | null;
+  ciUpdatedAt?: string | null;
   message?: string;
   quota?: {
     source: "app" | "shared" | "anonymous";
@@ -46,6 +49,7 @@ Agents should:
 - prefer `fresh` and `stale` payloads over calling GitHub directly
 - keep their own short client cache keyed by endpoint URL
 - surface `cache.stale`, `cache.generatedAt`, and `cache.message` in audit logs
+- use `countsUpdatedAt`, `releasesUpdatedAt`, and `ciUpdatedAt` when field-specific freshness matters
 - avoid retry loops on `429`; respect `Retry-After` when present
 - treat `error` payloads as "no ReleaseBar signal", not as negative user evidence
 

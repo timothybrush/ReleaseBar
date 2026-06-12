@@ -7,6 +7,7 @@ import { calculateAudienceScore, isLikelyBot } from "./audience.js";
 import {
   buildDashboard,
   dashboardCacheKey,
+  fetchOwnerRepoCounts,
   filterRepo,
   freshness,
   GitHubRateLimitError,
@@ -31,6 +32,7 @@ import {
   matchesProjectSearch,
   needsAttention,
   parseViewState,
+  releaseDebtText,
   showCodeChurn,
   sortProjects,
   viewStateSearch,
@@ -50,7 +52,11 @@ import type {
   SchedulerAuditEvent,
   TrustProfilePayload,
 } from "../../src/types.js";
-import worker, { DashboardBuildLock, dashboardStreamSignature } from "../../worker/index.js";
+import worker, {
+  DashboardBuildLock,
+  dashboardStreamSignature,
+  dashboardStreamState,
+} from "../../worker/index.js";
 
 const textEncoder = new TextEncoder();
 
@@ -88,10 +94,55 @@ function kvStore(initial: Record<string, string> = {}) {
       const names = [...values.keys()]
         .filter((key) => !options.prefix || key.startsWith(options.prefix))
         .sort();
+      const start = Number.parseInt(options.cursor ?? "0", 10) || 0;
+      const limit = options.limit ?? names.length;
+      const page = names.slice(start, start + limit);
+      const next = start + page.length;
       return {
-        keys: names.map((name) => ({ name })),
-        list_complete: true,
+        keys: page.map((name) => ({ name })),
+        list_complete: next >= names.length,
+        ...(next < names.length ? { cursor: String(next) } : {}),
       };
+    },
+  };
+}
+
+function durableLocks(env: ConstructorParameters<typeof DashboardBuildLock>[1]) {
+  const stubs = new Map<string, { fetch(request: Request): Promise<Response> }>();
+  return {
+    idFromName(name: string) {
+      return name;
+    },
+    get(id: string) {
+      const existing = stubs.get(id);
+      if (existing) return existing;
+      const values = new Map<string, unknown>();
+      let chain = Promise.resolve();
+      const state = {
+        storage: {
+          async get<T>(key: string) {
+            return values.get(key) as T | undefined;
+          },
+          async put<T>(key: string, value: T) {
+            values.set(key, value);
+          },
+          async delete(key: string) {
+            return values.delete(key);
+          },
+        },
+        blockConcurrencyWhile<T>(callback: () => Promise<T>) {
+          const result = chain.then(callback, callback);
+          chain = result.then(
+            () => undefined,
+            () => undefined,
+          );
+          return result;
+        },
+      };
+      const object = new DashboardBuildLock(state, env);
+      const stub = { fetch: (request: Request) => object.fetch(request) };
+      stubs.set(id, stub);
+      return stub;
     },
   };
 }
@@ -302,6 +353,18 @@ async function signedJson(secret: string, value: unknown): Promise<string> {
   );
   const signature = await crypto.subtle.sign("HMAC", key, textEncoder.encode(payload));
   return `${payload}.${base64Url(new Uint8Array(signature))}`;
+}
+
+async function webhookSignature(secret: string, body: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    textEncoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = new Uint8Array(await crypto.subtle.sign("HMAC", key, textEncoder.encode(body)));
+  return `sha256=${[...signature].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
 function crawlerRequest(
@@ -617,6 +680,31 @@ test("dashboard stream signature changes when dev sort counts change", () => {
     dashboardStreamSignature(payload, "partial"),
     dashboardStreamSignature(next, "partial"),
   );
+  const archived = JSON.parse(JSON.stringify(payload)) as DashboardPayload;
+  archived.projects[0]!.archived = true;
+  assert.notEqual(
+    dashboardStreamSignature(payload, "partial"),
+    dashboardStreamSignature(archived, "partial"),
+  );
+  const fresher = JSON.parse(JSON.stringify(payload)) as DashboardPayload;
+  fresher.cache!.countsUpdatedAt = "2026-05-22T00:01:00.000Z";
+  assert.notEqual(
+    dashboardStreamSignature(payload, "partial"),
+    dashboardStreamSignature(fresher, "partial"),
+  );
+});
+
+test("dashboard stream state preserves explicit webhook invalidation", () => {
+  const payload = testDashboard("owner", [testProject({ owner: "owner", name: "repo" })]);
+  payload.generatedAt = new Date().toISOString();
+  payload.cache = {
+    state: "stale",
+    stale: true,
+    capped: false,
+    repoLimit: 200,
+    generatedAt: payload.generatedAt,
+  };
+  assert.equal(dashboardStreamState(payload), "stale");
 });
 
 test("repository detail hides unavailable code churn", () => {
@@ -904,6 +992,9 @@ test("need attention explains release debt, stale releases, CI, and open work", 
   assert.equal(needsAttention(pressured), true);
   assert.deepEqual(attentionReasons(pressured), ["CI failing", "12 open PRs", "120 open issues"]);
   assert.equal(needsAttention(releaseDebt), true);
+  assert.equal(needsAttention({ ...pressured, archived: true }), false);
+  assert.equal(releaseDebtText({ ...releaseDebt, archived: true }), null);
+  assert.deepEqual(attentionReasons({ ...pressured, archived: true }), []);
   assert.deepEqual(attentionReasons(releaseDebt, Date.parse("2026-05-15T00:00:00Z")), [
     "201 commits since release",
   ]);
@@ -1040,6 +1131,17 @@ test("worker builds root hot dashboard from cached dashboards", async () => {
           }),
         ]),
       ),
+      "owner-metadata:v1:alpha": JSON.stringify({
+        owner: "alpha",
+        generatedAt: new Date().toISOString(),
+        metadataUpdatedAt: new Date().toISOString(),
+        countsUpdatedAt: new Date().toISOString(),
+        releaseDataComplete: true,
+        projects: [
+          testProject({ owner: "alpha", name: "hot", openIssues: 99 }),
+          testProject({ owner: "alpha", name: "second", archived: true }),
+        ],
+      }),
     }),
   };
 
@@ -1052,6 +1154,11 @@ test("worker builds root hot dashboard from cached dashboards", async () => {
   assert.equal(body.title, "ReleaseBar Hot");
   assert.deepEqual(body.owners, []);
   assert.equal(body.projects[0]?.fullName, "alpha/hot");
+  assert.equal(body.projects[0]?.openIssues, 99);
+  assert.equal(
+    body.projects.some((project) => project.fullName === "alpha/second"),
+    false,
+  );
   assert.equal(
     body.projects.some((project) => project.fullName === "alpha/archived"),
     false,
@@ -1196,12 +1303,29 @@ test("worker embeds cached metadata-only owner dashboard data in the app shell",
     ...payload.cache!,
     message: "release scan skipped until GitHub App quota is available",
   };
-  const key = dashboardCacheKey({
+  const metadataKey = dashboardCacheKey({
     owner: "owner",
     includeUnreleased: true,
     includeReleaseData: false,
     schemaVersion: 6,
   });
+  const releaseKey = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const releasePayload = {
+    ...payload,
+    projects: [
+      testProject({
+        owner: "owner",
+        name: "repo",
+        version: "v9.9.9",
+        releaseName: "hydrated release cache",
+      }),
+    ],
+  } satisfies DashboardPayload;
   const response = await worker.fetch(
     new Request("https://release.bar/owner", { headers: { cookie: "rd_session=bogus" } }),
     {
@@ -1215,7 +1339,8 @@ test("worker embeds cached metadata-only owner dashboard data in the app shell",
         },
       },
       DASHBOARD_CACHE: kvStore({
-        [key]: JSON.stringify(payload),
+        [metadataKey]: JSON.stringify(payload),
+        [releaseKey]: JSON.stringify(releasePayload),
       }),
       GITHUB_APP_ID: "123",
       GITHUB_APP_PRIVATE_KEY: "not-a-private-key",
@@ -1230,6 +1355,134 @@ test("worker embeds cached metadata-only owner dashboard data in the app shell",
   assert.match(html, /id="releasebar-initial-data"/);
   assert.match(html, /owner\\u002frepo|owner\/repo/);
   assert.match(html, /release scan skipped/);
+  assert.doesNotMatch(html, /hydrated release cache/);
+});
+
+test("worker does not embed a release-only cache for an unsynced owner dashboard", async () => {
+  const releaseKey = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const releasePayload = testDashboard("owner", [
+    testProject({
+      owner: "owner",
+      name: "repo",
+      version: "v9.9.9",
+      releaseName: "hydrated release cache",
+    }),
+  ]);
+  const response = await worker.fetch(
+    new Request("https://release.bar/owner", { headers: { cookie: "rd_session=bogus" } }),
+    {
+      ASSETS: {
+        fetch: async () =>
+          new Response(
+            '<title>ReleaseBar</title><script type="module" src="/assets/index.js"></script>',
+            { headers: { "content-type": "text/html" } },
+          ),
+      },
+      DASHBOARD_CACHE: kvStore({
+        [releaseKey]: JSON.stringify(releasePayload),
+      }),
+      GITHUB_APP_ID: "123",
+      GITHUB_APP_PRIVATE_KEY: "not-a-private-key",
+    },
+    { waitUntil: () => undefined },
+  );
+
+  const html = await response.text();
+  assert.equal(response.status, 200);
+  assert.doesNotMatch(html, /hydrated release cache/);
+  assert.doesNotMatch(html, /id="releasebar-initial-data"/);
+});
+
+test("signed-in mixed-account fast paths preserve release dashboards", async () => {
+  const sessionId = "session-mixed-cache";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const generatedAt = new Date().toISOString();
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const keyInput = {
+    owner: "openclaw",
+    owners: ["steipete"],
+    includeUnreleased: true,
+    schemaVersion: 6,
+  };
+  const metadataKey = dashboardCacheKey({ ...keyInput, includeReleaseData: false });
+  const releaseKey = dashboardCacheKey({ ...keyInput, includeReleaseData: true });
+  const metadataPayload = testDashboard("openclaw", [
+    testProject({
+      owner: "openclaw",
+      name: "releasebar",
+      version: "repo search",
+      releaseName: "metadata cache",
+    }),
+  ]);
+  metadataPayload.generatedAt = generatedAt;
+  metadataPayload.cache = { ...metadataPayload.cache!, generatedAt };
+  const releasePayload = testDashboard("openclaw", [
+    testProject({
+      owner: "openclaw",
+      name: "releasebar",
+      version: "v1.2.3",
+      releaseName: "hydrated release cache",
+    }),
+  ]);
+  releasePayload.generatedAt = generatedAt;
+  releasePayload.cache = { ...releasePayload.cache!, generatedAt };
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    ASSETS: {
+      fetch: async () =>
+        new Response(
+          '<title>ReleaseBar</title><script type="module" src="/assets/index.js"></script>',
+          { headers: { "content-type": "text/html" } },
+        ),
+    },
+    DASHBOARD_CACHE: kvStore({
+      [`auth:session:${sessionId}`]: JSON.stringify({
+        user: {
+          id: 1,
+          login: "octocat",
+          name: null,
+          avatarUrl: "https://avatars.githubusercontent.com/u/1",
+          url: "https://github.com/octocat",
+        },
+        accessToken: "user-token",
+        iat: exp - 600,
+        exp,
+      }),
+      [metadataKey]: JSON.stringify(metadataPayload),
+      [releaseKey]: JSON.stringify(releasePayload),
+    }),
+    GITHUB_APP_ID: "123",
+    GITHUB_APP_PRIVATE_KEY: "private-key",
+  };
+  const requestHeaders = { cookie: `rd_session=${authCookie}` };
+
+  const apiResponse = await worker.fetch(
+    new Request("https://release.bar/api/openclaw?owners=steipete", {
+      headers: requestHeaders,
+    }),
+    env,
+    { waitUntil: () => undefined },
+  );
+  assert.equal(apiResponse.status, 200);
+  const apiPayload = (await apiResponse.json()) as DashboardPayload;
+  assert.equal(apiPayload.projects[0]?.releaseName, "hydrated release cache");
+
+  const pageResponse = await worker.fetch(
+    new Request("https://release.bar/openclaw?owners=steipete", {
+      headers: requestHeaders,
+    }),
+    env,
+    { waitUntil: () => undefined },
+  );
+  assert.equal(pageResponse.status, 200);
+  const html = await pageResponse.text();
+  assert.match(html, /hydrated release cache/);
+  assert.doesNotMatch(html, /metadata cache/);
 });
 
 test("worker embeds cached crawler dashboard shells without discovering app installs", async () => {
@@ -2588,10 +2841,20 @@ test("worker serves OpenAPI spec aliases for Swagger tooling", async () => {
     const body = (await response.json()) as {
       openapi?: string;
       paths?: Record<string, unknown>;
+      components?: {
+        schemas?: {
+          CacheState?: {
+            properties?: Record<string, unknown>;
+          };
+        };
+      };
     };
     assert.equal(body.openapi, "3.1.0");
     assert.ok(body.paths?.["/api/users/{login}/trust"]);
     assert.ok(body.paths?.["/api/repos/{owner}/{repo}/audience"]);
+    assert.ok(body.components?.schemas?.CacheState?.properties?.countsUpdatedAt);
+    assert.ok(body.components?.schemas?.CacheState?.properties?.releasesUpdatedAt);
+    assert.ok(body.components?.schemas?.CacheState?.properties?.ciUpdatedAt);
   }
 });
 
@@ -4964,7 +5227,7 @@ test("worker manual dashboard refresh returns metadata before release hydration"
     const body = (await response.json()) as DashboardPayload;
     assert.equal(body.cache?.state, "partial");
     assert.equal(body.cache?.progress?.done, false);
-    assert.match(body.cache?.message ?? "", /issue and PR counts refreshed/);
+    assert.match(body.cache?.message ?? "", /repository metadata refreshed/);
     assert.equal(body.projects[0]?.openIssues, 9);
     assert.equal(body.projects[0]?.openPullRequests, 4);
     assert.equal(body.projects[0]?.version, "repo search");
@@ -4987,6 +5250,112 @@ test("worker manual dashboard refresh returns metadata before release hydration"
     assert.equal(hydrated.cache?.state, "fresh");
     assert.equal(hydrated.projects[0]?.version, "v1.0.0");
     assert.equal(hydrated.projects[0]?.commitsSinceRelease, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("manual refreshes merge owner removals observed during the build before caching", async () => {
+  const originalFetch = globalThis.fetch;
+  const cache = kvStore();
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] & {
+    GITHUB_TOKEN: string;
+    REFRESH_QUEUE: { send(): Promise<void> };
+  } = {
+    DASHBOARD_CACHE: cache,
+    GITHUB_TOKEN: "shared-token",
+    REFRESH_QUEUE: { send: async () => undefined },
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  let removalRecorded = false;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/users/owner") {
+      return Response.json({ login: "owner", type: "User" });
+    }
+    if (url.pathname === "/graphql") {
+      if (!removalRecorded) {
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        const stub = env.DASHBOARD_LOCKS!.get(
+          env.DASHBOARD_LOCKS!.idFromName("owner-metadata:owner"),
+        );
+        const removed = await stub.fetch(
+          new Request("https://releasebar.internal/owner-metadata/mutate", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              owner: "owner",
+              mutation: {
+                kind: "remove",
+                fullName: "owner/repo",
+                observedAt: new Date().toISOString(),
+              },
+            }),
+          }),
+        );
+        assert.equal(removed.ok, true);
+        removalRecorded = true;
+      }
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "User",
+            repositories: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                {
+                  owner: { login: "owner", __typename: "User" },
+                  name: "repo",
+                  nameWithOwner: "owner/repo",
+                  description: "removed during build",
+                  url: "https://github.com/owner/repo",
+                  defaultBranchRef: { name: "main" },
+                  primaryLanguage: { name: "TypeScript" },
+                  repositoryTopics: { nodes: [] },
+                  stargazerCount: 1,
+                  forkCount: 0,
+                  issues: { totalCount: 1 },
+                  pullRequests: { totalCount: 0 },
+                  isArchived: false,
+                  isFork: false,
+                  isPrivate: false,
+                  pushedAt: "2026-06-11T00:00:00Z",
+                  updatedAt: "2026-06-11T00:00:00Z",
+                  releases: { nodes: [] },
+                },
+              ],
+            },
+          },
+        },
+      });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/owner", { method: "POST" }),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 202);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.projects.length, 0);
+    const cached = JSON.parse(
+      (await cache.get(
+        dashboardCacheKey({
+          owner: "owner",
+          includeUnreleased: true,
+          includeReleaseData: true,
+          schemaVersion: 6,
+        }),
+      )) ?? "{}",
+    ) as DashboardPayload;
+    assert.equal(cached.projects.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -5947,18 +6316,32 @@ test("worker serves partial cached sources while combined dashboard rebuilds", a
   };
   const alphaKey = dashboardCacheKey({ owner: "alpha", includeUnreleased: true, schemaVersion: 6 });
   const betaKey = dashboardCacheKey({ owner: "beta", includeUnreleased: true, schemaVersion: 6 });
+  const now = new Date().toISOString();
+  const alphaSource = testProject({ owner: "alpha", name: "one", openIssues: 1 });
+  const alphaMetadata = testProject({
+    owner: "alpha",
+    name: "one",
+    openIssues: 9,
+    version: "repo search",
+    releaseDate: null,
+  });
 
   try {
     const response = await worker.fetch(
       new Request("https://release.bar/api/alpha?owners=beta"),
       {
         DASHBOARD_CACHE: kvStore({
-          [alphaKey]: JSON.stringify(
-            testDashboard("alpha", [testProject({ owner: "alpha", name: "one" })]),
-          ),
+          [alphaKey]: JSON.stringify(testDashboard("alpha", [alphaSource])),
           [betaKey]: JSON.stringify(
             testDashboard("beta", [testProject({ owner: "beta", name: "two" })]),
           ),
+          "owner-metadata:v1:alpha": JSON.stringify({
+            owner: "alpha",
+            generatedAt: now,
+            metadataUpdatedAt: now,
+            countsUpdatedAt: now,
+            projects: [alphaMetadata],
+          }),
         }),
         DASHBOARD_LOCKS: busyLocks,
         GITHUB_TOKEN: "shared-token",
@@ -5974,7 +6357,247 @@ test("worker serves partial cached sources while combined dashboard rebuilds", a
       "beta/two",
     ]);
     assert.equal(body.totals.repos, 2);
+    assert.equal(body.cache?.countsUpdatedAt, null);
+    assert.equal(body.cache?.releasesUpdatedAt, null);
+    assert.equal(body.cache?.ciUpdatedAt, null);
+    const mergedAlpha = body.projects.find((project) => project.fullName === "alpha/one");
+    assert.equal(mergedAlpha?.openIssues, 9);
+    assert.equal(mergedAlpha?.version, alphaSource.version);
+    assert.equal(mergedAlpha?.releaseDate, alphaSource.releaseDate);
     assert.equal(repoFetches, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker filters shared owner snapshots for cold combined dashboards", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/users/alpha") {
+      return Response.json({ login: "alpha", type: "User" });
+    }
+    if (url.pathname === "/users/beta") {
+      return Response.json({ login: "beta", type: "Organization" });
+    }
+    if (url.pathname === "/users/stale") {
+      return Response.json({ login: "stale", type: "User" });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const busyLocks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async () => new Response(null, { status: 409 }),
+    }),
+  };
+  const now = new Date().toISOString();
+  const snapshot = (
+    owner: string,
+    projects: Project[],
+    projectMetadataUpdatedAt: Record<string, string> = {},
+  ) =>
+    JSON.stringify({
+      owner,
+      generatedAt: now,
+      metadataUpdatedAt: now,
+      countsUpdatedAt: now,
+      projectMetadataUpdatedAt: Object.fromEntries(
+        projects.map((project) => [
+          project.fullName.toLowerCase(),
+          projectMetadataUpdatedAt[project.fullName.toLowerCase()] ?? now,
+        ]),
+      ),
+      projects,
+    });
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/alpha?owners=beta,stale&unreleased=false"),
+      {
+        DASHBOARD_CACHE: kvStore({
+          "owner-metadata:v1:alpha": snapshot(
+            "alpha",
+            [
+              testProject({ owner: "alpha", name: "released", fork: false }),
+              testProject({ owner: "alpha", name: "fork", fork: true }),
+              testProject({
+                owner: "alpha",
+                name: "unreleased",
+                fork: false,
+                releaseDate: null,
+                version: "unreleased",
+              }),
+              testProject({ owner: "alpha", name: "expired", fork: false }),
+            ],
+            {
+              "alpha/expired": new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString(),
+            },
+          ),
+          "owner-metadata:v1:beta": snapshot("beta", [
+            testProject({ owner: "beta", name: "released", fork: false }),
+          ]),
+          "owner-metadata:v1:stale": JSON.stringify({
+            owner: "stale",
+            generatedAt: new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString(),
+            metadataUpdatedAt: new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString(),
+            countsUpdatedAt: now,
+            projects: [testProject({ owner: "stale", name: "private-now", fork: false })],
+          }),
+        }),
+        DASHBOARD_LOCKS: busyLocks,
+        GITHUB_TOKEN: "shared-token",
+      },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as DashboardPayload;
+    assert.deepEqual(body.projects.map((project) => project.fullName).sort(), [
+      "alpha/released",
+      "beta/released",
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker uses explicit repository owner snapshots for cold dashboards", async () => {
+  const now = new Date().toISOString();
+  const project = testProject({ owner: "other", name: "repo" });
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/dashboard?repos=other/repo"),
+    {
+      DASHBOARD_CACHE: kvStore({
+        "owner-metadata:v1:other": JSON.stringify({
+          owner: "other",
+          generatedAt: now,
+          metadataUpdatedAt: now,
+          countsUpdatedAt: now,
+          knownRepos: ["other/repo"],
+          projectMetadataUpdatedAt: { "other/repo": now },
+          projectCountsUpdatedAt: { "other/repo": now },
+          projects: [project],
+        }),
+      }),
+      DASHBOARD_LOCKS: {
+        idFromName: (name: string) => name,
+        get: () => ({
+          fetch: async () => new Response(null, { status: 409 }),
+        }),
+      },
+    },
+    { waitUntil: () => undefined },
+  );
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as DashboardPayload;
+  assert.deepEqual(
+    body.projects.map((candidate) => candidate.fullName),
+    ["other/repo"],
+  );
+});
+
+test("cold partial dashboards honor durable privatization tombstones over stale KV", async () => {
+  const now = new Date().toISOString();
+  const project = testProject({ owner: "owner", name: "repo" });
+  const privateSnapshot = {
+    owner: "owner",
+    generatedAt: now,
+    metadataUpdatedAt: now,
+    countsUpdatedAt: now,
+    countsAttemptedAt: now,
+    releaseDataComplete: true,
+    knownRepos: [],
+    privateRepos: { "owner/repo": now },
+    removedRepos: { "owner/repo": now },
+    projectMetadataUpdatedAt: { "owner/repo": now },
+    projectCountsUpdatedAt: {},
+    countOverlays: {},
+    projects: [],
+  };
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/dashboard?repos=owner/repo"),
+    {
+      DASHBOARD_CACHE: kvStore({
+        "owner-metadata:v1:owner": JSON.stringify({
+          ...privateSnapshot,
+          privateRepos: {},
+          removedRepos: {},
+          knownRepos: ["owner/repo"],
+          projectCountsUpdatedAt: { "owner/repo": now },
+          projects: [project],
+        }),
+      }),
+      DASHBOARD_LOCKS: {
+        idFromName: (name: string) => name,
+        get: (id: string) => ({
+          fetch: async (request: Request) =>
+            id === "owner-metadata:owner" &&
+            new URL(request.url).pathname === "/owner-metadata/read"
+              ? Response.json(privateSnapshot)
+              : new Response(null, { status: 409 }),
+        }),
+      },
+    },
+    { waitUntil: () => undefined },
+  );
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as DashboardPayload;
+  assert.deepEqual(body.projects, []);
+});
+
+test("metadata-only partial dashboards strip hydrated release and CI fields", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/users/alpha") {
+      return Response.json({ login: "alpha", type: "User" });
+    }
+    if (url.pathname === "/users/beta") {
+      return Response.json({ login: "beta", type: "Organization" });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const busyLocks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async () => new Response(null, { status: 409 }),
+    }),
+  };
+  const now = new Date().toISOString();
+  const snapshot = (owner: string) =>
+    JSON.stringify({
+      owner,
+      generatedAt: now,
+      metadataUpdatedAt: now,
+      countsUpdatedAt: now,
+      releaseDataComplete: true,
+      projects: [testProject({ owner, name: "repo", ciState: "failure" })],
+    });
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/alpha?owners=beta"),
+      {
+        DASHBOARD_CACHE: kvStore({
+          "owner-metadata:v1:alpha": snapshot("alpha"),
+          "owner-metadata:v1:beta": snapshot("beta"),
+        }),
+        DASHBOARD_LOCKS: busyLocks,
+        GITHUB_APP_ID: "1",
+        GITHUB_APP_PRIVATE_KEY: "unused",
+      },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.cache?.state, "partial");
+    assert.equal(body.projects.length, 2);
+    for (const project of body.projects) {
+      assert.equal(project.version, "repo search");
+      assert.equal(project.releaseDate, null);
+      assert.equal(project.latestCommitSha, null);
+      assert.equal(project.commitsSinceRelease, null);
+      assert.equal(project.ciState, "unknown");
+      assert.equal(project.ciConclusion, null);
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -6071,6 +6694,8 @@ test("worker progressively resumes large owner dashboard builds from partial cac
     assert.equal(secondBody.cache?.state, "fresh");
     assert.equal(secondBody.cache?.progress?.done, true);
     assert.equal(secondBody.projects.length, 25);
+    assert.equal(typeof secondBody.cache?.releasesUpdatedAt, "string");
+    assert.equal(secondBody.cache?.ciUpdatedAt, secondBody.cache?.releasesUpdatedAt);
     assert.equal(
       secondBody.projects.filter((project) => project.version === "repo search").length,
       0,
@@ -6262,6 +6887,9 @@ test("worker resumes durable progress on cold metadata cache misses", async () =
             status: 204,
             headers: { "x-releasebar-progress": "durable" },
           });
+        }
+        if (path === "/target-index/upsert") {
+          return new Response(null, { status: 204 });
         }
         return new Response(null, { status: 404 });
       },
@@ -6474,6 +7102,9 @@ test("worker deduplicates queued refreshes for partial dashboards", async () => 
           }
           return new Response(null, { status: 204 });
         }
+        if (path === "/target-index/upsert") {
+          return new Response(null, { status: 204 });
+        }
         return new Response(null, { status: 404 });
       },
     }),
@@ -6591,10 +7222,148 @@ test("worker Queue messages stay bounded when profile filters are large", async 
   ) as RefreshJob;
   assert.equal(snapshot.target?.profileSnapshotKey, profileSnapshotKey);
   assert.equal(JSON.stringify(snapshot.target).length < 4096, true);
+  assert.equal(await cache.get("refresh:target-index:v1:ready"), null);
   const storedProfile = JSON.parse((await cache.get(profileSnapshotKey)) ?? "{}") as {
     hiddenRepos?: string[];
   };
   assert.equal(storedProfile.hiddenRepos?.length, 5000);
+});
+
+test("owner count scheduling rotates beyond a deferred owner cap", async () => {
+  const now = new Date().toISOString();
+  const staleAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const owners = Array.from({ length: 21 }, (_, index) => `owner${String(index).padStart(3, "0")}`);
+  const entries = Object.fromEntries(
+    owners.flatMap((owner) => {
+      const key = dashboardCacheKey({
+        owner,
+        includeUnreleased: true,
+        includeReleaseData: true,
+        schemaVersion: 6,
+      });
+      const project = testProject({ owner, name: "repo" });
+      const target: RefreshTarget = {
+        key,
+        kind: "dashboard",
+        owner,
+        owners: [owner],
+        repos: [],
+        includeReleaseData: true,
+        path: `/${owner}`,
+        priority: 100,
+        lastSeenAt: now,
+        lastAttemptAt: null,
+        lastSuccessAt: now,
+        nextDueAt: "2999-01-01T00:00:00Z",
+        failureCount: 0,
+      };
+      return [
+        [`refresh:target:v1:${key}`, JSON.stringify(target)],
+        [key, JSON.stringify(testDashboard(owner, [project]))],
+        [
+          `owner-metadata:v1:${owner}`,
+          JSON.stringify({
+            owner,
+            generatedAt: now,
+            metadataUpdatedAt: now,
+            countsUpdatedAt: staleAt,
+            releaseDataComplete: true,
+            knownRepos: [project.fullName.toLowerCase()],
+            removedRepos: {},
+            projectMetadataUpdatedAt: { [project.fullName.toLowerCase()]: now },
+            projectCountsUpdatedAt: { [project.fullName.toLowerCase()]: staleAt },
+            projects: [project],
+          }),
+        ],
+      ];
+    }),
+  );
+  const cache = kvStore(entries);
+  const run = async () => {
+    const waits: Promise<unknown>[] = [];
+    await (
+      worker as unknown as {
+        scheduled(
+          event: { cron: string },
+          env: unknown,
+          context: { waitUntil(promise: Promise<unknown>): void },
+        ): Promise<void>;
+      }
+    ).scheduled(
+      { cron: "*/15 * * * *" },
+      { DASHBOARD_CACHE: cache },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    await Promise.all(waits);
+  };
+
+  await run();
+  assert.equal(await cache.get("refresh:owner-count-cursor:v1"), "owner019");
+  await run();
+  assert.equal(await cache.get("refresh:owner-count-cursor:v1"), "owner018");
+});
+
+test("owner count scheduling throttles recent incomplete scans", async () => {
+  const now = new Date().toISOString();
+  const staleAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const key = dashboardCacheKey({
+    owner: "large-owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const project = testProject({ owner: "large-owner", name: "repo" });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "large-owner",
+    owners: ["large-owner"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/large-owner",
+    priority: 100,
+    lastSeenAt: now,
+    lastAttemptAt: null,
+    lastSuccessAt: now,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const cache = kvStore({
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+    [key]: JSON.stringify(testDashboard("large-owner", [project])),
+    "owner-metadata:v1:large-owner": JSON.stringify({
+      owner: "large-owner",
+      generatedAt: now,
+      metadataUpdatedAt: now,
+      countsUpdatedAt: staleAt,
+      countsAttemptedAt: now,
+      releaseDataComplete: true,
+      knownRepos: [project.fullName.toLowerCase()],
+      removedRepos: {},
+      projectMetadataUpdatedAt: { [project.fullName.toLowerCase()]: now },
+      projectCountsUpdatedAt: { [project.fullName.toLowerCase()]: staleAt },
+      projects: [project],
+    }),
+  });
+  const originalFetch = globalThis.fetch;
+  let graphqlRequests = 0;
+  globalThis.fetch = async (input) => {
+    if (new URL(String(input)).pathname === "/graphql") graphqlRequests += 1;
+    throw new Error(`unexpected fetch ${String(input)}`);
+  };
+  try {
+    const waits: Promise<unknown>[] = [];
+    await worker.scheduled(
+      { cron: "*/15 * * * *" } as never,
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    await Promise.all(waits);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(graphqlRequests, 0);
+  assert.equal(await cache.get("refresh:owner-count-cursor:v1"), null);
 });
 
 test("worker scheduler terminalizes retryable refreshes when Queue is unavailable", async () => {
@@ -6985,7 +7754,10 @@ test("worker falls back to KV progress when the Durable Object is unavailable", 
         DASHBOARD_LOCKS: {
           idFromName: (name: string) => name,
           get: () => ({
-            fetch: async () => {
+            fetch: async (request: Request) => {
+              if (new URL(request.url).pathname === "/owner-metadata/read") {
+                return new Response(null, { status: 204 });
+              }
               throw new Error("Durable Object unavailable");
             },
           }),
@@ -8632,8 +9404,24 @@ test("worker keeps signed-in mixed-account dashboards on shared release scans", 
 });
 
 test("worker keeps unsynced app-configured owner dashboards metadata-only", async () => {
+  const releaseKey = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const releasePayload = testDashboard("owner", [
+    testProject({
+      owner: "owner",
+      name: "repo",
+      version: "v9.9.9",
+      releaseName: "hydrated release cache",
+    }),
+  ]);
   const env = {
-    DASHBOARD_CACHE: kvStore(),
+    DASHBOARD_CACHE: kvStore({
+      [releaseKey]: JSON.stringify(releasePayload),
+    }),
     GITHUB_APP_ID: "123",
     GITHUB_APP_PRIVATE_KEY: "private-key",
   };
@@ -8687,7 +9475,9 @@ test("worker keeps unsynced app-configured owner dashboards metadata-only", asyn
     assert.equal(body.projects[0]?.commitsSinceRelease, null);
     assert.equal(body.projects[0]?.openIssues, null);
     assert.equal(body.projects[0]?.openPullRequests, null);
+    assert.equal(body.cache?.countsUpdatedAt, null);
     assert.match(body.cache?.message ?? "", /release scan skipped/);
+    assert.notEqual(body.projects[0]?.releaseName, "hydrated release cache");
     assert.equal(await env.DASHBOARD_CACHE.get("hot:index:v3"), null);
   } finally {
     globalThis.fetch = originalFetch;
@@ -13474,6 +14264,8 @@ test("dashboard build emits owner metadata before release hydration", async () =
     hydrateSort: "prs",
     hydrateDirection: "desc",
     token: "token",
+    previousReleasesUpdatedAt: "2026-01-01T00:00:00Z",
+    previousCiUpdatedAt: "2026-01-02T00:00:00Z",
     fetch: async (url) => {
       const path = new URL(String(url)).pathname;
       requested.push(path);
@@ -13491,6 +14283,7 @@ test("dashboard build emits owner metadata before release hydration", async () =
         });
       }
       if (path === "/repos/owner/one/commits/main") {
+        await new Promise((resolve) => setTimeout(resolve, 20));
         return Response.json({
           sha: "abcdef123456",
           commit: { committer: { date: "2026-01-04T00:00:00Z" } },
@@ -13521,13 +14314,167 @@ test("dashboard build emits owner metadata before release hydration", async () =
     ],
   );
   assert.equal(progress[0]?.cache?.progress?.scanned, 0);
+  assert.equal(payload.cache?.countsUpdatedAt, progress[0]?.cache?.countsUpdatedAt);
+  assert.equal(progress[0]?.cache?.releasesUpdatedAt, "2026-01-01T00:00:00Z");
+  assert.equal(progress[0]?.cache?.ciUpdatedAt, "2026-01-02T00:00:00Z");
   assert.equal(requested.includes("/repos/owner/one/commits/main"), true);
   assert.equal(requested.includes("/repos/owner/three/commits/main"), false);
   assert.equal(payload.cache?.state, "partial");
+  assert.equal(payload.cache?.releasesUpdatedAt, "2026-01-01T00:00:00Z");
+  assert.equal(payload.cache?.ciUpdatedAt, "2026-01-02T00:00:00Z");
   assert.deepEqual(
     payload.projects.map((project) => project.name),
     ["one", "two", "three"],
   );
+});
+
+test("partial owner scans do not advance count freshness without current coverage", async () => {
+  const previousCountsUpdatedAt = "2026-06-11T01:00:00Z";
+  const initialProjects = [
+    testProject({ owner: "partial-counts", name: "one", openIssues: 1, openPullRequests: 1 }),
+    testProject({ owner: "partial-counts", name: "two", openIssues: 2, openPullRequests: 2 }),
+  ];
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "partial-counts" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    repoLimit: 3,
+    repoScanLimit: 0,
+    repoScanTarget: 3,
+    ownerPageLimit: 1,
+    initialProjects,
+    token: "token",
+    previousCountsUpdatedAt,
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      assert.equal(path, "/graphql");
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "User",
+            repositories: {
+              pageInfo: { hasNextPage: true, endCursor: "next" },
+              nodes: [
+                {
+                  owner: { login: "partial-counts", __typename: "User" },
+                  name: "one",
+                  nameWithOwner: "partial-counts/one",
+                  description: null,
+                  url: "https://github.com/partial-counts/one",
+                  defaultBranchRef: { name: "main" },
+                  primaryLanguage: null,
+                  repositoryTopics: { nodes: [] },
+                  stargazerCount: 0,
+                  forkCount: 0,
+                  issues: { totalCount: 9 },
+                  pullRequests: { totalCount: 4 },
+                  isArchived: false,
+                  isFork: false,
+                  isPrivate: false,
+                  pushedAt: "2026-06-11T03:00:00Z",
+                  updatedAt: "2026-06-11T03:00:00Z",
+                  releases: { nodes: [] },
+                },
+              ],
+            },
+          },
+        },
+      });
+    },
+  });
+
+  assert.equal(payload.cache?.state, "partial");
+  assert.equal(payload.projects.find((project) => project.name === "one")?.openIssues, 9);
+  assert.equal(payload.projects.find((project) => project.name === "two")?.openIssues, 2);
+  assert.equal(payload.cache?.countsUpdatedAt, previousCountsUpdatedAt);
+});
+
+test("multi-page count scans keep their first-request observation time", async () => {
+  let page = 0;
+  let secondRequestStartedAt = 0;
+  const repoNode = (name: string) => ({
+    owner: { login: "count-clock", __typename: "User" },
+    name,
+    nameWithOwner: `count-clock/${name}`,
+    description: null,
+    url: `https://github.com/count-clock/${name}`,
+    defaultBranchRef: { name: "main" },
+    primaryLanguage: null,
+    repositoryTopics: { nodes: [] },
+    stargazerCount: 0,
+    forkCount: 0,
+    issues: { totalCount: 1 },
+    pullRequests: { totalCount: 0 },
+    isArchived: false,
+    isFork: false,
+    isPrivate: false,
+    pushedAt: "2026-06-11T03:00:00Z",
+    updatedAt: "2026-06-11T03:00:00Z",
+    releases: { nodes: [] },
+  });
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "count-clock" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    includeReleaseData: false,
+    repoLimit: 2,
+    repoScanLimit: 0,
+    ownerPageSize: 1,
+    token: "token",
+    fetch: async (url) => {
+      assert.equal(new URL(String(url)).pathname, "/graphql");
+      page += 1;
+      if (page === 2) secondRequestStartedAt = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            __typename: "User",
+            repositories: {
+              pageInfo: {
+                hasNextPage: page === 1,
+                endCursor: page === 1 ? "next" : null,
+              },
+              nodes: [repoNode(page === 1 ? "one" : "two")],
+            },
+          },
+        },
+      });
+    },
+  });
+
+  assert.equal(payload.projects.length, 2);
+  assert.ok(secondRequestStartedAt > 0);
+  assert.ok(Date.parse(payload.cache?.countsUpdatedAt ?? "") < secondRequestStartedAt);
+});
+
+test("metadata-only released-only builds preserve count freshness without fetching", async () => {
+  const previousCountsUpdatedAt = "2026-06-11T01:00:00Z";
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "released-only" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: false,
+    includeReleaseData: false,
+    previousCountsUpdatedAt,
+    fetch: async () => {
+      throw new Error("released-only metadata build should not fetch");
+    },
+  });
+
+  assert.deepEqual(payload.projects, []);
+  assert.equal(payload.cache?.countsUpdatedAt, previousCountsUpdatedAt);
 });
 
 test("dashboard cached hydration keeps fresh owner issue and PR totals", async () => {
@@ -14320,6 +15267,7 @@ test("dashboard hydration reconciles new repositories into a cached 200-repo set
   );
   const scanned: string[] = [];
   const removed: string[] = [];
+  const absent: string[] = [];
   const payload = await buildDashboard({
     title: "ReleaseBar",
     subtitle: "test",
@@ -14361,6 +15309,7 @@ test("dashboard hydration reconciles new repositories into a cached 200-repo set
     onProgress: (_partial, progress) => {
       if (progress.scannedRepo) scanned.push(progress.scannedRepo);
       removed.push(...(progress.removedRepos ?? []));
+      absent.push(...(progress.absentRepos ?? []));
     },
   });
 
@@ -14375,6 +15324,7 @@ test("dashboard hydration reconciles new repositories into a cached 200-repo set
   );
   assert.deepEqual(scanned, ["owner/repo-new"]);
   assert.deepEqual(removed, ["owner/repo-200"]);
+  assert.deepEqual(absent, []);
   assert.equal(payload.cache?.progress?.scanned, 200);
   assert.equal(payload.cache?.progress?.done, true);
 });
@@ -14407,6 +15357,7 @@ test("dashboard hydration removes vanished repositories after complete owner enu
     }),
   );
   const removed: string[] = [];
+  const absent: string[] = [];
   const payload = await buildDashboard({
     title: "ReleaseBar",
     subtitle: "test",
@@ -14445,6 +15396,7 @@ test("dashboard hydration removes vanished repositories after complete owner enu
     },
     onProgress: (_partial, progress) => {
       removed.push(...(progress.removedRepos ?? []));
+      absent.push(...(progress.absentRepos ?? []));
     },
   });
 
@@ -14453,8 +15405,75 @@ test("dashboard hydration removes vanished repositories after complete owner enu
     "owner/new-name",
   ]);
   assert.deepEqual(removed, ["owner/old-name"]);
+  assert.deepEqual(absent, ["owner/old-name"]);
   assert.equal(payload.cache?.progress?.scanned, 2);
   assert.equal(payload.cache?.progress?.done, true);
+});
+
+test("dashboard filtering does not report archived repositories as absent", async () => {
+  const previousReleasesUpdatedAt = "2026-06-10T05:00:00Z";
+  const previousCiUpdatedAt = "2026-06-10T06:00:00Z";
+  const project = testProject({
+    owner: "owner",
+    name: "repo",
+    archived: false,
+    pushedAt: "2026-06-10T07:00:00Z",
+    updatedAt: "2026-06-10T07:00:00Z",
+  });
+  const removed: string[] = [];
+  const absent: string[] = [];
+  const payload = await buildDashboard({
+    title: "ReleaseBar",
+    subtitle: "test",
+    canonicalDomain: "example.com",
+    owners: [{ type: "user", login: "owner" }],
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    includeReleaseData: true,
+    repoLimit: 200,
+    repoScanLimit: 12,
+    repoScanTarget: 1,
+    initialProjects: [project],
+    skipRepos: [project.fullName],
+    previousReleasesUpdatedAt,
+    previousCiUpdatedAt,
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      if (path === "/users/owner/repos") {
+        return Response.json([
+          {
+            owner: { login: "owner" },
+            name: "repo",
+            full_name: "owner/repo",
+            description: null,
+            html_url: "https://github.com/owner/repo",
+            default_branch: "main",
+            language: null,
+            stargazers_count: 0,
+            forks_count: 0,
+            open_issues_count: 0,
+            archived: true,
+            pushed_at: "2026-06-11T07:00:00Z",
+            updated_at: "2026-06-11T07:00:00Z",
+            fork: false,
+            private: false,
+          },
+        ]);
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+    onProgress: (_partial, progress) => {
+      removed.push(...(progress.removedRepos ?? []));
+      absent.push(...(progress.absentRepos ?? []));
+    },
+  });
+
+  assert.deepEqual(payload.projects, []);
+  assert.deepEqual(removed, ["owner/repo"]);
+  assert.deepEqual(absent, []);
+  assert.equal(payload.cache?.releasesUpdatedAt, previousReleasesUpdatedAt);
+  assert.equal(payload.cache?.ciUpdatedAt, previousCiUpdatedAt);
 });
 
 test("dashboard reconciliation preserves live repositories later on a short page", async () => {
@@ -15207,4 +16226,3486 @@ test("dashboard repo cap keeps paginating until eligible repos survive filters",
     ["one"],
   );
   assert.equal(payload.cache?.capped, true);
+});
+
+test("owner count refresh uses the lean GraphQL shape", async () => {
+  let query = "";
+  const result = await fetchOwnerRepoCounts({
+    owner: "owner",
+    token: "token",
+    fetch: async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as { query?: string };
+      query = body.query ?? "";
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            repositories: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                {
+                  nameWithOwner: "owner/repo",
+                  issues: { totalCount: 7 },
+                  pullRequests: { totalCount: 3 },
+                  isArchived: false,
+                  isFork: false,
+                  isPrivate: false,
+                  pushedAt: "2026-06-11T00:00:00Z",
+                  updatedAt: "2026-06-11T01:00:00Z",
+                },
+              ],
+            },
+          },
+        },
+      });
+    },
+  });
+
+  assert.match(query, /query ReleaseBarOwnerCounts/);
+  assert.doesNotMatch(query, /repositoryTopics|releases|statusCheckRollup/);
+  assert.equal(result.complete, true);
+  assert.deepEqual(result.repos[0], {
+    fullName: "owner/repo",
+    openIssues: 7,
+    openPullRequests: 3,
+    archived: false,
+    fork: false,
+    private: false,
+    pushedAt: "2026-06-11T00:00:00Z",
+    updatedAt: "2026-06-11T01:00:00Z",
+  });
+
+  const truncated = await fetchOwnerRepoCounts({
+    owner: "owner",
+    token: "token",
+    limit: 1,
+    fetch: async () =>
+      Response.json({
+        data: {
+          repositoryOwner: {
+            repositories: {
+              pageInfo: { hasNextPage: true, endCursor: "next" },
+              nodes: [
+                {
+                  nameWithOwner: "owner/repo",
+                  issues: { totalCount: 7 },
+                  pullRequests: { totalCount: 3 },
+                  isArchived: false,
+                  isFork: false,
+                  isPrivate: false,
+                  pushedAt: "2026-06-11T00:00:00Z",
+                  updatedAt: "2026-06-11T01:00:00Z",
+                },
+              ],
+            },
+          },
+        },
+      }),
+  });
+  assert.equal(truncated.complete, false);
+});
+
+test("worker serves fresh dashboard cache before GitHub App token discovery", async () => {
+  const now = new Date().toISOString();
+  const releaseKey = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const metadataKey = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: false,
+    schemaVersion: 6,
+  });
+  const project = testProject({ owner: "owner", name: "repo", openIssues: 1 });
+  const cachedProject = { ...project, archived: true };
+  const removedProject = testProject({ owner: "owner", name: "removed", openIssues: 4 });
+  const cached: DashboardPayload = {
+    ...testDashboard("owner", [cachedProject, removedProject]),
+    generatedAt: now,
+    options: {
+      includeForks: false,
+      includeArchived: false,
+      includeUnreleased: true,
+      repoLimit: 200,
+    },
+    cache: {
+      state: "fresh",
+      stale: false,
+      capped: false,
+      repoLimit: 200,
+      generatedAt: now,
+      countsUpdatedAt: now,
+      releasesUpdatedAt: now,
+      ciUpdatedAt: now,
+    },
+  };
+  const staleMetadataAt = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString();
+  const freshCountsAt = new Date(Date.now() + 1_000).toISOString();
+  const ownerSnapshot = {
+    owner: "owner",
+    generatedAt: staleMetadataAt,
+    metadataUpdatedAt: staleMetadataAt,
+    countsUpdatedAt: freshCountsAt,
+    knownRepos: [project.fullName.toLowerCase()],
+    projects: [{ ...project, description: "stale description", archived: false, openIssues: 9 }],
+  };
+  const cache = kvStore({
+    [metadataKey]: JSON.stringify(cached),
+    "owner-metadata:v1:owner": JSON.stringify(ownerSnapshot),
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("fresh cache should not discover or mint GitHub App tokens");
+  };
+  try {
+    const waits: Promise<unknown>[] = [];
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/owner"),
+      {
+        DASHBOARD_CACHE: cache,
+        GITHUB_APP_ID: "1",
+        GITHUB_APP_PRIVATE_KEY: "unused",
+      },
+      { waitUntil: (promise) => waits.push(promise) },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as DashboardPayload;
+    assert.equal(body.projects.length, 1);
+    assert.equal(body.projects[0]?.openIssues, 9);
+    assert.equal(body.projects[0]?.description, project.description);
+    await Promise.all(waits);
+    const metadataTarget = JSON.parse(
+      (await cache.get(`refresh:target:v1:${metadataKey}`)) ?? "{}",
+    ) as RefreshTarget;
+    assert.equal(metadataTarget.key, metadataKey);
+    assert.equal(metadataTarget.includeReleaseData, false);
+    assert.equal(await cache.get(`refresh:target:v1:${releaseKey}`), null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("owner metadata does not overwrite newer dashboard counts", async () => {
+  const now = new Date().toISOString();
+  const newerMetadataAt = new Date(Date.now() + 1_000).toISOString();
+  const staleCountsAt = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString();
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const project = testProject({ owner: "owner", name: "repo", openIssues: 1 });
+  const cached: DashboardPayload = {
+    ...testDashboard("owner", [project]),
+    generatedAt: now,
+    cache: {
+      state: "fresh",
+      stale: false,
+      capped: false,
+      repoLimit: 200,
+      generatedAt: now,
+      countsUpdatedAt: now,
+    },
+  };
+  const cache = kvStore({
+    [key]: JSON.stringify(cached),
+    "owner-metadata:v1:owner": JSON.stringify({
+      owner: "owner",
+      generatedAt: newerMetadataAt,
+      metadataUpdatedAt: newerMetadataAt,
+      countsUpdatedAt: staleCountsAt,
+      releaseDataComplete: true,
+      knownRepos: [project.fullName.toLowerCase()],
+      projects: [{ ...project, description: "new metadata", openIssues: 9 }],
+    }),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/owner"),
+    { DASHBOARD_CACHE: cache },
+    { waitUntil: () => undefined },
+  );
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as DashboardPayload;
+  assert.equal(body.projects[0]?.description, "new metadata");
+  assert.equal(body.projects[0]?.openIssues, 1);
+  assert.equal(body.cache?.countsUpdatedAt, now);
+});
+
+test("owner metadata compares count snapshots against count freshness", async () => {
+  const countsAt = "2026-06-11T01:00:00Z";
+  const snapshotAt = "2026-06-11T02:00:00Z";
+  const generatedAt = "2026-06-11T03:00:00Z";
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const project = testProject({ owner: "owner", name: "repo", openIssues: 1 });
+  const cache = kvStore({
+    [key]: JSON.stringify({
+      ...testDashboard("owner", [project]),
+      generatedAt,
+      cache: {
+        state: "partial",
+        stale: true,
+        capped: false,
+        repoLimit: 200,
+        generatedAt,
+        countsUpdatedAt: countsAt,
+      },
+    } satisfies DashboardPayload),
+    "owner-metadata:v1:owner": JSON.stringify({
+      owner: "owner",
+      generatedAt: snapshotAt,
+      metadataUpdatedAt: snapshotAt,
+      countsUpdatedAt: snapshotAt,
+      releaseDataComplete: true,
+      knownRepos: ["owner/repo"],
+      removedRepos: {},
+      projectMetadataUpdatedAt: { "owner/repo": snapshotAt },
+      projectCountsUpdatedAt: { "owner/repo": snapshotAt },
+      projects: [{ ...project, openIssues: 9 }],
+    }),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/owner"),
+    { DASHBOARD_CACHE: cache },
+    { waitUntil: () => undefined },
+  );
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as DashboardPayload;
+  assert.equal(body.projects[0]?.openIssues, 9);
+  assert.equal(body.cache?.countsUpdatedAt, snapshotAt);
+  assert.equal(body.cache?.projectCountsUpdatedAt?.["owner/repo"], snapshotAt);
+});
+
+test("owner count overlays update repositories absent from a narrow metadata snapshot", async () => {
+  const cachedAt = new Date(Date.now() - 60_000).toISOString();
+  const observedAt = new Date().toISOString();
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const cachedProject = testProject({
+    owner: "owner",
+    name: "outside-filter",
+    archived: false,
+    openIssues: 1,
+  });
+  const narrowProject = testProject({ owner: "owner", name: "inside-filter" });
+  const cache = kvStore({
+    [key]: JSON.stringify({
+      ...testDashboard("owner", [cachedProject]),
+      generatedAt: cachedAt,
+      cache: {
+        state: "fresh",
+        stale: false,
+        capped: false,
+        repoLimit: 200,
+        generatedAt: cachedAt,
+        countsUpdatedAt: cachedAt,
+      },
+    } satisfies DashboardPayload),
+    "owner-metadata:v1:owner": JSON.stringify({
+      owner: "owner",
+      generatedAt: cachedAt,
+      metadataUpdatedAt: cachedAt,
+      countsUpdatedAt: cachedAt,
+      releaseDataComplete: true,
+      knownRepos: null,
+      removedRepos: {},
+      projectMetadataUpdatedAt: { "owner/inside-filter": cachedAt },
+      projectCountsUpdatedAt: { "owner/inside-filter": cachedAt },
+      projects: [narrowProject],
+    }),
+  });
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = locks;
+  const response = await locks.get(locks.idFromName("owner-metadata:owner")).fetch(
+    new Request("https://releasebar.internal/owner-metadata/mutate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        owner: "owner",
+        mutation: {
+          kind: "counts",
+          updatedAt: observedAt,
+          complete: true,
+          counts: [
+            {
+              fullName: "owner/inside-filter",
+              openIssues: 0,
+              openPullRequests: 0,
+              archived: false,
+              fork: false,
+              private: false,
+              pushedAt: observedAt,
+              updatedAt: observedAt,
+            },
+            {
+              fullName: "owner/outside-filter",
+              openIssues: 9,
+              openPullRequests: 2,
+              archived: true,
+              fork: false,
+              private: false,
+              pushedAt: observedAt,
+              updatedAt: observedAt,
+            },
+          ],
+        },
+      }),
+    }),
+  );
+  assert.equal(response.ok, true);
+
+  const dashboard = await worker.fetch(new Request("https://release.bar/api/owner"), env, {
+    waitUntil: () => undefined,
+  });
+  assert.equal(dashboard.status, 200);
+  assert.equal(((await dashboard.json()) as DashboardPayload).projects.length, 0);
+  const snapshot = JSON.parse((await cache.get("owner-metadata:v1:owner")) ?? "{}") as {
+    countOverlays?: Record<string, { archived?: boolean; openIssues?: number }>;
+  };
+  assert.equal(snapshot.countOverlays?.["owner/outside-filter"]?.archived, true);
+  assert.equal(snapshot.countOverlays?.["owner/outside-filter"]?.openIssues, 9);
+});
+
+test("owner snapshots only advance count freshness when they cover every displayed repository", async () => {
+  const cachedAt = "2026-06-11T03:00:00Z";
+  const snapshotAt = "2026-06-11T04:00:00Z";
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const repo = testProject({ owner: "owner", name: "repo", openIssues: 1 });
+  const sibling = testProject({ owner: "owner", name: "sibling", openIssues: 2 });
+  const cache = kvStore({
+    [key]: JSON.stringify({
+      ...testDashboard("owner", [repo, sibling]),
+      generatedAt: cachedAt,
+      cache: {
+        state: "fresh",
+        stale: false,
+        capped: false,
+        repoLimit: 200,
+        generatedAt: cachedAt,
+        countsUpdatedAt: cachedAt,
+      },
+    } satisfies DashboardPayload),
+    "owner-metadata:v1:owner": JSON.stringify({
+      owner: "owner",
+      generatedAt: snapshotAt,
+      metadataUpdatedAt: cachedAt,
+      countsUpdatedAt: snapshotAt,
+      releaseDataComplete: true,
+      knownRepos: null,
+      removedRepos: {},
+      projectMetadataUpdatedAt: { "owner/repo": cachedAt },
+      projects: [{ ...repo, openIssues: 9 }],
+    }),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/owner"),
+    { DASHBOARD_CACHE: cache },
+    { waitUntil: () => undefined },
+  );
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as DashboardPayload;
+  assert.equal(body.projects.find((project) => project.name === "repo")?.openIssues, 9);
+  assert.equal(body.projects.find((project) => project.name === "sibling")?.openIssues, 2);
+  assert.equal(body.cache?.countsUpdatedAt, cachedAt);
+});
+
+test("partial owner count scans expose matched repository counts without advancing global freshness", async () => {
+  const initialAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  const dashboardAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const partialAt = new Date().toISOString();
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const repo = testProject({ owner: "owner", name: "repo", openIssues: 1 });
+  const sibling = testProject({ owner: "owner", name: "sibling", openIssues: 2 });
+  const cache = kvStore({
+    [key]: JSON.stringify({
+      ...testDashboard("owner", [repo, sibling]),
+      generatedAt: dashboardAt,
+      cache: {
+        state: "fresh",
+        stale: false,
+        capped: false,
+        repoLimit: 200,
+        generatedAt: dashboardAt,
+        countsUpdatedAt: initialAt,
+      },
+    } satisfies DashboardPayload),
+    "owner-metadata:v1:owner": JSON.stringify({
+      owner: "owner",
+      generatedAt: initialAt,
+      metadataUpdatedAt: initialAt,
+      countsUpdatedAt: initialAt,
+      releaseDataComplete: true,
+      knownRepos: ["owner/repo", "owner/sibling"],
+      removedRepos: {},
+      projectMetadataUpdatedAt: {
+        "owner/repo": initialAt,
+        "owner/sibling": initialAt,
+      },
+      projectCountsUpdatedAt: {
+        "owner/repo": initialAt,
+        "owner/sibling": initialAt,
+      },
+      projects: [repo, sibling],
+    }),
+  });
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  const stub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName("owner-metadata:owner"));
+  const mutation = await stub.fetch(
+    new Request("https://releasebar.internal/owner-metadata/mutate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        owner: "owner",
+        mutation: {
+          kind: "counts",
+          updatedAt: partialAt,
+          complete: false,
+          counts: [
+            {
+              fullName: "owner/repo",
+              openIssues: 9,
+              openPullRequests: 3,
+              archived: false,
+              fork: false,
+              private: false,
+              pushedAt: partialAt,
+              updatedAt: partialAt,
+            },
+          ],
+        },
+      }),
+    }),
+  );
+  assert.equal(mutation.ok, true);
+
+  const snapshot = (await mutation.json()) as {
+    countsUpdatedAt?: string;
+    projectCountsUpdatedAt?: Record<string, string>;
+  };
+  assert.equal(snapshot.countsUpdatedAt, initialAt);
+  assert.equal(snapshot.projectCountsUpdatedAt?.["owner/repo"], partialAt);
+  assert.equal(snapshot.projectCountsUpdatedAt?.["owner/sibling"], initialAt);
+
+  const response = await worker.fetch(new Request("https://release.bar/api/owner"), env, {
+    waitUntil: () => undefined,
+  });
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as DashboardPayload;
+  assert.equal(body.projects.find((project) => project.name === "repo")?.openIssues, 9);
+  assert.equal(body.projects.find((project) => project.name === "sibling")?.openIssues, 2);
+  assert.equal(body.cache?.countsUpdatedAt, initialAt);
+});
+
+test("stale archive observations do not override newer count observations", async () => {
+  const metadataAt = "2026-06-11T01:00:00Z";
+  const archiveAt = "2026-06-11T02:00:00Z";
+  const countsAt = "2026-06-11T03:00:00Z";
+  const project = testProject({ owner: "owner", name: "repo", archived: false });
+  const cache = kvStore({
+    "owner-metadata:v1:owner": JSON.stringify({
+      owner: "owner",
+      generatedAt: countsAt,
+      metadataUpdatedAt: metadataAt,
+      countsUpdatedAt: countsAt,
+      releaseDataComplete: true,
+      knownRepos: ["owner/repo"],
+      removedRepos: {},
+      projectMetadataUpdatedAt: { "owner/repo": metadataAt },
+      projectCountsUpdatedAt: { "owner/repo": countsAt },
+      projects: [project],
+    }),
+  });
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  const stub = locks.get(locks.idFromName("owner-metadata:owner"));
+  const response = await stub.fetch(
+    new Request("https://releasebar.internal/owner-metadata/mutate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        owner: "owner",
+        mutation: {
+          kind: "visibility",
+          fullName: "owner/repo",
+          archived: true,
+          observedAt: archiveAt,
+          repositoryUpdatedAt: archiveAt,
+        },
+      }),
+    }),
+  );
+  assert.equal(response.ok, true);
+  const snapshot = (await response.json()) as { projects?: Project[] };
+  assert.equal(snapshot.projects?.[0]?.archived, false);
+});
+
+test("partial owner count scans cannot make an incomplete repository set authoritative", async () => {
+  const initialAt = "2026-06-11T01:00:00Z";
+  const partialAt = "2026-06-11T02:00:00Z";
+  const repo = testProject({ owner: "owner", name: "repo" });
+  const newlyDiscovered = testProject({ owner: "owner", name: "new" });
+  const cache = kvStore({
+    "owner-metadata:v1:owner": JSON.stringify({
+      owner: "owner",
+      generatedAt: initialAt,
+      metadataUpdatedAt: initialAt,
+      countsUpdatedAt: initialAt,
+      releaseDataComplete: true,
+      knownRepos: ["owner/repo"],
+      removedRepos: {},
+      projectMetadataUpdatedAt: {
+        "owner/repo": initialAt,
+        "owner/new": initialAt,
+      },
+      projectCountsUpdatedAt: {
+        "owner/repo": initialAt,
+        "owner/new": initialAt,
+      },
+      projects: [repo, newlyDiscovered],
+    }),
+  });
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  const stub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName("owner-metadata:owner"));
+  const response = await stub.fetch(
+    new Request("https://releasebar.internal/owner-metadata/mutate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        owner: "owner",
+        mutation: {
+          kind: "counts",
+          updatedAt: partialAt,
+          complete: false,
+          counts: [repo, newlyDiscovered].map((project) => ({
+            fullName: project.fullName,
+            openIssues: 1,
+            openPullRequests: 0,
+            archived: false,
+            fork: false,
+            private: false,
+            pushedAt: partialAt,
+            updatedAt: partialAt,
+          })),
+        },
+      }),
+    }),
+  );
+  assert.equal(response.ok, true);
+  const snapshot = (await response.json()) as {
+    countsUpdatedAt?: string;
+    countsAttemptedAt?: string;
+    knownRepos?: string[];
+  };
+  assert.equal(snapshot.countsUpdatedAt, initialAt);
+  assert.equal(snapshot.countsAttemptedAt, partialAt);
+  assert.deepEqual(snapshot.knownRepos, ["owner/repo"]);
+});
+
+test("combined dashboards do not merge counts using another owner's oldest timestamp", async () => {
+  const generatedAt = new Date().toISOString();
+  const oldestOwnerCountAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  const intermediateCountAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const key = dashboardCacheKey({
+    owner: "owner",
+    owners: ["other"],
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const ownerProject = testProject({ owner: "owner", name: "repo", openIssues: 10 });
+  const otherProject = testProject({ owner: "other", name: "repo", openIssues: 2 });
+  const cache = kvStore({
+    "owner:v1:owner": JSON.stringify({ type: "user", login: "owner" }),
+    "owner:v1:other": JSON.stringify({ type: "user", login: "other" }),
+    [key]: JSON.stringify({
+      ...testDashboard("owner", [ownerProject, otherProject]),
+      generatedAt,
+      owners: [
+        { type: "user", login: "owner" },
+        { type: "user", login: "other" },
+      ],
+      cache: {
+        state: "fresh",
+        stale: false,
+        capped: false,
+        repoLimit: 200,
+        generatedAt,
+        countsUpdatedAt: oldestOwnerCountAt,
+      },
+    } satisfies DashboardPayload),
+    "owner-metadata:v1:owner": JSON.stringify({
+      owner: "owner",
+      generatedAt: intermediateCountAt,
+      metadataUpdatedAt: intermediateCountAt,
+      countsUpdatedAt: intermediateCountAt,
+      releaseDataComplete: true,
+      knownRepos: ["owner/repo"],
+      removedRepos: {},
+      projectMetadataUpdatedAt: { "owner/repo": intermediateCountAt },
+      projects: [{ ...ownerProject, openIssues: 3 }],
+    }),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/owner?owners=other"),
+    { DASHBOARD_CACHE: cache },
+    { waitUntil: () => undefined },
+  );
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as DashboardPayload;
+  assert.equal(body.projects.find((project) => project.fullName === "owner/repo")?.openIssues, 10);
+  assert.equal(body.cache?.countsUpdatedAt, oldestOwnerCountAt);
+});
+
+test("older owner snapshots do not overwrite newer dashboard fields", async () => {
+  const now = new Date().toISOString();
+  const olderAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const project = testProject({ owner: "owner", name: "repo", openIssues: 1 });
+  const cache = kvStore({
+    [key]: JSON.stringify({
+      ...testDashboard("owner", [project]),
+      generatedAt: now,
+      cache: {
+        state: "fresh",
+        stale: false,
+        capped: false,
+        repoLimit: 200,
+        generatedAt: now,
+        countsUpdatedAt: now,
+      },
+    } satisfies DashboardPayload),
+    "owner-metadata:v1:owner": JSON.stringify({
+      owner: "owner",
+      generatedAt: olderAt,
+      metadataUpdatedAt: olderAt,
+      countsUpdatedAt: olderAt,
+      releaseDataComplete: true,
+      knownRepos: [],
+      projects: [
+        {
+          ...project,
+          description: "older metadata",
+          archived: true,
+          openIssues: 9,
+        },
+      ],
+    }),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/owner"),
+    { DASHBOARD_CACHE: cache },
+    { waitUntil: () => undefined },
+  );
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as DashboardPayload;
+  assert.equal(body.projects.length, 1);
+  assert.equal(body.projects[0]?.description, project.description);
+  assert.equal(body.projects[0]?.archived, false);
+  assert.equal(body.projects[0]?.openIssues, 1);
+});
+
+test("targeted owner metadata updates do not refresh sibling repositories", async () => {
+  const dashboardAt = new Date().toISOString();
+  const olderAt = new Date(Date.parse(dashboardAt) - 60 * 60 * 1000).toISOString();
+  const eventAt = new Date(Date.parse(dashboardAt) + 1_000).toISOString();
+  const repo = testProject({ owner: "owner", name: "repo" });
+  const sibling = testProject({ owner: "owner", name: "sibling", description: "fresh sibling" });
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const cache = kvStore({
+    [key]: JSON.stringify({
+      ...testDashboard("owner", [repo, sibling]),
+      generatedAt: dashboardAt,
+      cache: {
+        state: "fresh",
+        stale: false,
+        capped: false,
+        repoLimit: 200,
+        generatedAt: dashboardAt,
+      },
+    } satisfies DashboardPayload),
+    "owner-metadata:v1:owner": JSON.stringify({
+      owner: "owner",
+      generatedAt: eventAt,
+      metadataUpdatedAt: eventAt,
+      countsUpdatedAt: olderAt,
+      releaseDataComplete: true,
+      projectMetadataUpdatedAt: {
+        "owner/repo": eventAt,
+        "owner/sibling": olderAt,
+      },
+      projects: [
+        { ...repo, archived: true },
+        { ...sibling, description: "stale sibling" },
+      ],
+    }),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/owner"),
+    { DASHBOARD_CACHE: cache },
+    { waitUntil: () => undefined },
+  );
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as DashboardPayload;
+  assert.equal(
+    body.projects.some((project) => project.fullName === "owner/repo"),
+    false,
+  );
+  assert.equal(
+    body.projects.find((project) => project.fullName === "owner/sibling")?.description,
+    "fresh sibling",
+  );
+});
+
+test("owner removal tombstones survive older refresh observations", async () => {
+  const removedAt = "2026-06-11T03:00:00Z";
+  const olderAt = "2026-06-11T02:00:00Z";
+  const newerAt = "2026-06-11T04:00:00Z";
+  const cache = kvStore();
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  const stub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName("owner-metadata:owner"));
+  const mutate = async (mutation: Record<string, unknown>) => {
+    const response = await stub.fetch(
+      new Request("https://releasebar.internal/owner-metadata/mutate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ owner: "owner", mutation }),
+      }),
+    );
+    assert.equal(response.ok || response.status === 204, true);
+  };
+
+  await mutate({ kind: "remove", fullName: "owner/repo", observedAt: removedAt });
+  await mutate({
+    kind: "counts",
+    updatedAt: olderAt,
+    complete: true,
+    counts: [
+      {
+        fullName: "owner/repo",
+        openIssues: 1,
+        openPullRequests: 0,
+        archived: false,
+        fork: false,
+        private: false,
+        pushedAt: newerAt,
+        updatedAt: newerAt,
+      },
+    ],
+  });
+  await mutate({ kind: "restore", fullName: "owner/repo", observedAt: olderAt });
+  let snapshot = JSON.parse((await cache.get("owner-metadata:v1:owner")) ?? "{}") as {
+    removedRepos?: Record<string, string>;
+  };
+  assert.equal(snapshot.removedRepos?.["owner/repo"], removedAt);
+
+  await mutate({ kind: "restore", fullName: "owner/repo", observedAt: newerAt });
+  snapshot = JSON.parse((await cache.get("owner-metadata:v1:owner")) ?? "{}") as {
+    removedRepos?: Record<string, string>;
+  };
+  assert.equal(snapshot.removedRepos?.["owner/repo"], undefined);
+});
+
+test("owner mutations reconcile newer KV fallback state before updating durable storage", async () => {
+  const initialAt = "2026-06-11T01:00:00Z";
+  const removedAt = "2026-06-11T02:00:00Z";
+  const followUpAt = "2026-06-11T03:00:00Z";
+  const project = testProject({ owner: "owner", name: "repo" });
+  const cache = kvStore();
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  const stub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName("owner-metadata:owner"));
+  const mutate = async (mutation: Record<string, unknown>) => {
+    const response = await stub.fetch(
+      new Request("https://releasebar.internal/owner-metadata/mutate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ owner: "owner", mutation }),
+      }),
+    );
+    assert.equal(response.ok || response.status === 204, true);
+    return response;
+  };
+
+  await mutate({
+    kind: "merge",
+    generatedAt: initialAt,
+    observedAt: initialAt,
+    countsUpdatedAt: initialAt,
+    countsComplete: true,
+    releaseDataComplete: true,
+    mode: "hydrated",
+    projects: [project],
+    removedRepos: [],
+  });
+  const fallbackSnapshot = JSON.parse(
+    (await cache.get("owner-metadata:v1:owner")) ?? "{}",
+  ) as Record<string, unknown>;
+  await cache.put(
+    "owner-metadata:v1:owner",
+    JSON.stringify({
+      ...fallbackSnapshot,
+      generatedAt: removedAt,
+      metadataUpdatedAt: removedAt,
+      knownRepos: [],
+      removedRepos: { "owner/repo": removedAt },
+      projectMetadataUpdatedAt: { "owner/repo": removedAt },
+      projects: [],
+    }),
+  );
+
+  const response = await mutate({
+    kind: "counts",
+    updatedAt: followUpAt,
+    complete: false,
+    counts: [],
+  });
+  const snapshot = (await response.json()) as {
+    removedRepos?: Record<string, string>;
+    projects?: Project[];
+  };
+  assert.equal(snapshot.removedRepos?.["owner/repo"], removedAt);
+  assert.equal(
+    snapshot.projects?.some((candidate) => candidate.fullName === project.fullName),
+    false,
+  );
+});
+
+test("older owner count refreshes cannot replace newer snapshots", async () => {
+  const metadataAt = "2026-06-11T02:00:00Z";
+  const olderAt = "2026-06-11T03:00:00Z";
+  const newerAt = "2026-06-11T04:00:00Z";
+  const repo = testProject({ owner: "owner", name: "repo", openIssues: 1 });
+  const sibling = testProject({ owner: "owner", name: "sibling", openIssues: 2 });
+  const cache = kvStore();
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  const stub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName("owner-metadata:owner"));
+  const mutate = async (mutation: Record<string, unknown>) => {
+    const response = await stub.fetch(
+      new Request("https://releasebar.internal/owner-metadata/mutate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ owner: "owner", mutation }),
+      }),
+    );
+    assert.equal(response.ok || response.status === 204, true);
+  };
+
+  await mutate({
+    kind: "merge",
+    generatedAt: metadataAt,
+    observedAt: metadataAt,
+    countsUpdatedAt: metadataAt,
+    countsComplete: true,
+    releaseDataComplete: true,
+    mode: "hydrated",
+    projects: [repo, sibling],
+    removedRepos: [],
+  });
+  await mutate({
+    kind: "counts",
+    updatedAt: newerAt,
+    complete: true,
+    counts: [
+      {
+        fullName: repo.fullName,
+        openIssues: 7,
+        openPullRequests: 3,
+        archived: false,
+        fork: false,
+        private: false,
+        pushedAt: newerAt,
+        updatedAt: newerAt,
+      },
+      {
+        fullName: sibling.fullName,
+        openIssues: 9,
+        openPullRequests: 4,
+        archived: false,
+        fork: false,
+        private: false,
+        pushedAt: newerAt,
+        updatedAt: newerAt,
+      },
+    ],
+  });
+  await mutate({
+    kind: "counts",
+    updatedAt: olderAt,
+    complete: true,
+    counts: [
+      {
+        fullName: repo.fullName,
+        openIssues: 5,
+        openPullRequests: 2,
+        archived: false,
+        fork: false,
+        private: false,
+        pushedAt: olderAt,
+        updatedAt: olderAt,
+      },
+    ],
+  });
+
+  const snapshot = JSON.parse((await cache.get("owner-metadata:v1:owner")) ?? "{}") as {
+    countsUpdatedAt?: string;
+    knownRepos?: string[];
+    projects?: Project[];
+  };
+  assert.equal(snapshot.countsUpdatedAt, newerAt);
+  assert.deepEqual(snapshot.knownRepos?.sort(), ["owner/repo", "owner/sibling"]);
+  assert.equal(
+    snapshot.projects?.find((project) => project.fullName === repo.fullName)?.openIssues,
+    7,
+  );
+  assert.equal(
+    snapshot.projects?.find((project) => project.fullName === sibling.fullName)?.openIssues,
+    9,
+  );
+});
+
+test("older complete count scans preserve newer repository metadata", async () => {
+  const countsAt = "2026-06-11T03:00:00Z";
+  const metadataAt = "2026-06-11T04:00:00Z";
+  const project = testProject({ owner: "owner", name: "repo", updatedAt: metadataAt });
+  const cache = kvStore();
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  const stub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName("owner-metadata:owner"));
+  const mutate = async (mutation: Record<string, unknown>) => {
+    const response = await stub.fetch(
+      new Request("https://releasebar.internal/owner-metadata/mutate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ owner: "owner", mutation }),
+      }),
+    );
+    assert.equal(response.ok || response.status === 204, true);
+  };
+
+  await mutate({
+    kind: "merge",
+    generatedAt: metadataAt,
+    observedAt: metadataAt,
+    countsUpdatedAt: "2026-06-11T02:00:00Z",
+    countsComplete: false,
+    releaseDataComplete: false,
+    mode: "metadata",
+    projects: [project],
+    removedRepos: [],
+  });
+  await mutate({
+    kind: "counts",
+    updatedAt: countsAt,
+    complete: true,
+    counts: [],
+  });
+
+  const snapshot = JSON.parse((await cache.get("owner-metadata:v1:owner")) ?? "{}") as {
+    knownRepos?: string[];
+    removedRepos?: Record<string, string>;
+    projects?: Project[];
+  };
+  assert.deepEqual(snapshot.knownRepos, ["owner/repo"]);
+  assert.equal(snapshot.removedRepos?.["owner/repo"], undefined);
+  assert.equal(snapshot.projects?.[0]?.fullName, "owner/repo");
+});
+
+test("newer metadata merges preserve counts without restoring stale repository state", async () => {
+  const countsAt = "2026-06-11T03:00:00Z";
+  const metadataAt = "2026-06-11T04:00:00Z";
+  const project = testProject({
+    owner: "owner",
+    name: "repo",
+    archived: false,
+    openIssues: 7,
+    openPullRequests: 3,
+    pushedAt: countsAt,
+    updatedAt: countsAt,
+  });
+  const cache = kvStore();
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  const stub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName("owner-metadata:owner"));
+  const mutate = async (mutation: Record<string, unknown>) => {
+    const response = await stub.fetch(
+      new Request("https://releasebar.internal/owner-metadata/mutate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ owner: "owner", mutation }),
+      }),
+    );
+    assert.equal(response.ok || response.status === 204, true);
+  };
+
+  await mutate({
+    kind: "merge",
+    generatedAt: countsAt,
+    observedAt: countsAt,
+    countsUpdatedAt: countsAt,
+    countsComplete: true,
+    releaseDataComplete: true,
+    mode: "hydrated",
+    projects: [project],
+    removedRepos: [],
+  });
+  await mutate({
+    kind: "merge",
+    generatedAt: metadataAt,
+    observedAt: metadataAt,
+    countsUpdatedAt: null,
+    countsComplete: false,
+    releaseDataComplete: false,
+    mode: "metadata",
+    projects: [
+      {
+        ...project,
+        archived: true,
+        openIssues: null,
+        openPullRequests: null,
+        pushedAt: metadataAt,
+        updatedAt: metadataAt,
+      },
+    ],
+    removedRepos: [],
+  });
+
+  const snapshot = JSON.parse((await cache.get("owner-metadata:v1:owner")) ?? "{}") as {
+    projects?: Project[];
+  };
+  assert.equal(snapshot.projects?.[0]?.archived, true);
+  assert.equal(snapshot.projects?.[0]?.pushedAt, metadataAt);
+  assert.equal(snapshot.projects?.[0]?.updatedAt, metadataAt);
+  assert.equal(snapshot.projects?.[0]?.openIssues, 7);
+  assert.equal(snapshot.projects?.[0]?.openPullRequests, 3);
+
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  await cache.put(
+    key,
+    JSON.stringify({
+      ...testDashboard("owner", [{ ...project, openIssues: 1, openPullRequests: 1 }]),
+      generatedAt: countsAt,
+      cache: {
+        state: "fresh",
+        stale: false,
+        capped: false,
+        repoLimit: 200,
+        generatedAt: countsAt,
+        countsUpdatedAt: "2026-06-11T02:00:00Z",
+        projectCountsUpdatedAt: { "owner/repo": "2026-06-11T02:00:00Z" },
+        releasesUpdatedAt: countsAt,
+        ciUpdatedAt: countsAt,
+      },
+    } satisfies DashboardPayload),
+  );
+  const dashboard = await worker.fetch(new Request("https://release.bar/api/owner"), env, {
+    waitUntil: () => undefined,
+  });
+  assert.equal(dashboard.status, 200);
+  assert.equal(((await dashboard.json()) as DashboardPayload).projects.length, 0);
+});
+
+test("older dashboard builds cannot restore repositories removed by newer counts", async () => {
+  const buildStartedAt = "2026-06-11T02:00:00Z";
+  const countsUpdatedAt = "2026-06-11T03:00:00Z";
+  const project = testProject({ owner: "owner", name: "repo" });
+  const cache = kvStore();
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  const stub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName("owner-metadata:owner"));
+  const mutate = async (mutation: Record<string, unknown>) => {
+    const response = await stub.fetch(
+      new Request("https://releasebar.internal/owner-metadata/mutate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ owner: "owner", mutation }),
+      }),
+    );
+    assert.equal(response.ok || response.status === 204, true);
+  };
+
+  await mutate({
+    kind: "merge",
+    generatedAt: buildStartedAt,
+    observedAt: buildStartedAt,
+    countsUpdatedAt: buildStartedAt,
+    countsComplete: true,
+    releaseDataComplete: true,
+    mode: "hydrated",
+    projects: [project],
+    removedRepos: [],
+  });
+  await mutate({
+    kind: "counts",
+    updatedAt: countsUpdatedAt,
+    complete: true,
+    counts: [],
+  });
+  await mutate({
+    kind: "merge",
+    generatedAt: countsUpdatedAt,
+    observedAt: buildStartedAt,
+    countsUpdatedAt: buildStartedAt,
+    countsComplete: true,
+    releaseDataComplete: true,
+    mode: "hydrated",
+    projects: [project],
+    removedRepos: [],
+  });
+
+  const snapshot = JSON.parse((await cache.get("owner-metadata:v1:owner")) ?? "{}") as {
+    knownRepos?: string[];
+    projects?: Project[];
+  };
+  assert.deepEqual(snapshot.knownRepos, []);
+  assert.equal(snapshot.projects?.length, 0);
+});
+
+test("complete metadata scans tombstone absent repositories across cached variants", async () => {
+  const initialAt = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+  const staleBuildAt = new Date(Date.now() - 60 * 1000).toISOString();
+  const removedAt = new Date().toISOString();
+  const repo = testProject({ owner: "owner", name: "repo" });
+  const sibling = testProject({ owner: "owner", name: "sibling" });
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const cache = kvStore({
+    [key]: JSON.stringify({
+      ...testDashboard("owner", [repo, sibling]),
+      generatedAt: initialAt,
+      cache: {
+        state: "fresh",
+        stale: false,
+        capped: false,
+        repoLimit: 200,
+        generatedAt: initialAt,
+        countsUpdatedAt: initialAt,
+      },
+    } satisfies DashboardPayload),
+    "owner-metadata:v1:owner": JSON.stringify({
+      owner: "owner",
+      generatedAt: initialAt,
+      metadataUpdatedAt: initialAt,
+      countsUpdatedAt: initialAt,
+      releaseDataComplete: true,
+      knownRepos: ["owner/repo", "owner/sibling"],
+      removedRepos: {},
+      projectMetadataUpdatedAt: {
+        "owner/repo": initialAt,
+        "owner/sibling": initialAt,
+      },
+      projects: [repo, sibling],
+    }),
+  });
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  const stub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName("owner-metadata:owner"));
+  const mutate = async (mutation: Record<string, unknown>) => {
+    const response = await stub.fetch(
+      new Request("https://releasebar.internal/owner-metadata/mutate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ owner: "owner", mutation }),
+      }),
+    );
+    assert.equal(response.ok || response.status === 204, true);
+  };
+
+  await mutate({
+    kind: "merge",
+    generatedAt: removedAt,
+    observedAt: removedAt,
+    countsUpdatedAt: removedAt,
+    countsComplete: true,
+    releaseDataComplete: true,
+    mode: "hydrated",
+    projects: [sibling],
+    removedRepos: ["owner/repo"],
+  });
+  await mutate({
+    kind: "merge",
+    generatedAt: removedAt,
+    observedAt: staleBuildAt,
+    countsUpdatedAt: staleBuildAt,
+    countsComplete: true,
+    releaseDataComplete: true,
+    mode: "hydrated",
+    projects: [repo, sibling],
+    removedRepos: [],
+  });
+
+  const snapshot = JSON.parse((await cache.get("owner-metadata:v1:owner")) ?? "{}") as {
+    knownRepos?: string[];
+    removedRepos?: Record<string, string>;
+    projects?: Project[];
+  };
+  assert.deepEqual(snapshot.knownRepos, ["owner/sibling"]);
+  assert.equal(snapshot.removedRepos?.["owner/repo"], removedAt);
+  assert.equal(
+    snapshot.projects?.some((project) => project.fullName === "owner/repo"),
+    false,
+  );
+
+  const response = await worker.fetch(new Request("https://release.bar/api/owner"), env, {
+    waitUntil: () => undefined,
+  });
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as DashboardPayload;
+  assert.deepEqual(
+    body.projects.map((project) => project.fullName),
+    ["owner/sibling"],
+  );
+});
+
+test("stale repository removals cannot hide newer public metadata", async () => {
+  const removedAt = "2026-06-11T03:00:00Z";
+  const publicAt = "2026-06-11T04:00:00Z";
+  const project = testProject({
+    owner: "owner",
+    name: "repo",
+    updatedAt: publicAt,
+  });
+  const cache = kvStore();
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  const stub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName("owner-metadata:owner"));
+  const mutate = async (mutation: Record<string, unknown>) => {
+    const response = await stub.fetch(
+      new Request("https://releasebar.internal/owner-metadata/mutate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ owner: "owner", mutation }),
+      }),
+    );
+    assert.equal(response.ok || response.status === 204, true);
+  };
+
+  await mutate({
+    kind: "merge",
+    generatedAt: publicAt,
+    observedAt: publicAt,
+    countsUpdatedAt: publicAt,
+    countsComplete: true,
+    releaseDataComplete: true,
+    mode: "hydrated",
+    projects: [project],
+    removedRepos: [],
+  });
+  await mutate({ kind: "remove", fullName: project.fullName.toLowerCase(), observedAt: removedAt });
+
+  const snapshot = JSON.parse((await cache.get("owner-metadata:v1:owner")) ?? "{}") as {
+    removedRepos?: Record<string, string>;
+    projects?: Project[];
+  };
+  assert.equal(snapshot.removedRepos?.[project.fullName.toLowerCase()], undefined);
+  assert.equal(
+    snapshot.projects?.some((candidate) => candidate.fullName === project.fullName),
+    true,
+  );
+});
+
+test("newer owner metadata merges cannot clear privacy tombstones", async () => {
+  const removedAt = "2026-06-11T03:00:00Z";
+  const observedAt = "2026-06-11T04:00:00Z";
+  const project = testProject({ owner: "owner", name: "repo" });
+  const cache = kvStore();
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  const stub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName("owner-metadata:owner"));
+  const mutate = async (mutation: Record<string, unknown>) => {
+    const response = await stub.fetch(
+      new Request("https://releasebar.internal/owner-metadata/mutate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ owner: "owner", mutation }),
+      }),
+    );
+    assert.equal(response.ok || response.status === 204, true);
+  };
+
+  await mutate({ kind: "remove", fullName: "owner/repo", observedAt: removedAt });
+  await mutate({
+    kind: "merge",
+    generatedAt: observedAt,
+    observedAt,
+    countsUpdatedAt: observedAt,
+    countsComplete: true,
+    releaseDataComplete: true,
+    mode: "hydrated",
+    projects: [project],
+    removedRepos: [],
+  });
+
+  const snapshot = JSON.parse((await cache.get("owner-metadata:v1:owner")) ?? "{}") as {
+    removedRepos?: Record<string, string>;
+    projects?: Project[];
+  };
+  assert.equal(snapshot.removedRepos?.["owner/repo"], removedAt);
+  assert.equal(
+    snapshot.projects?.some((candidate) => candidate.fullName === "owner/repo"),
+    false,
+  );
+});
+
+test("worker persists archived observations without showing archived repositories", async () => {
+  const owner = "archived-observation";
+  const generatedAt = "2026-06-11T01:00:00Z";
+  const key = dashboardCacheKey({
+    owner,
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const project = testProject({
+    owner,
+    name: "repo",
+    archived: false,
+    updatedAt: generatedAt,
+  });
+  const cache = kvStore({
+    [`owner:v1:${owner}`]: JSON.stringify({ type: "user", login: owner }),
+    [`progress:v1:${key}`]: JSON.stringify({
+      scannedRepos: [],
+      projects: [project],
+      updatedAt: generatedAt,
+      durableFallback: true,
+    }),
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner,
+    owners: [owner],
+    repos: [],
+    includeReleaseData: true,
+    path: `/${owner}`,
+    priority: 100,
+    lastSeenAt: generatedAt,
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: generatedAt,
+    failureCount: 0,
+  };
+  const job: RefreshJob = {
+    id: "job-archived-observation",
+    targetKey: key,
+    target,
+    kind: "dashboard",
+    status: "queued",
+    reason: "partial-cache",
+    createdAt: generatedAt,
+    updatedAt: generatedAt,
+    startedAt: null,
+    finishedAt: null,
+    attempts: 0,
+    durationMs: null,
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const path = new URL(String(input)).pathname;
+    if (path === `/users/${owner}/repos`) {
+      return Response.json([
+        {
+          owner: { login: owner },
+          name: "repo",
+          full_name: `${owner}/repo`,
+          description: "archived repository",
+          html_url: `https://github.com/${owner}/repo`,
+          default_branch: "main",
+          language: "TypeScript",
+          topics: [],
+          stargazers_count: 1,
+          forks_count: 0,
+          open_issues_count: 0,
+          archived: true,
+          pushed_at: "2026-06-11T02:00:00Z",
+          updated_at: "2026-06-11T02:00:00Z",
+          fork: false,
+          private: false,
+        },
+      ]);
+    }
+    throw new Error(`unexpected fetch ${path}`);
+  };
+  try {
+    let acknowledged = false;
+    await worker.queue(
+      {
+        messages: [
+          {
+            body: job,
+            attempts: 1,
+            ack() {
+              acknowledged = true;
+            },
+            retry() {
+              throw new Error("archived observation refresh should not retry");
+            },
+          },
+        ],
+      },
+      { DASHBOARD_CACHE: cache },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(acknowledged, true);
+    const dashboard = JSON.parse((await cache.get(key)) ?? "{}") as DashboardPayload;
+    assert.equal(dashboard.projects.length, 0);
+    const snapshot = JSON.parse((await cache.get(`owner-metadata:v1:${owner}`)) ?? "{}") as {
+      projects?: Project[];
+      removedRepos?: Record<string, string>;
+    };
+    assert.equal(snapshot.projects?.[0]?.archived, true);
+    assert.equal(snapshot.removedRepos?.[`${owner}/repo`], undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker preserves field freshness when resuming an older progress checkpoint", async () => {
+  const originalFetch = globalThis.fetch;
+  const owner = "freshness-checkpoint";
+  const now = new Date();
+  const generatedAt = now.toISOString();
+  const generationStartedAt = new Date(now.getTime() - 10 * 60 * 1000).toISOString();
+  const removedAt = new Date(now.getTime() - 5 * 60 * 1000).toISOString();
+  const releasesUpdatedAt = new Date(now.getTime() - 2 * 60 * 1000).toISOString();
+  const ciUpdatedAt = new Date(now.getTime() - 60 * 1000).toISOString();
+  const key = dashboardCacheKey({
+    owner,
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const project = testProject({ owner, name: "repo" });
+  const cache = kvStore({
+    [`owner:v1:${owner}`]: JSON.stringify({ type: "user", login: owner }),
+    [`progress:v1:${key}`]: JSON.stringify({
+      scannedRepos: [project.fullName.toLowerCase()],
+      projects: [project],
+      generationStartedAt,
+      countsUpdatedAt: generatedAt,
+      releasesUpdatedAt,
+      ciUpdatedAt,
+      updatedAt: generatedAt,
+      durableFallback: true,
+    }),
+    [`owner-metadata:v1:${owner}`]: JSON.stringify({
+      owner,
+      generatedAt: removedAt,
+      metadataUpdatedAt: removedAt,
+      countsUpdatedAt: null,
+      releaseDataComplete: false,
+      knownRepos: [],
+      removedRepos: { [project.fullName.toLowerCase()]: removedAt },
+      projectMetadataUpdatedAt: {},
+      projectCountsUpdatedAt: {},
+      countOverlays: {},
+      projects: [],
+    }),
+  });
+  const waits: Promise<unknown>[] = [];
+  const sentJobs: RefreshJob[] = [];
+  globalThis.fetch = async (input) => {
+    const path = new URL(String(input)).pathname;
+    if (path === `/users/${owner}/repos`) {
+      return Response.json([
+        {
+          owner: { login: owner },
+          name: project.name,
+          full_name: project.fullName,
+          description: null,
+          html_url: project.url,
+          default_branch: project.defaultBranch,
+          language: null,
+          stargazers_count: 0,
+          forks_count: 0,
+          open_issues_count: 0,
+          archived: false,
+          pushed_at: project.pushedAt,
+          updated_at: project.updatedAt,
+          fork: false,
+          private: false,
+        },
+      ]);
+    }
+    throw new Error(`unexpected fetch ${path}`);
+  };
+  try {
+    const env = {
+      DASHBOARD_CACHE: cache,
+      REFRESH_QUEUE: {
+        async send(job: RefreshJob) {
+          sentJobs.push(job);
+        },
+      },
+    };
+    const response = await worker.fetch(new Request(`https://release.bar/api/${owner}`), env, {
+      waitUntil: (promise) => waits.push(promise),
+    });
+    assert.equal(response.status, 200);
+    const resumed = (await response.json()) as DashboardPayload;
+    assert.equal(resumed.cache?.countsUpdatedAt, generatedAt);
+    assert.equal(resumed.cache?.releasesUpdatedAt, releasesUpdatedAt);
+    assert.equal(resumed.cache?.ciUpdatedAt, ciUpdatedAt);
+    await Promise.all(waits);
+    assert.equal(sentJobs.length, 1);
+
+    let acknowledged = false;
+    await worker.queue(
+      {
+        messages: [
+          {
+            body: sentJobs[0]!,
+            attempts: 1,
+            ack: () => {
+              acknowledged = true;
+            },
+            retry: () => undefined,
+          },
+        ],
+      },
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(acknowledged, true);
+    const completed = JSON.parse((await cache.get(key)) ?? "{}") as DashboardPayload;
+    assert.equal(completed.projects.length, 0);
+    assert.equal(completed.cache?.releasesUpdatedAt, releasesUpdatedAt);
+    assert.equal(completed.cache?.ciUpdatedAt, ciUpdatedAt);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("signed repository-less GitHub App webhooks are acknowledged", async () => {
+  const secret = "webhook-secret";
+  const body = JSON.stringify({
+    action: "created",
+    installation: { id: 42 },
+    sender: { login: "owner" },
+  });
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/github/webhook", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-event": "installation",
+        "x-github-delivery": "delivery-installation",
+        "x-hub-signature-256": await webhookSignature(secret, body),
+      },
+      body,
+    }),
+    { GITHUB_WEBHOOK_SECRET: secret },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 202);
+  assert.deepEqual(await response.json(), { ok: true, ignored: true });
+});
+
+test("signed private repository webhooks are ignored before durable admission", async () => {
+  const secret = "webhook-secret";
+  const body = JSON.stringify({
+    ref: "refs/heads/main",
+    repository: {
+      full_name: "owner/private-repo",
+      private: true,
+      default_branch: "main",
+      updated_at: "2026-06-11T04:00:00Z",
+    },
+  });
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/github/webhook", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-event": "push",
+        "x-github-delivery": "delivery-private-push",
+        "x-hub-signature-256": await webhookSignature(secret, body),
+      },
+      body,
+    }),
+    { GITHUB_WEBHOOK_SECRET: secret },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 202);
+  assert.deepEqual(await response.json(), { ok: true, ignored: true });
+});
+
+test("signed GitHub webhooks serialize mutations and enqueue authoritative refreshes", async () => {
+  const secret = "webhook-secret";
+  const now = new Date().toISOString();
+  const key = dashboardCacheKey({
+    owner: "owner",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const combinedKey = dashboardCacheKey({
+    owner: "owner",
+    owners: ["other"],
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const combinedCountsUpdatedAt = "2026-01-01T00:00:00Z";
+  const project = testProject({
+    owner: "owner",
+    name: "repo",
+    openIssues: 2,
+    openPullRequests: 1,
+  });
+  const oldProject = testProject({
+    owner: "owner",
+    name: "old-repo",
+    openIssues: 8,
+    pushedAt: "2020-01-01T00:00:00Z",
+  });
+  const dashboard: DashboardPayload = {
+    ...testDashboard("owner", [project]),
+    generatedAt: now,
+    options: {
+      includeForks: false,
+      includeArchived: false,
+      includeUnreleased: true,
+      repoLimit: 200,
+    },
+    cache: {
+      state: "fresh",
+      stale: false,
+      capped: false,
+      repoLimit: 200,
+      generatedAt: now,
+    },
+  };
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner: "owner",
+    owners: ["owner"],
+    repos: [],
+    includeReleaseData: true,
+    path: "/owner",
+    priority: 100,
+    lastSeenAt: now,
+    lastAttemptAt: null,
+    lastSuccessAt: now,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const combinedTarget: RefreshTarget = {
+    ...target,
+    key: combinedKey,
+    owners: ["owner", "other"],
+    path: "/owner?owners=other",
+  };
+  const secondaryKey = dashboardCacheKey({
+    owner: "primary",
+    owners: ["owner"],
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const secondaryTarget: RefreshTarget = {
+    ...target,
+    key: secondaryKey,
+    owner: "primary",
+    owners: ["primary", "owner"],
+    path: "/primary?owners=owner",
+  };
+  const legacyTargets = Object.fromEntries(
+    Array.from({ length: 201 }, (_, index) => {
+      const owner = `legacy${String(index).padStart(3, "0")}`;
+      const legacyKey = dashboardCacheKey({
+        owner,
+        includeUnreleased: true,
+        includeReleaseData: true,
+        schemaVersion: 6,
+      });
+      return [
+        `refresh:target:v1:${legacyKey}`,
+        JSON.stringify({
+          ...target,
+          key: legacyKey,
+          owner,
+          owners: [owner],
+          path: `/${owner}`,
+        } satisfies RefreshTarget),
+      ];
+    }),
+  );
+  const cache = kvStore({
+    ...legacyTargets,
+    "owner:v1:owner": JSON.stringify({ type: "user", login: "owner" }),
+    [key]: JSON.stringify(dashboard),
+    [combinedKey]: JSON.stringify({
+      ...dashboard,
+      owners: [
+        { type: "user", login: "owner" },
+        { type: "user", login: "other" },
+      ],
+      cache: {
+        ...dashboard.cache!,
+        countsUpdatedAt: combinedCountsUpdatedAt,
+      },
+    } satisfies DashboardPayload),
+    [secondaryKey]: JSON.stringify({
+      ...dashboard,
+      owners: [
+        { type: "user", login: "primary" },
+        { type: "user", login: "owner" },
+      ],
+    } satisfies DashboardPayload),
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+    [`refresh:target:v1:${combinedKey}`]: JSON.stringify(combinedTarget),
+    [`refresh:target:v1:${secondaryKey}`]: JSON.stringify(secondaryTarget),
+    "owner-metadata:v1:owner": JSON.stringify({
+      owner: "owner",
+      generatedAt: now,
+      metadataUpdatedAt: now,
+      countsUpdatedAt: now,
+      releaseDataComplete: true,
+      projects: [oldProject],
+    }),
+    "owner-metadata:v1:other": JSON.stringify({
+      owner: "other",
+      generatedAt: now,
+      metadataUpdatedAt: now,
+      countsUpdatedAt: null,
+      releaseDataComplete: true,
+      projects: [testProject({ owner: "other", name: "repo" })],
+    }),
+  });
+  const queued: unknown[] = [];
+  const queuedWebhooks: Array<Record<string, unknown>> = [];
+  const queuedWebhookDelays: Array<number | undefined> = [];
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+    GITHUB_WEBHOOK_SECRET: secret,
+    GITHUB_TOKEN: "shared-token",
+    REFRESH_QUEUE: {
+      send: async (message, options) => {
+        queued.push(message);
+        if (
+          message &&
+          typeof message === "object" &&
+          (message as { kind?: unknown }).kind === "github-webhook"
+        ) {
+          queuedWebhooks.push(message as Record<string, unknown>);
+          queuedWebhookDelays.push(options?.delaySeconds);
+        }
+      },
+    },
+  };
+  const locks = durableLocks(env);
+  const durableObjectNames: string[] = [];
+  env.DASHBOARD_LOCKS = {
+    idFromName(name) {
+      durableObjectNames.push(name);
+      return locks.idFromName(name);
+    },
+    get: locks.get,
+  };
+  let exactIssues = 2;
+  let exactArchived = false;
+  let failCounts = false;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/graphql") {
+      if (failCounts) throw new Error("count refresh failed");
+      return Response.json({
+        data: {
+          repositoryOwner: {
+            repositories: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                {
+                  nameWithOwner: "owner/repo",
+                  issues: { totalCount: exactIssues },
+                  pullRequests: { totalCount: 1 },
+                  isArchived: exactArchived,
+                  isFork: false,
+                  isPrivate: false,
+                  pushedAt: repository.pushed_at,
+                  updatedAt: repository.updated_at,
+                },
+              ],
+            },
+          },
+        },
+      });
+    }
+    throw new Error(`unexpected fetch ${url.pathname}`);
+  };
+  const send = async (event: string, delivery: string, payload: unknown) => {
+    const body = JSON.stringify(payload);
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/github/webhook", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-github-event": event,
+          "x-github-delivery": delivery,
+          "x-hub-signature-256": await webhookSignature(secret, body),
+        },
+        body,
+      }),
+      env,
+      { waitUntil: () => undefined },
+    );
+    const index = queued.findIndex(
+      (message) =>
+        Boolean(message) &&
+        typeof message === "object" &&
+        (message as { kind?: unknown }).kind === "github-webhook",
+    );
+    if (index >= 0) {
+      const [message] = queued.splice(index, 1);
+      await worker.queue(
+        {
+          messages: [
+            {
+              body: message as never,
+              attempts: 1,
+              ack: () => undefined,
+              retry: () => undefined,
+            },
+          ],
+        },
+        env,
+        { waitUntil: () => undefined },
+      );
+      while (true) {
+        const fanoutIndex = queued.findIndex(
+          (queuedMessage) =>
+            Boolean(queuedMessage) &&
+            typeof queuedMessage === "object" &&
+            (queuedMessage as { kind?: unknown }).kind === "github-webhook-fanout",
+        );
+        if (fanoutIndex < 0) break;
+        const [fanout] = queued.splice(fanoutIndex, 1);
+        await worker.queue(
+          {
+            messages: [
+              {
+                body: fanout as never,
+                attempts: 1,
+                ack: () => undefined,
+                retry: () => undefined,
+              },
+            ],
+          },
+          env,
+          { waitUntil: () => undefined },
+        );
+      }
+      for (let queuedIndex = queued.length - 1; queuedIndex >= 0; queuedIndex -= 1) {
+        const queuedJob = queued[queuedIndex] as
+          | { id?: unknown; kind?: unknown; targetKey?: unknown }
+          | undefined;
+        if (
+          queuedJob?.kind !== "dashboard" ||
+          typeof queuedJob.id !== "string" ||
+          typeof queuedJob.targetKey !== "string"
+        ) {
+          continue;
+        }
+        queued.splice(queuedIndex, 1);
+        const targetStub = env.DASHBOARD_LOCKS!.get(
+          env.DASHBOARD_LOCKS!.idFromName(queuedJob.targetKey),
+        );
+        await targetStub.fetch(
+          new Request("https://releasebar.internal/job/release", {
+            method: "POST",
+            body: JSON.stringify({ jobId: queuedJob.id }),
+          }),
+        );
+      }
+    }
+    return response;
+  };
+
+  const repository = {
+    full_name: "owner/repo",
+    archived: false,
+    default_branch: "main",
+    pushed_at: "2026-06-11T00:00:00Z",
+    updated_at: new Date(Date.parse(now) + 1_000).toISOString(),
+  };
+  const readDashboard = async (url = "https://release.bar/api/owner") => {
+    const response = await worker.fetch(new Request(url), env, {
+      waitUntil: () => undefined,
+    });
+    assert.equal(response.status, 200);
+    return (await response.json()) as DashboardPayload;
+  };
+  try {
+    const oversized = await worker.fetch(
+      new Request("https://release.bar/api/github/webhook", {
+        method: "POST",
+        headers: {
+          "content-length": String(2 * 1024 * 1024 + 1),
+        },
+        body: "{}",
+      }),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(oversized.status, 413);
+
+    assert.equal(
+      (await send("ping", "delivery-ping", { zen: "Approachable is better" })).status,
+      200,
+    );
+
+    exactIssues = 3;
+    assert.equal(
+      (
+        await send("issues", "delivery-1", {
+          action: "opened",
+          repository,
+        })
+      ).status,
+      202,
+    );
+    const counted = await readDashboard();
+    assert.equal(counted.projects[0]?.openIssues, 3);
+    const combinedCounted = await readDashboard("https://release.bar/api/owner?owners=other");
+    assert.equal(combinedCounted.projects[0]?.openIssues, 3);
+    assert.equal(combinedCounted.cache?.countsUpdatedAt, combinedCountsUpdatedAt);
+    const countedSnapshot = JSON.parse((await cache.get("owner-metadata:v1:owner")) ?? "{}") as {
+      countsUpdatedAt?: string;
+      projects?: Project[];
+    };
+    assert.ok(Date.parse(countedSnapshot.countsUpdatedAt ?? "") >= Date.parse(now));
+    assert.equal(
+      countedSnapshot.projects?.find((candidate) => candidate.name === "repo")?.openIssues,
+      3,
+    );
+    assert.equal(
+      countedSnapshot.projects?.find((candidate) => candidate.name === "old-repo")?.openIssues,
+      undefined,
+    );
+
+    exactIssues = 4;
+    await send("issues", "delivery-transferred", {
+      action: "transferred",
+      repository,
+    });
+    assert.equal((await readDashboard()).projects[0]?.openIssues, 4);
+
+    await send("issues", "delivery-1", { action: "opened", repository });
+    const deduplicated = await readDashboard();
+    assert.equal(deduplicated.projects[0]?.openIssues, 4);
+
+    exactIssues = 5;
+    await Promise.all([
+      send("issues", "delivery-2", { action: "opened", repository }),
+      send("issues", "delivery-3", { action: "opened", repository }),
+    ]);
+    const serialized = await readDashboard();
+    assert.equal(serialized.projects[0]?.openIssues, 5);
+
+    failCounts = true;
+    await send("issues", "delivery-redelivery", { action: "opened", repository });
+    assert.equal(queuedWebhookDelays.at(-1), 5 * 60);
+    assert.equal(
+      (
+        queued.find(
+          (message) =>
+            Boolean(message) &&
+            typeof message === "object" &&
+            (message as { delivery?: unknown }).delivery === "delivery-redelivery",
+        ) as { attempts?: number } | undefined
+      )?.attempts,
+      1,
+    );
+    failCounts = false;
+    exactIssues = 6;
+    await send("issues", "delivery-redelivery", { action: "opened", repository });
+    const redelivered = await readDashboard();
+    assert.equal(redelivered.projects[0]?.openIssues, 6);
+
+    failCounts = true;
+    await send("repository", "delivery-archive-fallback", {
+      action: "archived",
+      repository: { ...repository, archived: true },
+    });
+    failCounts = false;
+    assert.equal((await readDashboard()).projects.length, 0);
+
+    exactArchived = false;
+    await send("repository", "delivery-archive-fallback-restore", {
+      action: "unarchived",
+      repository,
+    });
+
+    exactArchived = true;
+    await send("repository", "delivery-4", {
+      action: "archived",
+      repository: { ...repository, archived: true },
+    });
+    assert.equal((await readDashboard()).projects.length, 0);
+
+    exactArchived = false;
+    await send("repository", "delivery-5", {
+      action: "unarchived",
+      repository,
+    });
+    assert.equal((await readDashboard()).projects[0]?.archived, false);
+
+    await send("push", "delivery-6", {
+      ref: "refs/heads/feature",
+      after: "11111112222222",
+      head_commit: { timestamp: "2026-06-11T02:00:00Z" },
+      commits: Array.from({ length: 2_048 }, (_, index) => ({
+        id: String(index).padStart(40, "0"),
+        message: "large push payload",
+      })),
+      repository,
+    });
+    const featurePush = JSON.parse((await cache.get(key)) ?? "{}") as DashboardPayload;
+    assert.equal(featurePush.projects[0]?.latestCommitSha, "abcdef1");
+
+    await send("push", "delivery-7", {
+      ref: "refs/heads/main",
+      after: "22222223333333",
+      head_commit: { timestamp: "2026-06-11T03:00:00Z" },
+      repository,
+    });
+    assert.equal(await cache.get(key), null);
+    assert.equal(await cache.get(secondaryKey), null);
+    const activeLocks = env.DASHBOARD_LOCKS;
+    env.DASHBOARD_LOCKS = {
+      idFromName: (name) => name,
+      get: () => ({
+        fetch: async () => new Response(null, { status: 409 }),
+      }),
+    };
+    const pushFallback = await readDashboard();
+    env.DASHBOARD_LOCKS = activeLocks;
+    assert.equal(pushFallback.projects[0]?.version, "repo search");
+    assert.equal(pushFallback.projects[0]?.releaseDate, null);
+    assert.equal(pushFallback.projects[0]?.latestCommitSha, null);
+    assert.equal(pushFallback.projects[0]?.ciState, "unknown");
+
+    await cache.put(key, JSON.stringify(dashboard));
+    await send("release", "delivery-8", {
+      action: "edited",
+      release: {
+        tag_name: "v0.9.0",
+        name: "old release",
+        html_url: "https://github.com/owner/repo/releases/tag/v0.9.0",
+        published_at: "2026-04-01T00:00:00Z",
+        draft: false,
+      },
+      repository,
+    });
+    assert.equal(await cache.get(key), null);
+
+    await cache.put(key, JSON.stringify(dashboard));
+    await send("release", "delivery-9", {
+      action: "edited",
+      release: {
+        tag_name: "v1.0.0",
+        name: "current release",
+        html_url: "https://github.com/owner/repo/releases/tag/v1.0.0",
+        published_at: "2026-05-01T00:00:00Z",
+        draft: false,
+      },
+      repository,
+    });
+    assert.equal(await cache.get(key), null);
+
+    const releaseFragmentKey = "repo:v2:owner/repo:unreleased:release";
+    await cache.put(key, JSON.stringify(dashboard));
+    await cache.put(releaseFragmentKey, "cached");
+    await send("release", "delivery-created", {
+      action: "created",
+      release: {
+        tag_name: "v1.1.0",
+        name: "new release",
+        html_url: "https://github.com/owner/repo/releases/tag/v1.1.0",
+        published_at: "2026-06-11T04:00:00Z",
+        draft: false,
+      },
+      repository,
+    });
+    assert.equal(await cache.get(releaseFragmentKey), null);
+    assert.equal(await cache.get(key), null);
+
+    await cache.put(key, JSON.stringify(dashboard));
+    await cache.put(releaseFragmentKey, "cached");
+    await send("release", "delivery-unpublished", {
+      action: "unpublished",
+      release: {
+        tag_name: "v1.1.0",
+        name: "unpublished release",
+        html_url: "https://github.com/owner/repo/releases/tag/v1.1.0",
+        published_at: "2026-06-11T04:00:00Z",
+        draft: true,
+      },
+      repository,
+    });
+    assert.equal(await cache.get(releaseFragmentKey), null);
+    assert.equal(await cache.get(key), null);
+
+    await cache.put(key, JSON.stringify(dashboard));
+    await cache.put("hot:v3", JSON.stringify(testDashboard("hot", [project])));
+    const privateCacheKeys = [
+      "repo-detail:v4:owner/repo",
+      "social-repo:v3:owner/repo",
+      "repo-activity:v1:owner/repo:day",
+      "repo-audience:v5:owner/repo:week",
+      "owner-activity:v1:owner:day",
+      "owner-activity-summary:v2:owner:week:chat-latest:hash",
+      "repo-activity-summary:v2:owner/repo:day:chat-latest:hash",
+      "release-summary:v1:owner/repo:v1.0.0:abcdef1:chat-latest",
+      "discover:v4:week:all",
+      "repo-audience:v5:other/repo:week",
+      "owner-activity:v1:contributor:week",
+      "owner-activity-summary:v2:contributor:week:chat-latest:hash",
+      "trust-profile:v4:owner",
+      "audience-user-repos:v2:owner",
+    ];
+    await Promise.all(privateCacheKeys.map((cacheKey) => cache.put(cacheKey, "cached")));
+    await cache.delete("owner-metadata:v1:owner");
+    await send("repository", "delivery-10", {
+      action: "privatized",
+      repository,
+    });
+    assert.equal(await cache.get(key), null);
+    await cache.put(key, JSON.stringify(dashboard));
+    assert.equal((await readDashboard()).projects.length, 0);
+    const privateSnapshot = JSON.parse((await cache.get("owner-metadata:v1:owner")) ?? "{}") as {
+      privateRepos?: Record<string, string>;
+      removedRepos?: Record<string, string>;
+      projects?: Project[];
+    };
+    assert.equal(privateSnapshot.projects?.length, 0);
+    assert.equal(typeof privateSnapshot.privateRepos?.["owner/repo"], "string");
+    assert.equal(typeof privateSnapshot.removedRepos?.["owner/repo"], "string");
+    assert.equal(await cache.get("hot:v3"), null);
+    for (const cacheKey of privateCacheKeys) {
+      assert.equal(await cache.get(cacheKey), null);
+    }
+    await cache.put(
+      "discover:v4:week:all",
+      JSON.stringify({
+        ...testDashboard("hot", [project]),
+        title: "GitHub Hot",
+        owners: [],
+      }),
+    );
+    const privateDiscover = await worker.fetch(
+      new Request("https://release.bar/api/_discover?period=week"),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(privateDiscover.status, 200);
+    assert.equal(((await privateDiscover.json()) as DashboardPayload).projects.length, 0);
+
+    const leakedAt = new Date(Date.parse(now) + 10_000).toISOString();
+    await cache.put(
+      "owner-activity:v1:contributor:week",
+      JSON.stringify({
+        owner: {
+          type: "user",
+          login: "contributor",
+          avatarUrl: "https://github.com/contributor.png",
+          url: "https://github.com/contributor",
+        },
+        range: "week",
+        generatedAt: leakedAt,
+        cache: {
+          state: "fresh",
+          stale: false,
+          generatedAt: leakedAt,
+        },
+        totals: {
+          events: 1,
+          commits: 1,
+          pullRequests: 0,
+          issues: 0,
+          comments: 0,
+          releases: 0,
+          repositories: 1,
+        },
+        repositories: [
+          {
+            fullName: "owner/repo",
+            url: "https://github.com/owner/repo",
+            events: 1,
+            commits: 1,
+            lastActiveAt: leakedAt,
+          },
+        ],
+        events: [
+          {
+            id: "private-race",
+            kind: "commit",
+            title: "private repository work",
+            repo: "owner/repo",
+            url: "https://github.com/owner/repo",
+            createdAt: leakedAt,
+            count: 1,
+          },
+        ],
+      } satisfies OwnerActivityPayload),
+    );
+    const privateActivity = await worker.fetch(
+      new Request("https://release.bar/api/contributor/activity?range=week"),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(privateActivity.status, 200);
+    const privateActivityBody = (await privateActivity.json()) as OwnerActivityPayload;
+    assert.equal(privateActivityBody.events.length, 0);
+    assert.equal(privateActivityBody.repositories.length, 0);
+    assert.doesNotMatch(JSON.stringify(privateActivityBody), /owner\/repo|private repository work/);
+
+    await Promise.all([
+      cache.put(key, JSON.stringify(dashboard)),
+      cache.put(
+        "owner-metadata:v1:owner",
+        JSON.stringify({
+          owner: "owner",
+          generatedAt: now,
+          metadataUpdatedAt: now,
+          countsUpdatedAt: now,
+          releaseDataComplete: true,
+          knownRepos: ["owner/repo"],
+          privateRepos: {},
+          removedRepos: {},
+          projectMetadataUpdatedAt: { "owner/repo": now },
+          projectCountsUpdatedAt: { "owner/repo": now },
+          countOverlays: {},
+          projects: [project],
+        }),
+      ),
+      cache.put(
+        "repo-detail:v4:owner/repo",
+        JSON.stringify({
+          fullName: "owner/repo",
+          generatedAt: now,
+          cache: { state: "fresh", stale: false, generatedAt: now },
+          stats: {
+            commitActivity: { state: "ready" },
+            codeFrequency: { state: "ready" },
+          },
+          project,
+          releases: [],
+          contributors: [],
+          commitActivity: [],
+          codeFrequency: [],
+          languages: [],
+          workTrend: null,
+        } satisfies RepoDetailPayload),
+      ),
+    ]);
+    assert.equal((await readDashboard()).projects.length, 0);
+    const stalePrivateDetail = await worker.fetch(
+      new Request("https://release.bar/api/repos/owner/repo"),
+      env,
+      { waitUntil: () => undefined },
+    );
+    assert.equal(stalePrivateDetail.status, 404);
+
+    await cache.put(key, JSON.stringify(dashboard));
+    await send("repository", "delivery-publicized-old", {
+      action: "publicized",
+      repository: {
+        ...repository,
+        updated_at: new Date(Date.parse(now) - 1_000).toISOString(),
+      },
+    });
+    assert.equal((await readDashboard()).projects.length, 0);
+
+    await send("repository", "delivery-publicized-new", {
+      action: "publicized",
+      repository: {
+        ...repository,
+        updated_at: new Date(Date.parse(now) + 2_000).toISOString(),
+      },
+    });
+    assert.equal((await readDashboard()).projects.length, 1);
+
+    const compactPush = queuedWebhooks.find((message) => message.delivery === "delivery-6")
+      ?.payload as Record<string, unknown> | undefined;
+    assert.equal("commits" in (compactPush ?? {}), false);
+    assert.equal(JSON.stringify(compactPush).length < 2_000, true);
+    const indexes = await cache.list({ prefix: "refresh:target-index:v1:owner:owner:" });
+    assert.equal(indexes.keys.length > 0, true);
+    assert.equal(durableObjectNames.includes("github-webhook-admission"), true);
+    assert.equal(durableObjectNames.includes("github-webhook-process:owner"), true);
+    assert.equal(durableObjectNames.includes("github-webhooks"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("GitHub webhooks fan out beyond the durable target hot-cache limit", async () => {
+  type QueuedWebhook = {
+    kind: "github-webhook";
+    id: string;
+    event: string;
+    delivery: string;
+    payload: Record<string, unknown>;
+    createdAt: string;
+    attempts?: number;
+  };
+  type QueuedFanout = {
+    kind: "github-webhook-fanout";
+    id: string;
+    event: string;
+    delivery: string;
+    payload: Record<string, unknown>;
+    createdAt: string;
+    action: {
+      reason: string;
+      includeReleaseDataOnly: boolean;
+      invalidateDashboard: boolean;
+    };
+    source: "owner" | "repo" | "legacy";
+    cursor?: string;
+  };
+  const secret = "fanout-webhook-secret";
+  const owner = "fanout";
+  const now = new Date().toISOString();
+  const project = testProject({ owner, name: "repo" });
+  const targets = Array.from({ length: 205 }, (_, index) => {
+    const suffix = String(index).padStart(3, "0");
+    const key = `dashboard:v6:${owner}:noforks-noarchived-unreleased-release:sources-${suffix}`;
+    return {
+      key,
+      kind: "dashboard",
+      owner,
+      owners: [owner],
+      repos: [],
+      includeReleaseData: true,
+      path: `/${owner}?variant=${suffix}`,
+      priority: 60,
+      lastSeenAt: now,
+      lastAttemptAt: null,
+      lastSuccessAt: now,
+      nextDueAt: "2999-01-01T00:00:00Z",
+      failureCount: 0,
+      indexVersion: 2,
+    } satisfies RefreshTarget;
+  });
+  const cache = kvStore({
+    "refresh:target-index:v1:ready": "2",
+    ...Object.fromEntries(
+      targets.flatMap((target, index) => [
+        [`refresh:target:v1:${target.key}`, JSON.stringify(target)],
+        [
+          `refresh:target-index:v1:owner:${owner}:${String(index).padStart(3, "0")}`,
+          JSON.stringify(target.key),
+        ],
+        [target.key, JSON.stringify(testDashboard(owner, [project]))],
+      ]),
+    ),
+  });
+  await cache.put(
+    `refresh:target-index:v1:repo:${encodeURIComponent(`${owner}/repo`)}:duplicate`,
+    JSON.stringify(targets[0]!.key),
+  );
+  const queued: Array<RefreshJob | QueuedWebhook | QueuedFanout> = [];
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+    GITHUB_WEBHOOK_SECRET: secret,
+    REFRESH_QUEUE: {
+      send: async (message) => {
+        queued.push(message);
+      },
+    },
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  const durableOwnerIndex = env.DASHBOARD_LOCKS.get(
+    env.DASHBOARD_LOCKS.idFromName(`refresh-target-index:owner:${owner}`),
+  );
+  for (const target of targets) {
+    const indexed = await durableOwnerIndex.fetch(
+      new Request("https://releasebar.internal/target-index/upsert", {
+        method: "POST",
+        body: JSON.stringify(target),
+      }),
+    );
+    assert.equal(indexed.status, 204);
+  }
+  const durableRepoIndex = env.DASHBOARD_LOCKS.get(
+    env.DASHBOARD_LOCKS.idFromName(`refresh-target-index:repo:${owner}/repo`),
+  );
+  const duplicate = await durableRepoIndex.fetch(
+    new Request("https://releasebar.internal/target-index/upsert", {
+      method: "POST",
+      body: JSON.stringify(targets[0]),
+    }),
+  );
+  assert.equal(duplicate.status, 204);
+  const payload = {
+    ref: "refs/heads/main",
+    after: "abcdef1234567890",
+    repository: {
+      full_name: `${owner}/repo`,
+      archived: false,
+      default_branch: "main",
+      pushed_at: now,
+      updated_at: now,
+    },
+  };
+  const body = JSON.stringify(payload);
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/github/webhook", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-event": "push",
+        "x-github-delivery": "delivery-fanout",
+        "x-hub-signature-256": await webhookSignature(secret, body),
+      },
+      body,
+    }),
+    env,
+    { waitUntil: () => undefined },
+  );
+  assert.equal(response.status, 202);
+  const webhookJob = queued.find(
+    (message): message is QueuedWebhook => message.kind === "github-webhook",
+  );
+  assert.ok(webhookJob);
+  let acknowledged = false;
+  await worker.queue(
+    {
+      messages: [
+        {
+          body: webhookJob,
+          attempts: 1,
+          ack: () => {
+            acknowledged = true;
+          },
+          retry: () => undefined,
+        },
+      ],
+    },
+    env,
+    { waitUntil: () => undefined },
+  );
+  const moved = await durableOwnerIndex.fetch(
+    new Request("https://releasebar.internal/target-index/upsert", {
+      method: "POST",
+      body: JSON.stringify({
+        ...targets[202]!,
+        lastSeenAt: new Date(Date.parse(now) + 1_000).toISOString(),
+      }),
+    }),
+  );
+  assert.equal(moved.status, 204);
+  const pageSizes = [
+    queued.filter((message): message is RefreshJob => message.kind === "dashboard").length,
+  ];
+  while (true) {
+    const fanoutIndex = queued.findIndex(
+      (message): message is QueuedFanout => message.kind === "github-webhook-fanout",
+    );
+    if (fanoutIndex < 0) break;
+    const [fanout] = queued.splice(fanoutIndex, 1);
+    const before = queued.filter(
+      (message): message is RefreshJob => message.kind === "dashboard",
+    ).length;
+    await worker.queue(
+      {
+        messages: [
+          {
+            body: fanout!,
+            attempts: 1,
+            ack: () => undefined,
+            retry: () => undefined,
+          },
+        ],
+      },
+      env,
+      { waitUntil: () => undefined },
+    );
+    const after = queued.filter(
+      (message): message is RefreshJob => message.kind === "dashboard",
+    ).length;
+    pageSizes.push(after - before);
+  }
+
+  const dashboardJobs = queued.filter(
+    (message): message is RefreshJob => message.kind === "dashboard",
+  );
+  assert.equal(acknowledged, true);
+  assert.equal(pageSizes.length >= 2, true);
+  assert.equal(Math.max(...pageSizes) <= 200, true);
+  assert.equal(new Set(dashboardJobs.map((job) => job.targetKey)).size, targets.length);
+  const firstJob = dashboardJobs.find((job) => job.targetKey === targets[0]!.key);
+  assert.ok(firstJob);
+  const firstTargetStub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName(targets[0]!.key));
+  const release = await firstTargetStub.fetch(
+    new Request("https://releasebar.internal/job/release", {
+      method: "POST",
+      body: JSON.stringify({ jobId: firstJob.id, consumeDirty: true }),
+    }),
+  );
+  assert.equal(release.status, 204);
+  assert.equal(await cache.get(targets[0]!.key), null);
+  assert.equal(await cache.get(targets.at(-1)!.key), null);
+});
+
+test("durable target indexes cap persistent variants per source", async () => {
+  const now = new Date().toISOString();
+  const cache = kvStore();
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  const stub = locks.get(locks.idFromName("refresh-target-index:owner:owner"));
+  for (let index = 0; index < 512; index += 1) {
+    const response = await stub.fetch(
+      new Request("https://releasebar.internal/target-index/upsert", {
+        method: "POST",
+        body: JSON.stringify({
+          key: `dashboard:v6:owner:variant-${index}`,
+          kind: "dashboard",
+          owner: "owner",
+          owners: ["owner"],
+          repos: [],
+          includeReleaseData: true,
+          path: `/owner?variant=${index}`,
+          priority: 60,
+          lastSeenAt: now,
+          lastAttemptAt: null,
+          lastSuccessAt: null,
+          nextDueAt: now,
+          failureCount: 0,
+        } satisfies RefreshTarget),
+      }),
+    );
+    assert.equal(response.status, 204);
+  }
+  const rejected = await stub.fetch(
+    new Request("https://releasebar.internal/target-index/upsert", {
+      method: "POST",
+      body: JSON.stringify({
+        key: "dashboard:v6:owner:variant-overflow",
+        kind: "dashboard",
+        owner: "owner",
+        owners: ["owner"],
+        repos: [],
+        includeReleaseData: true,
+        path: "/owner?variant=overflow",
+        priority: 60,
+        lastSeenAt: now,
+        lastAttemptAt: null,
+        lastSuccessAt: null,
+        nextDueAt: now,
+        failureCount: 0,
+      } satisfies RefreshTarget),
+    }),
+  );
+  assert.equal(rejected.status, 429);
+});
+
+test("durable target indexes reject oversized entries and serialized source state", async () => {
+  const now = new Date().toISOString();
+  const cache = kvStore();
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  const stub = locks.get(locks.idFromName("refresh-target-index:owner:owner"));
+  const target = (index: number, padding: number): RefreshTarget => ({
+    key: `dashboard:v6:owner:large-${index}`,
+    kind: "dashboard",
+    owner: "owner",
+    owners: ["owner"],
+    repos: [],
+    includeReleaseData: true,
+    path: `/owner?padding=${"x".repeat(padding)}&variant=${index}`,
+    priority: 60,
+    lastSeenAt: now,
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: now,
+    failureCount: 0,
+  });
+  const oversized = await stub.fetch(
+    new Request("https://releasebar.internal/target-index/upsert", {
+      method: "POST",
+      body: JSON.stringify(target(0, 9 * 1024)),
+    }),
+  );
+  assert.equal(oversized.status, 413);
+
+  let accepted = 0;
+  let rejected = 0;
+  for (let index = 1; index <= 512; index += 1) {
+    const response = await stub.fetch(
+      new Request("https://releasebar.internal/target-index/upsert", {
+        method: "POST",
+        body: JSON.stringify(target(index, 4 * 1024)),
+      }),
+    );
+    if (response.status === 204) accepted += 1;
+    if (response.status === 429) {
+      rejected = index;
+      break;
+    }
+  }
+  assert.equal(accepted > 0, true);
+  assert.equal(rejected > 0 && rejected < 512, true);
+});
+
+test("repo-only refresh targets do not consume a shared custom-owner index", async () => {
+  const now = new Date().toISOString();
+  const target: RefreshTarget = {
+    key: "dashboard:v6:repo-only-index",
+    kind: "dashboard",
+    owner: "custom",
+    owners: [],
+    repos: ["owner/repo"],
+    includeReleaseData: true,
+    path: "/?repos=owner/repo",
+    priority: 60,
+    lastSeenAt: now,
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const cache = kvStore({
+    [target.key]: JSON.stringify(
+      testDashboard("custom", [testProject({ owner: "owner", name: "repo" })]),
+    ),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+  });
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = locks;
+  const waits: Promise<unknown>[] = [];
+
+  await worker.scheduled({ cron: "0 * * * *" } as never, env, {
+    waitUntil: (promise) => waits.push(promise),
+  });
+  await Promise.all(waits);
+
+  const customIndex = await locks.get(locks.idFromName("refresh-target-index:owner:custom")).fetch(
+    new Request("https://releasebar.internal/target-index/list", {
+      method: "POST",
+    }),
+  );
+  const repoIndex = await locks.get(locks.idFromName("refresh-target-index:repo:owner/repo")).fetch(
+    new Request("https://releasebar.internal/target-index/list", {
+      method: "POST",
+    }),
+  );
+  assert.deepEqual(await customIndex.json(), []);
+  assert.equal(((await repoIndex.json()) as RefreshTarget[])[0]?.key, target.key);
+});
+
+test("multi-source target admission rolls back newly-created durable indexes", async () => {
+  const now = new Date().toISOString();
+  const target: RefreshTarget = {
+    key: "dashboard:v6:atomic-index",
+    kind: "dashboard",
+    owner: "owner",
+    owners: ["owner"],
+    repos: ["other/repo"],
+    includeReleaseData: true,
+    path: "/owner?repos=other/repo",
+    priority: 100,
+    lastSeenAt: now,
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const cache = kvStore({
+    [target.key]: JSON.stringify(
+      testDashboard("owner", [testProject({ owner: "other", name: "repo" })]),
+    ),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+  });
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+  };
+  const backing = durableLocks(env);
+  const locks = {
+    idFromName: backing.idFromName,
+    get(id: string) {
+      if (id === "refresh-target-index:repo:other/repo") {
+        return {
+          async fetch(request: Request) {
+            return new URL(request.url).pathname === "/target-index/upsert"
+              ? new Response(null, { status: 429 })
+              : new Response(null, { status: 204 });
+          },
+        };
+      }
+      return backing.get(id);
+    },
+  };
+  env.DASHBOARD_LOCKS = locks;
+  const waits: Promise<unknown>[] = [];
+
+  await worker.scheduled({ cron: "0 * * * *" } as never, env, {
+    waitUntil: (promise) => waits.push(promise),
+  });
+  await Promise.all(waits);
+
+  const ownerIndex = await backing
+    .get(backing.idFromName("refresh-target-index:owner:owner"))
+    .fetch(
+      new Request("https://releasebar.internal/target-index/list", {
+        method: "POST",
+      }),
+    );
+  assert.deepEqual(await ownerIndex.json(), []);
+  assert.equal(await cache.get(`refresh:target:v1:${target.key}`), null);
+});
+
+test("rejected target admission does not persist or queue the target", async () => {
+  const owner = "capped";
+  const key = dashboardCacheKey({
+    owner,
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const generatedAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const cached = {
+    ...testDashboard(owner, [testProject({ owner, name: "repo" })]),
+    generatedAt,
+    cache: {
+      state: "stale",
+      stale: true,
+      capped: false,
+      repoLimit: 200,
+      generatedAt,
+      countsUpdatedAt: generatedAt,
+      projectCountsUpdatedAt: { [`${owner}/repo`]: generatedAt },
+      releasesUpdatedAt: generatedAt,
+      ciUpdatedAt: generatedAt,
+    },
+  } satisfies DashboardPayload;
+  const cache = kvStore({
+    [key]: JSON.stringify(cached),
+    [`owner:v1:${owner}`]: JSON.stringify({ type: "user", login: owner }),
+  });
+  const queued: unknown[] = [];
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+    REFRESH_QUEUE: {
+      async send(message) {
+        queued.push(message);
+      },
+    },
+  };
+  const backing = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: backing.idFromName,
+    get(id: string) {
+      if (id === `refresh-target-index:owner:${owner}`) {
+        return {
+          async fetch(request: Request) {
+            return new URL(request.url).pathname === "/target-index/upsert"
+              ? new Response(null, { status: 429 })
+              : new Response(null, { status: 204 });
+          },
+        };
+      }
+      return backing.get(id);
+    },
+  };
+  const waits: Promise<unknown>[] = [];
+  const response = await worker.fetch(new Request(`https://release.bar/api/${owner}`), env, {
+    waitUntil: (promise) => waits.push(promise),
+  });
+  await Promise.all(waits);
+
+  assert.equal(response.status, 200);
+  assert.equal(queued.length, 0);
+  assert.equal(await cache.get(`refresh:target:v1:${key}`), null);
+});
+
+test("archive webhooks invalidate caches when owner snapshots omit the repository", async () => {
+  const secret = "archive-no-snapshot-secret";
+  const owner = "coldowner";
+  const now = new Date().toISOString();
+  const key = dashboardCacheKey({
+    owner,
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const dashboard = testDashboard(owner, [testProject({ owner, name: "repo" })]);
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner,
+    owners: [owner],
+    repos: [],
+    includeReleaseData: true,
+    path: `/${owner}`,
+    priority: 100,
+    lastSeenAt: now,
+    lastAttemptAt: null,
+    lastSuccessAt: now,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const cache = kvStore({
+    [key]: JSON.stringify(dashboard),
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+    [`owner-metadata:v1:${owner}`]: JSON.stringify({
+      owner,
+      generatedAt: now,
+      metadataUpdatedAt: now,
+      countsUpdatedAt: now,
+      releaseDataComplete: true,
+      projects: [testProject({ owner, name: "sibling" })],
+    }),
+  });
+  const queued: unknown[] = [];
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+    GITHUB_WEBHOOK_SECRET: secret,
+    GITHUB_TOKEN: "shared-token",
+    REFRESH_QUEUE: {
+      send: async (message) => {
+        queued.push(message);
+      },
+    },
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  const payload = {
+    action: "archived",
+    repository: {
+      full_name: `${owner}/repo`,
+      archived: true,
+      default_branch: "main",
+      updated_at: now,
+    },
+  };
+  const body = JSON.stringify(payload);
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/github/webhook", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-event": "repository",
+        "x-github-delivery": "delivery-archive-no-snapshot",
+        "x-hub-signature-256": await webhookSignature(secret, body),
+      },
+      body,
+    }),
+    env,
+    { waitUntil: () => undefined },
+  );
+  assert.equal(response.status, 202);
+  const webhookJob = queued.find(
+    (message) =>
+      Boolean(message) &&
+      typeof message === "object" &&
+      (message as { kind?: unknown }).kind === "github-webhook",
+  );
+  assert.ok(webhookJob);
+  await worker.queue(
+    {
+      messages: [
+        {
+          body: webhookJob as never,
+          attempts: 1,
+          ack: () => undefined,
+          retry: () => undefined,
+        },
+      ],
+    },
+    env,
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(await cache.get(key), null);
+});
+
+test("push webhooks bypass terminal target backoff before invalidating caches", async () => {
+  const owner = "backedoff";
+  const now = new Date().toISOString();
+  const key = dashboardCacheKey({
+    owner,
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner,
+    owners: [owner],
+    repos: [],
+    includeReleaseData: true,
+    path: `/${owner}`,
+    priority: 100,
+    lastSeenAt: now,
+    lastAttemptAt: now,
+    lastSuccessAt: now,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 11,
+    terminalBackoffUntil: "2999-01-01T00:00:00Z",
+  };
+  const cache = kvStore({
+    [key]: JSON.stringify(testDashboard(owner, [testProject({ owner, name: "repo" })])),
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+  });
+  const queued: unknown[] = [];
+  const queuedDelays: Array<number | undefined> = [];
+  const dashboardCacheAtEnqueue: Array<string | null> = [];
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+    REFRESH_QUEUE: {
+      send: async (message, options) => {
+        queued.push(message);
+        queuedDelays.push(options?.delaySeconds);
+        if (
+          message &&
+          typeof message === "object" &&
+          (message as { kind?: unknown }).kind === "dashboard"
+        ) {
+          dashboardCacheAtEnqueue.push(await cache.get(key));
+        }
+      },
+    },
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+
+  await worker.queue(
+    {
+      messages: [
+        {
+          body: {
+            kind: "github-webhook",
+            id: "job-backedoff-push",
+            event: "push",
+            delivery: "delivery-backedoff-push",
+            payload: {
+              ref: "refs/heads/main",
+              repository: {
+                full_name: `${owner}/repo`,
+                default_branch: "main",
+                updated_at: now,
+              },
+            },
+            createdAt: now,
+          },
+          attempts: 1,
+          ack: () => undefined,
+          retry: () => undefined,
+        } as never,
+      ],
+    },
+    env,
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(await cache.get(key), null);
+  assert.deepEqual(dashboardCacheAtEnqueue, [null]);
+  assert.equal(
+    queued.some(
+      (message) =>
+        Boolean(message) &&
+        typeof message === "object" &&
+        (message as { kind?: unknown; targetKey?: unknown }).kind === "dashboard" &&
+        (message as { targetKey?: unknown }).targetKey === key,
+    ),
+    true,
+  );
+
+  const activeJob = queued.find(
+    (message) =>
+      Boolean(message) &&
+      typeof message === "object" &&
+      (message as { kind?: unknown }).kind === "dashboard",
+  ) as { id?: string } | undefined;
+  assert.equal(typeof activeJob?.id, "string");
+  queued.length = 0;
+  await cache.put(
+    key,
+    JSON.stringify(testDashboard(owner, [testProject({ owner, name: "repo" })])),
+  );
+  await worker.queue(
+    {
+      messages: [
+        {
+          body: {
+            kind: "github-webhook",
+            id: "job-reserved-push",
+            event: "push",
+            delivery: "delivery-reserved-push",
+            payload: {
+              ref: "refs/heads/main",
+              repository: {
+                full_name: `${owner}/repo`,
+                default_branch: "main",
+                updated_at: now,
+              },
+            },
+            createdAt: now,
+          },
+          attempts: 1,
+          ack: () => undefined,
+          retry: () => undefined,
+        } as never,
+      ],
+    },
+    env,
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(await cache.get(key), null);
+  const requeued = queued.find(
+    (message) =>
+      Boolean(message) &&
+      typeof message === "object" &&
+      (message as { kind?: unknown; delivery?: unknown }).kind === "github-webhook" &&
+      (message as { delivery?: unknown }).delivery === "delivery-reserved-push",
+  );
+  assert.equal(requeued, undefined);
+  const targetStub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName(key));
+  const release = await targetStub.fetch(
+    new Request("https://releasebar.internal/job/release", {
+      method: "POST",
+      body: JSON.stringify({
+        jobId: activeJob!.id,
+        consumeDirty: true,
+      }),
+    }),
+  );
+  assert.equal(release.status, 200);
+  assert.equal(((await release.json()) as { reason?: string }).reason, "webhook:push");
+});
+
+test("reserved webhook refreshes queue one follow-up after the active job", async () => {
+  const owner = "reserved-fallback";
+  const now = new Date().toISOString();
+  const finalDeliveryStartedAt = new Date(Date.parse(now) + 60_000).toISOString();
+  const key = dashboardCacheKey({
+    owner,
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const target: RefreshTarget = {
+    key,
+    kind: "dashboard",
+    owner,
+    owners: [owner],
+    repos: [],
+    includeReleaseData: true,
+    path: `/${owner}`,
+    priority: 100,
+    lastSeenAt: now,
+    lastAttemptAt: now,
+    lastSuccessAt: now,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const cache = kvStore({
+    [key]: JSON.stringify(testDashboard(owner, [testProject({ owner, name: "sibling" })])),
+    [`refresh:target:v1:${key}`]: JSON.stringify(target),
+  });
+  const queued: unknown[] = [];
+  const delays: Array<number | undefined> = [];
+  const env: ConstructorParameters<typeof DashboardBuildLock>[1] = {
+    DASHBOARD_CACHE: cache,
+    REFRESH_QUEUE: {
+      send: async (message, options) => {
+        queued.push(message);
+        delays.push(options?.delaySeconds);
+      },
+    },
+  };
+  const locks = durableLocks(env);
+  env.DASHBOARD_LOCKS = {
+    idFromName: locks.idFromName,
+    get: locks.get,
+  };
+  const targetStub = env.DASHBOARD_LOCKS.get(env.DASHBOARD_LOCKS.idFromName(key));
+  const reservation = await targetStub.fetch(
+    new Request("https://releasebar.internal/job/reserve", {
+      method: "POST",
+      body: JSON.stringify({ jobId: "existing-job" }),
+    }),
+  );
+  assert.equal(reservation.status, 204);
+
+  let acknowledged = false;
+  let retried = false;
+  await worker.queue(
+    {
+      messages: [
+        {
+          body: {
+            kind: "github-webhook",
+            id: "job-reserved-fallback",
+            event: "repository",
+            delivery: "delivery-reserved-fallback",
+            payload: {
+              action: "publicized",
+              repository: {
+                full_name: `${owner}/missing`,
+                default_branch: "main",
+                updated_at: now,
+              },
+            },
+            createdAt: now,
+            attempts: 0,
+          },
+          attempts: 1,
+          ack() {
+            acknowledged = true;
+          },
+          retry() {
+            retried = true;
+          },
+        } as never,
+      ],
+    },
+    env,
+    { waitUntil: () => undefined },
+  );
+
+  const requeuedWebhook = queued.find(
+    (message) =>
+      Boolean(message) &&
+      typeof message === "object" &&
+      (message as { kind?: unknown; delivery?: unknown }).kind === "github-webhook" &&
+      (message as { delivery?: unknown }).delivery === "delivery-reserved-fallback",
+  );
+  assert.equal(requeuedWebhook, undefined);
+  assert.equal(acknowledged, true);
+  assert.equal(retried, false);
+
+  let activeAcknowledged = false;
+  await worker.queue(
+    {
+      messages: [
+        {
+          body: {
+            id: "existing-job",
+            targetKey: key,
+            target,
+            kind: "dashboard",
+            status: "succeeded",
+            reason: "existing refresh",
+            createdAt: "2026-06-11T00:00:00Z",
+            updatedAt: now,
+            startedAt: finalDeliveryStartedAt,
+            finishedAt: now,
+            attempts: 1,
+            durationMs: 1,
+          },
+          attempts: 1,
+          ack() {
+            activeAcknowledged = true;
+          },
+          retry() {
+            throw new Error("completed active job should not retry");
+          },
+        } as never,
+      ],
+    },
+    env,
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(activeAcknowledged, true);
+  const followup = queued.find(
+    (message) =>
+      Boolean(message) &&
+      typeof message === "object" &&
+      (message as { kind?: unknown; reason?: unknown }).kind === "dashboard" &&
+      String((message as { reason?: unknown }).reason).includes("repository-publicized:follow-up"),
+  ) as { targetKey?: string } | undefined;
+  assert.equal(followup?.targetKey, key);
+  assert.equal(delays.at(-1), 0);
+  assert.equal(await cache.get(key), null);
+});
+
+test("worker acknowledges webhook jobs after the durable requeue limit", async () => {
+  let abandoned = false;
+  let acknowledged = false;
+  let retried = false;
+  const locks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async (request: Request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/webhook/process") {
+          return new Response(null, { status: 500 });
+        }
+        if (path === "/webhook/abandon") {
+          abandoned = true;
+          return new Response(null, { status: 204 });
+        }
+        return new Response(null, { status: 404 });
+      },
+    }),
+  };
+
+  await (
+    worker as unknown as {
+      queue(
+        batch: {
+          messages: Array<{
+            body: unknown;
+            attempts?: number;
+            ack(): void;
+            retry(options?: { delaySeconds?: number }): void;
+          }>;
+        },
+        env: unknown,
+        context: unknown,
+      ): Promise<void>;
+    }
+  ).queue(
+    {
+      messages: [
+        {
+          body: {
+            kind: "github-webhook",
+            id: "job-terminal",
+            event: "issues",
+            delivery: "delivery-terminal",
+            payload: {
+              action: "opened",
+              repository: {
+                full_name: "owner/repo",
+                default_branch: "main",
+              },
+            },
+            createdAt: new Date().toISOString(),
+            attempts: 48,
+          },
+          attempts: 1,
+          ack() {
+            acknowledged = true;
+          },
+          retry() {
+            retried = true;
+          },
+        },
+      ],
+    },
+    { DASHBOARD_LOCKS: locks },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(abandoned, true);
+  assert.equal(acknowledged, true);
+  assert.equal(retried, false);
+});
+
+test("terminal webhook fanout clears admission and processing deduplication", async () => {
+  const abandoned: string[] = [];
+  let retried = false;
+  const locks = {
+    idFromName: (name: string) => name,
+    get: (id: string) => ({
+      fetch: async (request: Request) => {
+        if (new URL(request.url).pathname === "/webhook/abandon") {
+          abandoned.push(id);
+          return new Response(null, { status: 204 });
+        }
+        return new Response(null, { status: 404 });
+      },
+    }),
+  };
+  const cache = {
+    ...kvStore(),
+    async list() {
+      throw new Error("fanout page failed");
+    },
+  };
+
+  await worker.queue(
+    {
+      messages: [
+        {
+          body: {
+            kind: "github-webhook-fanout",
+            id: "fanout-terminal",
+            event: "push",
+            delivery: "delivery-fanout-terminal",
+            payload: {
+              ref: "refs/heads/main",
+              repository: {
+                full_name: "owner/repo",
+                default_branch: "main",
+              },
+            },
+            createdAt: new Date().toISOString(),
+            action: {
+              reason: "webhook:push",
+              includeReleaseDataOnly: true,
+              invalidateDashboard: true,
+            },
+            source: "owner",
+          },
+          attempts: 11,
+          ack() {
+            throw new Error("failed fanout should retry");
+          },
+          retry() {
+            retried = true;
+          },
+        } as never,
+      ],
+    },
+    {
+      DASHBOARD_CACHE: cache,
+      DASHBOARD_LOCKS: locks,
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.deepEqual(abandoned.sort(), ["github-webhook-admission", "github-webhook-process:owner"]);
+  assert.equal(retried, true);
 });

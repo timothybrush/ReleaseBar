@@ -5,7 +5,7 @@ ReleaseBar keeps public dashboard data warm with a small scheduler on the Cloudf
 ## Runtime Pieces
 
 - Cloudflare cron runs every 15 minutes from `wrangler.toml`.
-- `DASHBOARD_CACHE` stores compact refresh targets, immutable profile and per-job snapshots, latest job states, visible dashboard snapshots, audit events, and scheduler state.
+- `DASHBOARD_CACHE` stores compact refresh targets, shared owner metadata/count snapshots, immutable profile and per-job snapshots, latest job states, visible dashboard snapshots, audit events, and scheduler state.
 - `DASHBOARD_LOCKS` Durable Objects hold the active job reservation, refresh-target failure state, and strongly consistent progressive-scan checkpoint for each dashboard.
 - `REFRESH_QUEUE` receives background rebuild jobs in production.
 - User requests return cheap repository metadata first, bounded by the same 15-second cold-response deadline, then enqueue release hydration instead of keeping long scans inside HTTP `waitUntil()`.
@@ -27,7 +27,9 @@ Targets are intentionally demand-driven. A dashboard nobody has opened is not sc
 
 ## Scheduling Policy
 
-Every cron tick:
+Every cron tick first refreshes lean issue, pull request, archive, and activity metadata for recently viewed owners whose shared snapshot is about 15 minutes old. These count queries use GitHub App or shared authenticated quota, run with bounded concurrency, and are merged into every cached dashboard variant at read time.
+
+The same tick schedules deep dashboard work:
 
 1. Lists known refresh targets.
 2. Reads the cached dashboard payload for each target.
@@ -51,7 +53,7 @@ A refresh job rebuilds the same dashboard cache entry the user-facing route woul
 1. Load the target.
 2. Find a source-owned GitHub App installation token for the target owners/repos when possible.
 3. Fall back to shared or anonymous quota if no app token exists.
-4. Rebuild consecutive 12-repository hydration batches within a 12-minute Queue budget.
+4. Rebuild consecutive 12-repository hydration batches within a 12-minute Queue budget, hydrating up to four repositories concurrently.
 5. Store the scan checkpoint in the dashboard Durable Object and the visible dashboard snapshot in KV after each batch.
 6. Retry the same reserved Queue message if the dashboard remains incomplete.
 7. Update target success/failure state and write at most one job-state update per Queue delivery.
@@ -81,6 +83,15 @@ This means popular or installed accounts can refresh without burning the shared 
 - recent targets, jobs, and audit events
 
 Audit events are stored in KV and logged to Worker logs with `area: "scheduler"`. Keep audit detail short and structured so production logs remain searchable.
+
+## GitHub Webhooks
+
+`POST /api/github/webhook` accepts payloads up to 2 MiB, verifies `X-Hub-Signature-256` with `GITHUB_WEBHOOK_SECRET`, accepts GitHub setup pings, and serializes delivery admission through `DASHBOARD_LOCKS`. It acknowledges event deliveries only after the payload is durably written to Cloudflare Queue. Queue consumers serialize cache mutations through the same Durable Object and deduplicate accepted and processed `X-GitHub-Delivery` values for 24 hours.
+
+- `issues` and `pull_request` run one lean authoritative owner-count query, then patch known split counts
+- `repository` archive/unarchive events remove or restore rows according to dashboard visibility and enqueue a metadata refresh
+- `push` and `release` invalidate repository fragments and enqueue affected release dashboards for authoritative hydration
+- failed background processing clears the delivery marker so GitHub retries remain actionable
 
 ## Operational Notes
 

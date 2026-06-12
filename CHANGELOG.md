@@ -2,6 +2,7 @@
 
 ## 0.1.1 - Unreleased
 
+- Added shared per-owner metadata snapshots with lean 15-minute issue/PR count refreshes, fresh-cache responses before GitHub App token discovery, four-repository release hydration concurrency, independent count/release/CI timestamps, signed GitHub webhooks for issue, pull request, push, release, and archive updates, and stricter archived-repository removal from status views.
 - Returned current issue and PR counts before deep release scans when authenticated GitHub quota provides an exact split, marked anonymous REST splits unavailable without per-repository fan-out, moved progressive dashboard hydration to deadline-bounded Queue consumers with Durable Object checkpoints and strongly consistent target backoff state, removed stale cross-request build promises that could freeze scan progress, reduced oversized owner release GraphQL pages without changing prerelease selection, moved audit writes off foreground responses, scoped short upstream backoffs by GraphQL operation, and parallelized admin access-log reads.
 
 ## 0.1.0 - 2026-06-11

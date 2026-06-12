@@ -44,6 +44,7 @@ export type Project = {
   issuesUrl: string;
   pullRequestsUrl: string;
   archived: boolean;
+  fork?: boolean;
   pushedAt: string | null;
   updatedAt: string | null;
   latestCommitSha: string | null;
@@ -154,6 +155,10 @@ export type DashboardPayload = {
     capped: boolean;
     repoLimit: number | null;
     generatedAt: string;
+    countsUpdatedAt?: string | null;
+    projectCountsUpdatedAt?: Record<string, string>;
+    releasesUpdatedAt?: string | null;
+    ciUpdatedAt?: string | null;
     quota?: ApiQuota;
     message?: string;
     progress?: {
@@ -512,6 +517,7 @@ export type RepoDetailPayload = {
 export type RefreshTarget = {
   key: string;
   kind: "dashboard";
+  indexVersion?: number;
   owner: string;
   owners: string[];
   repos: string[];

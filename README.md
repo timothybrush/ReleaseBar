@@ -59,7 +59,7 @@ The Worker in `worker/index.ts` serves both the static app shell and the generic
 - `GET /openapi.json`, `GET /api/openapi.json`, and `GET /api/swagger.json` expose the public API as Swagger-compatible OpenAPI 3.1 JSON
 - `GET /api/_discover` and `GET /api/_hot` power the root dashboard
 
-Dashboard builds validate public GitHub owners and scan up to the 200 most recently pushed public repositories per owner. Cold dashboards return lightweight repository metadata, including issue and PR counts when authenticated GitHub quota provides an exact split, before release hydration continues through Cloudflare Queue in 12-repository batches. Anonymous REST fallbacks leave split counts unavailable instead of spending one extra request per repository. Unsynced public dashboards show bounded repository metadata without release, compare, commit, or check-run calls. Dashboard payloads, repo fragments, hot boards, app-installation coverage, profile settings, and auth session data live in Cloudflare KV. A Durable Object binding (`DASHBOARD_LOCKS`) prevents repeated cold requests from stampeding GitHub and stores strongly consistent progressive-scan checkpoints, active-job reservations, and refresh-target failure state between rapid Queue deliveries.
+Dashboard builds validate public GitHub owners and scan up to the 200 most recently pushed public repositories per owner. Shared owner metadata snapshots feed every dashboard filter/release variant. Active owners get a lean issue/PR/archive GraphQL refresh about every 15 minutes, while release and CI hydration stays on the roughly six-hour dashboard cadence. Cold dashboards return lightweight repository metadata before release hydration continues through Cloudflare Queue in 12-repository batches, with up to four repositories hydrated concurrently inside each batch. Anonymous REST fallbacks leave split counts unavailable instead of spending one extra request per repository. Unsynced public dashboards show bounded repository metadata without release, compare, commit, or check-run calls. Dashboard payloads expose separate `countsUpdatedAt`, `releasesUpdatedAt`, and `ciUpdatedAt` cache timestamps. Dashboard payloads, owner snapshots, repo fragments, hot boards, app-installation coverage, profile settings, and auth session data live in Cloudflare KV. A Durable Object binding (`DASHBOARD_LOCKS`) prevents repeated cold requests from stampeding GitHub and stores strongly consistent progressive-scan checkpoints, active-job reservations, and refresh-target failure state between rapid Queue deliveries.
 
 Fresh dashboard cache is served for about 1h. Stale or partial cache is shown while a background rebuild continues, so large owners can show useful rows before all release data finishes. Dashboard records are retained longer than the fresh window so older public data can remain visible during GitHub outages or rate limits, with the UI marking stale/partial state.
 
@@ -73,11 +73,14 @@ Configure these Worker secrets before enabling login:
 - `GITHUB_APP_CLIENT_SECRET`
 - `GITHUB_APP_ID`
 - `GITHUB_APP_PRIVATE_KEY`
+- `GITHUB_WEBHOOK_SECRET`
 - `AUTH_COOKIE_SECRET`
 
 `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` are required for dedicated GitHub App quota. Without them, users can still sign in, but dashboard rebuilds use the shared server token/cache. Optional: `GITHUB_APP_SLUG` defaults to `releasebar-app`, the current GitHub App slug.
 
 Set the GitHub App setup URL to `https://release.bar/api/auth/install` and enable redirect-on-update so users return to their dashboard after installing or changing repository access.
+
+Set the GitHub App webhook URL to `https://release.bar/api/github/webhook`, use the same value as the `GITHUB_WEBHOOK_SECRET` Worker secret, and subscribe to `Issues`, `Pull requests`, `Push`, `Releases`, and `Repository` events. Signed deliveries up to 2 MiB enter Cloudflare Queue before acknowledgement. Count and archive events run lean authoritative refreshes, while push/release events invalidate affected release/CI fragments and enqueue deep refreshes.
 
 ### AI Release Summaries
 

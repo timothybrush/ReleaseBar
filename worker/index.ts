@@ -7,7 +7,9 @@ import {
 import {
   buildDashboard,
   dashboardCacheKey,
+  fetchOwnerRepoCounts,
   GitHubRateLimitError,
+  type OwnerRepoCount,
   resolveOwnerType,
   slugOwner,
   validOwnerSlug,
@@ -112,6 +114,37 @@ type Queue<Message = unknown> = {
   send(message: Message, options?: { delaySeconds?: number }): Promise<void>;
 };
 
+type GitHubWebhookJob = {
+  kind: "github-webhook";
+  id: string;
+  event: string;
+  delivery: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+  attempts?: number;
+};
+
+type WebhookTargetAction = {
+  reason: string;
+  includeReleaseDataOnly: boolean;
+  invalidateDashboard: boolean;
+};
+
+type GitHubWebhookFanoutJob = {
+  kind: "github-webhook-fanout";
+  id: string;
+  event: string;
+  delivery: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+  action: WebhookTargetAction;
+  source: "owner" | "repo" | "legacy";
+  cursor?: string;
+  backfillFailed?: boolean;
+};
+
+type WorkerQueueMessage = RefreshJob | GitHubWebhookJob | GitHubWebhookFanoutJob;
+
 type MessageBatch<Message = unknown> = {
   messages: Array<{
     body: Message;
@@ -140,11 +173,12 @@ type Env = {
   GITHUB_APP_ID?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
   GITHUB_APP_SLUG?: string;
+  GITHUB_WEBHOOK_SECRET?: string;
   GITHUB_TOKEN?: string;
   OPENAI_API_KEY?: string;
   OPENAI_SUMMARY_MODEL?: string;
   RELEASEDECK_CANONICAL_DOMAIN?: string;
-  REFRESH_QUEUE?: Queue<RefreshJob>;
+  REFRESH_QUEUE?: Queue<WorkerQueueMessage>;
 };
 
 type ExecutionContext = {
@@ -203,6 +237,7 @@ const hotCacheTtlMs = 5 * 60 * 1000;
 const localBuildLocks = new Map<string, StoredBuildLock>();
 const localRefreshReservationFallbackScope = {};
 const localRefreshJobReservations = new WeakMap<object, Map<string, StoredRefreshJobReservation>>();
+const localRefreshDirtyMarkers = new WeakMap<object, Map<string, StoredRefreshDirty>>();
 const discoverLimit = 40;
 const discoverHydrateLimit = 24;
 const discoverHydrateBatchSize = 8;
@@ -244,6 +279,7 @@ const githubAccessShardCount = 16;
 const githubSharedBudgetPrefix = `github:budget:v1:shared:`;
 const githubGraphqlBackoffPrefix = `github:backoff:v2:graphql:`;
 const githubGraphqlBackoffSeconds = 2 * 60;
+const githubGraphqlOwnerCountsOperation = "ReleaseBarOwnerCounts";
 const githubGraphqlOwnerReleaseOperation = "ReleaseBarOwnerRepos.release";
 const githubGraphqlRepoDetailsOperation = "ReleaseBarRepoDetails";
 const githubGraphqlRepoStargazersOperation = "ReleaseBarRepoStargazers";
@@ -263,6 +299,10 @@ const sharedQuotaMinimumRemaining: Record<string, number> = {
   _: 250,
 };
 const refreshTargetPrefix = `refresh:target:v1:`;
+const refreshTargetIndexPrefix = `refresh:target-index:v1:`;
+const refreshTargetIndexReadyKey = `refresh:target-index:v1:ready`;
+const refreshTargetIndexVersion = 2;
+const refreshTargetIndexBackfillLimit = 50;
 const refreshProfileSnapshotPrefix = `refresh:profile-snapshot:v1:`;
 const refreshJobPrefix = `refresh:job:v1:`;
 const refreshJobIndexPrefix = `refresh:jobs:v2:`;
@@ -270,15 +310,33 @@ const refreshJobDeliveryPrefix = `refresh:job-deliveries:v1:`;
 const legacyRefreshJobIndexKey = `refresh:jobs:index:v1`;
 const refreshAuditPrefix = `refresh:audit:v2:`;
 const refreshStateKey = `refresh:state:v1`;
+const refreshOwnerCountCursorKey = `refresh:owner-count-cursor:v1`;
+const ownerMetadataPrefix = `owner-metadata:v1:`;
+const ownerMetadataTtlSeconds = 90 * 24 * 60 * 60;
+const githubWebhookDeliveryTtlMs = 24 * 60 * 60 * 1000;
+const githubWebhookDeliveryLimit = 2000;
+const githubWebhookProcessingLeaseMs = 12 * 60 * 1000;
+const githubWebhookBodyLimitBytes = 2 * 1024 * 1024;
+const githubWebhookRequeueLimit = 48;
 const manualRefreshCooldownPrefix = `refresh:manual:v1:`;
 const manualRefreshCooldownSeconds = 10 * 60;
 const refreshTargetListLimit = 5000;
+const refreshTargetSourceLimit = 512;
+const durableRefreshTargetIndexLimit = refreshTargetSourceLimit;
+const durableRefreshTargetEntryLimitBytes = 8 * 1024;
+const durableRefreshTargetIndexLimitBytes = 1024 * 1024;
+const webhookTargetPageSize = 200;
+const webhookTargetBatchSize = 50;
+const webhookTargetConcurrency = 8;
 const refreshJobListLimit = 80;
 const refreshAuditListLimit = 80;
 const schedulerBatchLimit = 20;
 const schedulerSharedDormantRefreshMs = 7 * 24 * 60 * 60 * 1000;
 const schedulerSharedDormantAfterMs = 24 * 60 * 60 * 1000;
 const schedulerRecentViewMs = 7 * 24 * 60 * 60 * 1000;
+const schedulerCountRefreshMs = 15 * 60 * 1000;
+const schedulerCountOwnerLimit = 20;
+const schedulerCountConcurrency = 4;
 const schedulerActiveRefreshMs = 6 * 60 * 60 * 1000;
 const schedulerDormantRefreshMs = 24 * 60 * 60 * 1000;
 const schedulerRetryBaseMs = 30 * 60 * 1000;
@@ -367,6 +425,22 @@ type DashboardRequest = {
   quotaAccount?: string | null;
 };
 
+type OwnerMetadataSnapshot = {
+  owner: string;
+  generatedAt: string;
+  metadataUpdatedAt: string;
+  countsUpdatedAt: string | null;
+  countsAttemptedAt: string | null;
+  releaseDataComplete: boolean;
+  knownRepos: string[] | null;
+  privateRepos: Record<string, string>;
+  removedRepos: Record<string, string>;
+  projectMetadataUpdatedAt: Record<string, string>;
+  projectCountsUpdatedAt: Record<string, string>;
+  countOverlays: Record<string, OwnerRepoCount>;
+  projects: Project[];
+};
+
 type RequestToken = {
   token: string;
   quotaSource: "app";
@@ -433,6 +507,57 @@ type StoredRefreshJobReservation = {
   expiresAt: number;
 };
 
+type StoredRefreshDirty = {
+  observedAt: string;
+  reason: string;
+};
+
+type StoredWebhookDelivery = {
+  id: string;
+  processedAt: number;
+};
+
+type StoredWebhookProcessing = {
+  delivery: string;
+  expiresAt: number;
+};
+
+type OwnerMetadataMutation =
+  | {
+      kind: "merge";
+      generatedAt: string;
+      observedAt: string;
+      countsUpdatedAt: string | null;
+      countsComplete: boolean;
+      releaseDataComplete: boolean;
+      mode: "metadata" | "hydrated";
+      projects: Project[];
+      removedRepos: string[];
+    }
+  | {
+      kind: "counts";
+      updatedAt: string;
+      counts: OwnerRepoCount[];
+      complete: boolean;
+    }
+  | {
+      kind: "visibility";
+      fullName: string;
+      archived: boolean;
+      observedAt: string;
+      repositoryUpdatedAt: string | null;
+    }
+  | {
+      kind: "remove";
+      fullName: string;
+      observedAt: string;
+    }
+  | {
+      kind: "restore";
+      fullName: string;
+      observedAt: string;
+    };
+
 type RefreshTargetMutation =
   | {
       kind: "observe";
@@ -466,6 +591,10 @@ type StoredBuildProgress = {
   scannedRepos: string[];
   projects: Project[];
   generationStartedAt?: string;
+  countsUpdatedAt?: string | null;
+  projectCountsUpdatedAt?: Record<string, string>;
+  releasesUpdatedAt?: string | null;
+  ciUpdatedAt?: string | null;
   updatedAt: string;
   durableFallback?: true;
 };
@@ -1803,15 +1932,17 @@ async function socialRepoProject(
   if (!validRepoSlug(label)) return null;
   const [owner, repo] = label.split("/");
   if (!owner || !repo) return null;
+  const barrier = await repositoryPublicCacheBarrier(env, label);
+  if (barrier === "blocked") return null;
   const key = repoDetailCacheKey(owner, repo);
-  const cached = await readRepoDetail(env, key);
+  const cached = barrier === "clear" ? await readRepoDetail(env, key) : null;
   const allowRefresh = allowRequestRefresh(request);
   const ageMs = repoDetailAgeMs(cached);
   if (cached && ageMs > repoDetailCacheTtlMs && allowRefresh) {
     context.waitUntil(refreshRepoDetail(key, owner, repo, request, env).catch(() => undefined));
   }
   if (cached && ageMs <= maxDisplayStaleMs) return cached.project;
-  const social = await readSocialRepo(env, owner, repo);
+  const social = barrier === "clear" ? await readSocialRepo(env, owner, repo) : null;
   const socialAgeMs = socialRepoAgeMs(social);
   if (social && socialAgeMs > repoDetailCacheTtlMs && allowRefresh) {
     context.waitUntil(refreshSocialRepo(owner, repo, request, env).catch(() => undefined));
@@ -1965,6 +2096,13 @@ function openApiSpec(origin: string): Record<string, unknown> {
       state: { enum: ["fresh", "stale", "partial", "warming", "error"] },
       stale: { type: "boolean" },
       generatedAt: { type: "string", format: "date-time" },
+      countsUpdatedAt: { type: ["string", "null"], format: "date-time" },
+      projectCountsUpdatedAt: {
+        type: "object",
+        additionalProperties: { type: "string", format: "date-time" },
+      },
+      releasesUpdatedAt: { type: ["string", "null"], format: "date-time" },
+      ciUpdatedAt: { type: ["string", "null"], format: "date-time" },
       message: { type: "string" },
       quota: {
         type: "object",
@@ -3462,6 +3600,10 @@ function withCacheState(
       capped: payload.cache?.capped ?? false,
       repoLimit: payload.cache ? payload.cache.repoLimit : repoLimit,
       generatedAt: payload.generatedAt,
+      countsUpdatedAt: payload.cache?.countsUpdatedAt ?? null,
+      projectCountsUpdatedAt: payload.cache?.projectCountsUpdatedAt ?? {},
+      releasesUpdatedAt: payload.cache?.releasesUpdatedAt ?? null,
+      ciUpdatedAt: payload.cache?.ciUpdatedAt ?? null,
       ...(payload.cache?.quota ? { quota: payload.cache.quota } : {}),
       ...(payload.cache?.progress ? { progress: payload.cache.progress } : {}),
       ...(cacheMessage ? { message: cacheMessage } : {}),
@@ -3544,9 +3686,29 @@ function errorStatus(error: unknown): number {
   return isGitHubRateLimit(error) ? 429 : 502;
 }
 
-async function readCached(env: Env, key: string): Promise<DashboardPayload | null> {
+function ownerMetadataKey(owner: string): string {
+  return `${ownerMetadataPrefix}${slugOwner(owner)}`;
+}
+
+function dashboardWithVisibleProjects(payload: DashboardPayload): DashboardPayload {
+  if (payload.options?.includeArchived) return payload;
+  const projects = payload.projects.filter((project) => !project.archived);
+  if (projects.length === payload.projects.length) return payload;
+  return {
+    ...payload,
+    totals: dashboardTotals(projects),
+    projects,
+  };
+}
+
+async function readCachedRaw(env: Env, key: string): Promise<DashboardPayload | null> {
   const raw = await env.DASHBOARD_CACHE?.get(key);
   return raw ? tryJsonParse<DashboardPayload>(raw, `dashboard ${key}`) : null;
+}
+
+async function readCached(env: Env, key: string): Promise<DashboardPayload | null> {
+  const payload = await readCachedRaw(env, key);
+  return payload ? dashboardWithVisibleProjects(payload) : null;
 }
 
 function cacheAgeMs(payload: DashboardPayload | null): number {
@@ -3557,6 +3719,31 @@ function cacheAgeMs(payload: DashboardPayload | null): number {
 
 function canDisplayCached(payload: DashboardPayload | null): payload is DashboardPayload {
   return cacheAgeMs(payload) <= maxDisplayStaleMs;
+}
+
+function canDisplayOwnerMetadata(snapshot: OwnerMetadataSnapshot): boolean {
+  return Date.now() - safeIso(snapshot.metadataUpdatedAt) <= maxDisplayStaleMs;
+}
+
+function canDisplayOwnerProjectMetadata(
+  snapshot: OwnerMetadataSnapshot,
+  fullName: string,
+): boolean {
+  return (
+    Date.now() - safeIso(snapshot.projectMetadataUpdatedAt[fullName.toLowerCase()]) <=
+    maxDisplayStaleMs
+  );
+}
+
+function canDisplayOwnerProjectCounts(snapshot: OwnerMetadataSnapshot, fullName: string): boolean {
+  return (
+    Date.now() - safeIso(snapshot.projectCountsUpdatedAt[fullName.toLowerCase()]) <=
+    maxDisplayStaleMs
+  );
+}
+
+function canDisplayOwnerCounts(snapshot: OwnerMetadataSnapshot): boolean {
+  return Date.now() - safeIso(snapshot.countsUpdatedAt) <= maxDisplayStaleMs;
 }
 
 async function manualRefreshCooldownKey(key: string): Promise<string> {
@@ -3630,6 +3817,1072 @@ async function writeCached(
   });
 }
 
+function normalizeOwnerObservationMap(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string" && safeIso(entry[1]) > 0,
+      )
+      .map(([repo, observedAt]) => [repo.toLowerCase(), observedAt]),
+  );
+}
+
+function isOwnerRepoCount(value: unknown): value is OwnerRepoCount {
+  const count = value as OwnerRepoCount | null;
+  return Boolean(
+    count &&
+    validRepoSlug(count.fullName.toLowerCase()) &&
+    Number.isFinite(count.openIssues) &&
+    Number.isFinite(count.openPullRequests) &&
+    typeof count.archived === "boolean" &&
+    typeof count.fork === "boolean" &&
+    typeof count.private === "boolean",
+  );
+}
+
+function normalizeOwnerCountOverlays(
+  value: unknown,
+  projects: Project[],
+  projectCountsUpdatedAt: Record<string, string>,
+): Record<string, OwnerRepoCount> {
+  const overlays =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? Object.fromEntries(
+          Object.entries(value).flatMap(([fullName, count]) =>
+            isOwnerRepoCount(count)
+              ? [[fullName.toLowerCase(), { ...count, fullName: count.fullName.toLowerCase() }]]
+              : [],
+          ),
+        )
+      : {};
+  for (const project of projects) {
+    const fullName = project.fullName.toLowerCase();
+    if (
+      overlays[fullName] ||
+      !projectCountsUpdatedAt[fullName] ||
+      project.openIssues === null ||
+      project.openPullRequests === null
+    ) {
+      continue;
+    }
+    overlays[fullName] = {
+      fullName,
+      openIssues: project.openIssues,
+      openPullRequests: project.openPullRequests,
+      archived: project.archived,
+      fork: project.fork === true,
+      private: false,
+      pushedAt: project.pushedAt,
+      updatedAt: project.updatedAt,
+    };
+  }
+  return overlays;
+}
+
+function normalizeOwnerMetadataSnapshot(
+  owner: string,
+  value: unknown,
+): OwnerMetadataSnapshot | null {
+  const snapshot = value as OwnerMetadataSnapshot | null;
+  if (snapshot?.owner !== slugOwner(owner) || !Array.isArray(snapshot.projects)) return null;
+  const hasMetadataClocks =
+    snapshot.projectMetadataUpdatedAt &&
+    typeof snapshot.projectMetadataUpdatedAt === "object" &&
+    !Array.isArray(snapshot.projectMetadataUpdatedAt);
+  const hasCountClocks =
+    snapshot.projectCountsUpdatedAt &&
+    typeof snapshot.projectCountsUpdatedAt === "object" &&
+    !Array.isArray(snapshot.projectCountsUpdatedAt);
+  const projectCountsUpdatedAt = hasCountClocks
+    ? normalizeOwnerObservationMap(snapshot.projectCountsUpdatedAt)
+    : Object.fromEntries(
+        snapshot.countsUpdatedAt
+          ? snapshot.projects.map((project) => [
+              project.fullName.toLowerCase(),
+              snapshot.countsUpdatedAt!,
+            ])
+          : [],
+      );
+  return {
+    ...snapshot,
+    countsAttemptedAt: snapshot.countsAttemptedAt ?? snapshot.countsUpdatedAt ?? null,
+    releaseDataComplete: snapshot.releaseDataComplete === true,
+    knownRepos: Array.isArray(snapshot.knownRepos)
+      ? snapshot.knownRepos.map((repo) => repo.toLowerCase())
+      : null,
+    privateRepos: normalizeOwnerObservationMap(snapshot.privateRepos),
+    removedRepos: normalizeOwnerObservationMap(snapshot.removedRepos),
+    projectMetadataUpdatedAt: hasMetadataClocks
+      ? normalizeOwnerObservationMap(snapshot.projectMetadataUpdatedAt)
+      : Object.fromEntries(
+          snapshot.projects.map((project) => [
+            project.fullName.toLowerCase(),
+            snapshot.metadataUpdatedAt,
+          ]),
+        ),
+    projectCountsUpdatedAt,
+    countOverlays: normalizeOwnerCountOverlays(
+      snapshot.countOverlays,
+      snapshot.projects,
+      projectCountsUpdatedAt,
+    ),
+  };
+}
+
+function newestOwnerTimestamp(...values: Array<string | null | undefined>): string | null {
+  let newest: string | null = null;
+  for (const value of values) {
+    if (value && safeIso(value) >= safeIso(newest)) newest = value;
+  }
+  return newest;
+}
+
+function ownerSnapshotIsNewer(
+  candidate: OwnerMetadataSnapshot,
+  current: OwnerMetadataSnapshot,
+): boolean {
+  for (const field of ["countsUpdatedAt", "metadataUpdatedAt", "generatedAt"] as const) {
+    const candidateTime = safeIso(candidate[field]);
+    const currentTime = safeIso(current[field]);
+    if (candidateTime !== currentTime) return candidateTime > currentTime;
+  }
+  return true;
+}
+
+function reconcileOwnerMetadataSnapshots(
+  owner: string,
+  storedValue: unknown,
+  cachedValue: unknown,
+  durablePrivacy = false,
+): OwnerMetadataSnapshot | null {
+  const stored = normalizeOwnerMetadataSnapshot(owner, storedValue);
+  const cached = normalizeOwnerMetadataSnapshot(owner, cachedValue);
+  const snapshots = [stored, cached].filter(
+    (snapshot): snapshot is OwnerMetadataSnapshot => snapshot !== null,
+  );
+  if (snapshots.length === 0) return null;
+  if (snapshots.length === 1) return snapshots[0]!;
+
+  const authority = snapshots.reduce((current, candidate) =>
+    ownerSnapshotIsNewer(candidate, current) ? candidate : current,
+  );
+  const names = new Set<string>();
+  for (const snapshot of [authority, ...snapshots]) {
+    for (const project of snapshot.projects) names.add(project.fullName.toLowerCase());
+    for (const name of snapshot.knownRepos ?? []) names.add(name);
+    for (const name of Object.keys(snapshot.privateRepos)) names.add(name);
+    for (const name of Object.keys(snapshot.removedRepos)) names.add(name);
+    for (const name of Object.keys(snapshot.projectMetadataUpdatedAt)) names.add(name);
+    for (const name of Object.keys(snapshot.projectCountsUpdatedAt)) names.add(name);
+    for (const name of Object.keys(snapshot.countOverlays)) names.add(name);
+  }
+
+  const privateRepos =
+    durablePrivacy && stored
+      ? { ...stored.privateRepos }
+      : Object.fromEntries(
+          [...names].flatMap((fullName) => {
+            const privatizedAt = newestOwnerTimestamp(
+              ...snapshots.map((snapshot) => snapshot.privateRepos[fullName]),
+            );
+            return privatizedAt ? [[fullName, privatizedAt]] : [];
+          }),
+        );
+  const removedRepos: Record<string, string> = {};
+  const projectMetadataUpdatedAt: Record<string, string> = {};
+  const projectCountsUpdatedAt: Record<string, string> = {};
+  const countOverlays: Record<string, OwnerRepoCount> = {};
+  const projects: Project[] = [];
+  const authoritativeRepos = authority.knownRepos === null ? null : new Set(authority.knownRepos);
+
+  for (const fullName of names) {
+    const privatizedAt = privateRepos[fullName];
+    const removedAt = newestOwnerTimestamp(
+      ...snapshots.map((snapshot) => snapshot.removedRepos[fullName]),
+    );
+    const metadataAt = newestOwnerTimestamp(
+      ...snapshots.map((snapshot) => snapshot.projectMetadataUpdatedAt[fullName]),
+    );
+    const countsAt = newestOwnerTimestamp(
+      ...snapshots.map((snapshot) => snapshot.projectCountsUpdatedAt[fullName]),
+    );
+    if (metadataAt) projectMetadataUpdatedAt[fullName] = metadataAt;
+    if (countsAt) projectCountsUpdatedAt[fullName] = countsAt;
+    const countOverlay = snapshots
+      .map((snapshot) => ({
+        count: snapshot.countOverlays[fullName],
+        observedAt: snapshot.projectCountsUpdatedAt[fullName],
+      }))
+      .filter((candidate): candidate is { count: OwnerRepoCount; observedAt: string } =>
+        Boolean(candidate.count && candidate.observedAt),
+      )
+      .sort((left, right) => safeIso(right.observedAt) - safeIso(left.observedAt))[0];
+    if (countOverlay) countOverlays[fullName] = countOverlay.count;
+    if (privatizedAt) {
+      removedRepos[fullName] = newestOwnerTimestamp(privatizedAt, removedAt)!;
+      continue;
+    }
+
+    let metadataSource: { project: Project; observedAt: string | null } | null = null;
+    let countSource: { project: Project; observedAt: string | null } | null = null;
+    for (const snapshot of snapshots) {
+      const project = snapshot.projects.find(
+        (candidate) => candidate.fullName.toLowerCase() === fullName,
+      );
+      if (!project) continue;
+      const projectMetadataAt =
+        snapshot.projectMetadataUpdatedAt[fullName] ?? snapshot.metadataUpdatedAt;
+      if (!metadataSource || safeIso(projectMetadataAt) >= safeIso(metadataSource.observedAt)) {
+        metadataSource = { project, observedAt: projectMetadataAt };
+      }
+      const projectCountsAt = snapshot.projectCountsUpdatedAt[fullName] ?? snapshot.countsUpdatedAt;
+      if (!countSource || safeIso(projectCountsAt) >= safeIso(countSource.observedAt)) {
+        countSource = { project, observedAt: projectCountsAt };
+      }
+    }
+
+    const publicMetadataAt = metadataSource?.observedAt ?? null;
+    if (removedAt && safeIso(removedAt) >= safeIso(publicMetadataAt)) {
+      removedRepos[fullName] = removedAt;
+      continue;
+    }
+    if (!metadataSource) continue;
+    if (
+      authoritativeRepos &&
+      !authoritativeRepos.has(fullName) &&
+      safeIso(publicMetadataAt) <= safeIso(authority.countsUpdatedAt)
+    ) {
+      continue;
+    }
+
+    let project = metadataSource.project;
+    if (countSource) {
+      project =
+        safeIso(countSource.observedAt) > safeIso(publicMetadataAt)
+          ? mergeProjectCountFields(project, countSource.project)
+          : mergeProjectIssuePullCounts(project, countSource.project);
+    }
+    projects.push(project);
+  }
+
+  const knownRepos =
+    authority.knownRepos === null
+      ? null
+      : [
+          ...new Set([
+            ...authority.knownRepos,
+            ...projects
+              .filter(
+                (project) =>
+                  safeIso(projectMetadataUpdatedAt[project.fullName.toLowerCase()]) >
+                  safeIso(authority.countsUpdatedAt),
+              )
+              .map((project) => project.fullName.toLowerCase()),
+          ]),
+        ].filter((fullName) => !removedRepos[fullName]);
+
+  return {
+    owner,
+    generatedAt: newestOwnerTimestamp(...snapshots.map((snapshot) => snapshot.generatedAt))!,
+    metadataUpdatedAt: newestOwnerTimestamp(
+      ...snapshots.map((snapshot) => snapshot.metadataUpdatedAt),
+    )!,
+    countsUpdatedAt: newestOwnerTimestamp(...snapshots.map((snapshot) => snapshot.countsUpdatedAt)),
+    countsAttemptedAt: newestOwnerTimestamp(
+      ...snapshots.map((snapshot) => snapshot.countsAttemptedAt),
+    ),
+    releaseDataComplete: snapshots.some((snapshot) => snapshot.releaseDataComplete),
+    knownRepos,
+    privateRepos,
+    removedRepos,
+    projectMetadataUpdatedAt,
+    projectCountsUpdatedAt,
+    countOverlays,
+    projects,
+  };
+}
+
+async function readOwnerMetadataKv(env: Env, owner: string): Promise<OwnerMetadataSnapshot | null> {
+  const raw = await env.DASHBOARD_CACHE?.get(ownerMetadataKey(owner));
+  if (!raw) return null;
+  return normalizeOwnerMetadataSnapshot(
+    owner,
+    tryJsonParse<OwnerMetadataSnapshot>(raw, `owner metadata ${owner}`),
+  );
+}
+
+async function readDurableOwnerMetadata(
+  env: Env,
+  owner: string,
+): Promise<OwnerMetadataSnapshot | null> {
+  const normalizedOwner = slugOwner(owner);
+  if (!env.DASHBOARD_LOCKS) return readOwnerMetadataKv(env, normalizedOwner);
+  const id = env.DASHBOARD_LOCKS.idFromName(`owner-metadata:${normalizedOwner}`);
+  const response = await env.DASHBOARD_LOCKS.get(id).fetch(
+    new Request("https://releasebar.internal/owner-metadata/read", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ owner: normalizedOwner }),
+    }),
+  );
+  if (response.status === 404 || response.status === 409) {
+    return readOwnerMetadataKv(env, normalizedOwner);
+  }
+  if (response.status === 204) return null;
+  if (!response.ok) {
+    throw new Error(`owner metadata read returned ${response.status}`);
+  }
+  return normalizeOwnerMetadataSnapshot(normalizedOwner, await response.json());
+}
+
+async function readOwnerMetadata(env: Env, owner: string): Promise<OwnerMetadataSnapshot | null> {
+  return readOwnerMetadataKv(env, owner);
+}
+
+type PublicCacheBarrier = "clear" | "blocked" | "unknown";
+
+async function repositoryPublicCacheBarrier(
+  env: Env,
+  fullName: string,
+): Promise<PublicCacheBarrier> {
+  const normalized = fullName.toLowerCase();
+  const owner = normalized.split("/")[0];
+  if (!owner) return "blocked";
+  try {
+    const snapshot = await readDurableOwnerMetadata(env, owner);
+    return snapshot?.removedRepos[normalized] || snapshot?.privateRepos[normalized]
+      ? "blocked"
+      : "clear";
+  } catch {
+    return "unknown";
+  }
+}
+
+async function privateRepositoryNames(env: Env, fullNames: string[]): Promise<Set<string> | null> {
+  const normalized = [...new Set(fullNames.map((fullName) => fullName.toLowerCase()))];
+  const owners = [
+    ...new Set(
+      normalized
+        .map((fullName) => fullName.split("/")[0] ?? "")
+        .filter((owner) => validOwnerSlug(owner)),
+    ),
+  ];
+  try {
+    const snapshots = await mapConcurrent(
+      owners,
+      8,
+      async (owner) => [owner, await readDurableOwnerMetadata(env, owner)] as const,
+    );
+    const byOwner = new Map(snapshots);
+    return new Set(
+      normalized.filter((fullName) => {
+        const owner = fullName.split("/")[0] ?? "";
+        return Boolean(byOwner.get(owner)?.privateRepos[fullName]);
+      }),
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function writeOwnerMetadata(env: Env, snapshot: OwnerMetadataSnapshot): Promise<void> {
+  await env.DASHBOARD_CACHE?.put(ownerMetadataKey(snapshot.owner), JSON.stringify(snapshot), {
+    expirationTtl: ownerMetadataTtlSeconds,
+  });
+}
+
+function mergeProjectMetadata(project: Project, metadata: Project): Project {
+  return {
+    ...project,
+    owner: metadata.owner,
+    name: metadata.name,
+    fullName: metadata.fullName,
+    description: metadata.description,
+    url: metadata.url,
+    defaultBranch: metadata.defaultBranch,
+    language: metadata.language,
+    topics: metadata.topics,
+    stars: metadata.stars,
+    forks: metadata.forks,
+    issuesUrl: metadata.issuesUrl,
+    pullRequestsUrl: metadata.pullRequestsUrl,
+    archived: metadata.archived,
+    fork: metadata.fork,
+    pushedAt: metadata.pushedAt,
+    updatedAt: metadata.updatedAt,
+  };
+}
+
+function projectWithoutReleaseData(project: Project): Project {
+  return {
+    ...project,
+    openIssues: null,
+    openPullRequests: null,
+    latestCommitSha: null,
+    latestCommitDate: null,
+    version: "repo search",
+    releaseName: null,
+    releaseUrl: `${project.url}/releases`,
+    releaseDate: null,
+    commitsSinceRelease: null,
+    compareUrl: null,
+    ciState: "unknown",
+    ciStatus: null,
+    ciConclusion: null,
+    ciWorkflow: null,
+    ciUrl: null,
+    ciRunDate: null,
+    freshness: "hot",
+  };
+}
+
+function mergeProjectCountFields(project: Project, counts: Project | OwnerRepoCount): Project {
+  return {
+    ...project,
+    openIssues: counts.openIssues ?? project.openIssues,
+    openPullRequests: counts.openPullRequests ?? project.openPullRequests,
+    archived: counts.archived,
+    fork: counts.fork,
+    pushedAt: counts.pushedAt,
+    updatedAt: counts.updatedAt,
+  };
+}
+
+function mergeProjectIssuePullCounts(project: Project, counts: Project | OwnerRepoCount): Project {
+  return {
+    ...project,
+    openIssues: counts.openIssues ?? project.openIssues,
+    openPullRequests: counts.openPullRequests ?? project.openPullRequests,
+  };
+}
+
+function ownerSnapshotWithCounts(
+  snapshot: OwnerMetadataSnapshot,
+  counts: OwnerRepoCount[],
+  updatedAt: string,
+  complete: boolean,
+): OwnerMetadataSnapshot {
+  if (safeIso(updatedAt) < safeIso(snapshot.countsAttemptedAt)) {
+    return snapshot;
+  }
+  const byName = new Map(counts.map((repo) => [repo.fullName.toLowerCase(), repo]));
+  const publicNames = new Set(
+    counts.filter((repo) => !repo.private).map((repo) => repo.fullName.toLowerCase()),
+  );
+  const privateNames = counts
+    .filter((repo) => repo.private)
+    .map((repo) => repo.fullName.toLowerCase());
+  const newerMetadataNames = new Set(
+    Object.entries(snapshot.projectMetadataUpdatedAt)
+      .filter(([, metadataUpdatedAt]) => safeIso(metadataUpdatedAt) > safeIso(updatedAt))
+      .map(([fullName]) => fullName),
+  );
+  const removedRepos = { ...snapshot.removedRepos };
+  const projectCountsUpdatedAt = { ...snapshot.projectCountsUpdatedAt };
+  const countOverlays = { ...snapshot.countOverlays };
+  for (const fullName of publicNames) {
+    if (snapshot.privateRepos[fullName]) continue;
+    if (safeIso(updatedAt) > safeIso(removedRepos[fullName])) {
+      delete removedRepos[fullName];
+    }
+  }
+  for (const fullName of privateNames) {
+    if (newerMetadataNames.has(fullName)) continue;
+    if (safeIso(updatedAt) >= safeIso(removedRepos[fullName])) {
+      removedRepos[fullName] = updatedAt;
+    }
+    delete countOverlays[fullName];
+  }
+  if (complete) {
+    for (const fullName of Object.keys(countOverlays)) {
+      if (!publicNames.has(fullName) && !newerMetadataNames.has(fullName)) {
+        delete countOverlays[fullName];
+      }
+    }
+  }
+  for (const count of counts) {
+    const fullName = count.fullName.toLowerCase();
+    if (count.private || newerMetadataNames.has(fullName)) continue;
+    countOverlays[fullName] = { ...count, fullName };
+    if (safeIso(updatedAt) >= safeIso(projectCountsUpdatedAt[fullName])) {
+      projectCountsUpdatedAt[fullName] = updatedAt;
+    }
+  }
+  return {
+    ...snapshot,
+    countsUpdatedAt: complete ? updatedAt : snapshot.countsUpdatedAt,
+    countsAttemptedAt: updatedAt,
+    knownRepos: complete
+      ? [
+          ...new Set([
+            ...publicNames,
+            ...(snapshot.knownRepos ?? []).filter((fullName) => newerMetadataNames.has(fullName)),
+            ...snapshot.projects
+              .map((project) => project.fullName.toLowerCase())
+              .filter((fullName) => newerMetadataNames.has(fullName)),
+          ]),
+        ]
+      : (snapshot.knownRepos ?? null),
+    removedRepos,
+    countOverlays,
+    projects: snapshot.projects.flatMap((project) => {
+      const fullName = project.fullName.toLowerCase();
+      if (snapshot.privateRepos[fullName]) return [];
+      const count = byName.get(fullName);
+      const preserveNewerMetadata = newerMetadataNames.has(fullName);
+      if (!count) return complete && !preserveNewerMetadata ? [] : [project];
+      if (count.private) return preserveNewerMetadata ? [project] : [];
+      return [
+        {
+          ...project,
+          openIssues: count.openIssues,
+          openPullRequests: count.openPullRequests,
+          archived: preserveNewerMetadata ? project.archived : count.archived,
+          fork: preserveNewerMetadata ? project.fork : count.fork,
+          pushedAt: preserveNewerMetadata ? project.pushedAt : count.pushedAt,
+          updatedAt: preserveNewerMetadata ? project.updatedAt : count.updatedAt,
+        },
+      ];
+    }),
+    projectCountsUpdatedAt,
+  };
+}
+
+function applyOwnerMetadataMutation(
+  owner: string,
+  existing: OwnerMetadataSnapshot | null,
+  mutation: OwnerMetadataMutation,
+): OwnerMetadataSnapshot | null {
+  if (mutation.kind === "counts") {
+    return existing
+      ? ownerSnapshotWithCounts(existing, mutation.counts, mutation.updatedAt, mutation.complete)
+      : null;
+  }
+
+  if (mutation.kind === "visibility") {
+    if (!existing) return null;
+    const latestObservation = Math.max(
+      safeIso(existing.projectMetadataUpdatedAt[mutation.fullName]),
+      safeIso(existing.projectCountsUpdatedAt[mutation.fullName]),
+      safeIso(existing.removedRepos[mutation.fullName]),
+    );
+    if (safeIso(mutation.observedAt) < latestObservation) {
+      return existing;
+    }
+    return {
+      ...existing,
+      generatedAt:
+        safeIso(existing.generatedAt) > safeIso(mutation.observedAt)
+          ? existing.generatedAt
+          : mutation.observedAt,
+      metadataUpdatedAt:
+        safeIso(existing.metadataUpdatedAt) > safeIso(mutation.observedAt)
+          ? existing.metadataUpdatedAt
+          : mutation.observedAt,
+      projectMetadataUpdatedAt: {
+        ...existing.projectMetadataUpdatedAt,
+        [mutation.fullName]:
+          safeIso(existing.projectMetadataUpdatedAt[mutation.fullName]) >
+          safeIso(mutation.observedAt)
+            ? existing.projectMetadataUpdatedAt[mutation.fullName]!
+            : mutation.observedAt,
+      },
+      countOverlays: existing.countOverlays[mutation.fullName]
+        ? {
+            ...existing.countOverlays,
+            [mutation.fullName]: {
+              ...existing.countOverlays[mutation.fullName]!,
+              archived: mutation.archived,
+              updatedAt:
+                safeIso(mutation.repositoryUpdatedAt) >=
+                safeIso(existing.countOverlays[mutation.fullName]!.updatedAt)
+                  ? mutation.repositoryUpdatedAt
+                  : existing.countOverlays[mutation.fullName]!.updatedAt,
+            },
+          }
+        : existing.countOverlays,
+      projects: existing.projects.map((project) =>
+        project.fullName.toLowerCase() === mutation.fullName &&
+        safeIso(mutation.observedAt) >=
+          safeIso(existing.projectMetadataUpdatedAt[mutation.fullName])
+          ? {
+              ...project,
+              archived: mutation.archived,
+              updatedAt:
+                safeIso(mutation.repositoryUpdatedAt) >= safeIso(project.updatedAt)
+                  ? (mutation.repositoryUpdatedAt ?? project.updatedAt)
+                  : project.updatedAt,
+            }
+          : project,
+      ),
+    };
+  }
+
+  if (mutation.kind === "remove") {
+    const project = existing?.projects.find(
+      (candidate) => candidate.fullName.toLowerCase() === mutation.fullName,
+    );
+    const latestRepositoryObservation = Math.max(
+      safeIso(existing?.projectMetadataUpdatedAt?.[mutation.fullName]),
+      safeIso(existing?.removedRepos?.[mutation.fullName]),
+      safeIso(project?.updatedAt),
+    );
+    if (safeIso(mutation.observedAt) < latestRepositoryObservation) {
+      return existing;
+    }
+    return {
+      owner,
+      generatedAt:
+        safeIso(existing?.generatedAt) > safeIso(mutation.observedAt)
+          ? existing!.generatedAt
+          : mutation.observedAt,
+      metadataUpdatedAt:
+        safeIso(existing?.metadataUpdatedAt) > safeIso(mutation.observedAt)
+          ? existing!.metadataUpdatedAt
+          : mutation.observedAt,
+      countsUpdatedAt: existing?.countsUpdatedAt ?? null,
+      countsAttemptedAt: existing?.countsAttemptedAt ?? null,
+      releaseDataComplete: existing?.releaseDataComplete === true,
+      knownRepos: existing?.knownRepos?.filter((repo) => repo !== mutation.fullName) ?? null,
+      privateRepos: {
+        ...existing?.privateRepos,
+        [mutation.fullName]:
+          safeIso(existing?.privateRepos?.[mutation.fullName]) > safeIso(mutation.observedAt)
+            ? existing!.privateRepos[mutation.fullName]!
+            : mutation.observedAt,
+      },
+      removedRepos: {
+        ...existing?.removedRepos,
+        [mutation.fullName]:
+          safeIso(existing?.removedRepos?.[mutation.fullName]) > safeIso(mutation.observedAt)
+            ? existing!.removedRepos[mutation.fullName]!
+            : mutation.observedAt,
+      },
+      projectMetadataUpdatedAt: {
+        ...existing?.projectMetadataUpdatedAt,
+        [mutation.fullName]:
+          safeIso(existing?.projectMetadataUpdatedAt?.[mutation.fullName]) >
+          safeIso(mutation.observedAt)
+            ? existing!.projectMetadataUpdatedAt[mutation.fullName]!
+            : mutation.observedAt,
+      },
+      projectCountsUpdatedAt: {
+        ...existing?.projectCountsUpdatedAt,
+      },
+      countOverlays: Object.fromEntries(
+        Object.entries(existing?.countOverlays ?? {}).filter(
+          ([fullName]) => fullName !== mutation.fullName,
+        ),
+      ),
+      projects: (existing?.projects ?? []).filter(
+        (project) => project.fullName.toLowerCase() !== mutation.fullName,
+      ),
+    };
+  }
+
+  if (mutation.kind === "restore") {
+    if (!existing) return null;
+    const removedRepos = { ...existing.removedRepos };
+    const privateRepos = { ...existing.privateRepos };
+    const accepted = safeIso(mutation.observedAt) >= safeIso(privateRepos[mutation.fullName]);
+    if (accepted) {
+      delete privateRepos[mutation.fullName];
+      delete removedRepos[mutation.fullName];
+    }
+    return {
+      ...existing,
+      generatedAt:
+        safeIso(existing.generatedAt) > safeIso(mutation.observedAt)
+          ? existing.generatedAt
+          : mutation.observedAt,
+      metadataUpdatedAt:
+        safeIso(existing.metadataUpdatedAt) > safeIso(mutation.observedAt)
+          ? existing.metadataUpdatedAt
+          : mutation.observedAt,
+      knownRepos:
+        accepted && existing.knownRepos
+          ? [...new Set([...existing.knownRepos, mutation.fullName])]
+          : existing.knownRepos,
+      privateRepos,
+      removedRepos,
+      projectMetadataUpdatedAt: {
+        ...existing.projectMetadataUpdatedAt,
+        [mutation.fullName]:
+          safeIso(existing.projectMetadataUpdatedAt[mutation.fullName]) >
+          safeIso(mutation.observedAt)
+            ? existing.projectMetadataUpdatedAt[mutation.fullName]!
+            : mutation.observedAt,
+      },
+    };
+  }
+
+  const projects = new Map(
+    (existing?.projects ?? []).map((project) => [project.fullName.toLowerCase(), project]),
+  );
+  const projectMetadataUpdatedAt = { ...existing?.projectMetadataUpdatedAt };
+  const projectCountsUpdatedAt = { ...existing?.projectCountsUpdatedAt };
+  const countOverlays = { ...existing?.countOverlays };
+  const privateRepos = { ...existing?.privateRepos };
+  const removedRepos = { ...existing?.removedRepos };
+  const incomingNames = new Set(mutation.projects.map((project) => project.fullName.toLowerCase()));
+  const removedNames = new Set(mutation.removedRepos);
+  const acceptedRemovedNames = new Set<string>();
+  const coversExistingProjects = (existing?.projects ?? []).every(
+    (project) =>
+      incomingNames.has(project.fullName.toLowerCase()) ||
+      removedNames.has(project.fullName.toLowerCase()),
+  );
+  const incomingCountsUpdatedAt =
+    mutation.countsComplete &&
+    coversExistingProjects &&
+    mutation.projects.every(
+      (project) => project.openIssues !== null && project.openPullRequests !== null,
+    )
+      ? mutation.countsUpdatedAt
+      : (existing?.countsUpdatedAt ?? null);
+  for (const fullName of mutation.removedRepos) {
+    if (
+      safeIso(mutation.observedAt) >= safeIso(projectMetadataUpdatedAt[fullName]) &&
+      fullName.startsWith(`${owner}/`)
+    ) {
+      projects.delete(fullName);
+      delete countOverlays[fullName];
+      projectMetadataUpdatedAt[fullName] = mutation.observedAt;
+      removedRepos[fullName] = mutation.observedAt;
+      acceptedRemovedNames.add(fullName);
+    }
+  }
+  for (const project of mutation.projects) {
+    const fullName = project.fullName.toLowerCase();
+    if (privateRepos[fullName]) {
+      projects.delete(fullName);
+      delete countOverlays[fullName];
+      continue;
+    }
+    if (safeIso(mutation.observedAt) <= safeIso(removedRepos[fullName])) {
+      continue;
+    }
+    if (
+      existing?.knownRepos &&
+      !existing.knownRepos.includes(fullName) &&
+      safeIso(existing.countsUpdatedAt) > safeIso(mutation.observedAt)
+    ) {
+      continue;
+    }
+    const current = projects.get(fullName);
+    const incomingMetadataIsNewer =
+      safeIso(mutation.observedAt) >= safeIso(projectMetadataUpdatedAt[fullName]);
+    const incomingHasCounts =
+      project.openIssues !== null &&
+      project.openPullRequests !== null &&
+      Boolean(mutation.countsUpdatedAt);
+    const incomingProjectCountsAreNewer =
+      incomingHasCounts &&
+      safeIso(mutation.countsUpdatedAt) > safeIso(projectCountsUpdatedAt[fullName]);
+    const preserveCurrentCounts =
+      Boolean(current) &&
+      (!incomingHasCounts ||
+        safeIso(projectCountsUpdatedAt[fullName]) >= safeIso(mutation.countsUpdatedAt));
+    if (safeIso(mutation.observedAt) > safeIso(removedRepos[fullName])) {
+      delete removedRepos[fullName];
+    }
+    let merged = project;
+    if (current && mutation.mode === "metadata" && incomingMetadataIsNewer) {
+      merged = mergeProjectMetadata(current, project);
+    } else if (current && !incomingMetadataIsNewer) {
+      merged = incomingProjectCountsAreNewer ? mergeProjectCountFields(current, project) : current;
+    }
+    if (current && preserveCurrentCounts) {
+      merged = mergeProjectIssuePullCounts(merged, current);
+    }
+    projects.set(fullName, merged);
+    if (incomingMetadataIsNewer) {
+      projectMetadataUpdatedAt[fullName] = mutation.observedAt;
+    }
+    if (
+      incomingHasCounts &&
+      !preserveCurrentCounts &&
+      safeIso(mutation.countsUpdatedAt) >= safeIso(projectCountsUpdatedAt[fullName])
+    ) {
+      projectCountsUpdatedAt[fullName] = mutation.countsUpdatedAt!;
+      countOverlays[fullName] = {
+        fullName,
+        openIssues: project.openIssues!,
+        openPullRequests: project.openPullRequests!,
+        archived: project.archived,
+        fork: project.fork === true,
+        private: false,
+        pushedAt: project.pushedAt,
+        updatedAt: project.updatedAt,
+      };
+    }
+  }
+  return {
+    owner,
+    generatedAt:
+      safeIso(existing?.generatedAt) > safeIso(mutation.generatedAt)
+        ? existing!.generatedAt
+        : mutation.generatedAt,
+    metadataUpdatedAt:
+      safeIso(existing?.metadataUpdatedAt) > safeIso(mutation.observedAt)
+        ? existing!.metadataUpdatedAt
+        : mutation.observedAt,
+    countsUpdatedAt:
+      safeIso(existing?.countsUpdatedAt) > safeIso(incomingCountsUpdatedAt)
+        ? existing!.countsUpdatedAt
+        : incomingCountsUpdatedAt,
+    countsAttemptedAt: newestOwnerTimestamp(existing?.countsAttemptedAt, mutation.countsUpdatedAt),
+    releaseDataComplete: existing?.releaseDataComplete === true || mutation.releaseDataComplete,
+    knownRepos:
+      existing?.knownRepos?.filter((fullName) => !acceptedRemovedNames.has(fullName)) ?? null,
+    privateRepos,
+    removedRepos,
+    projectMetadataUpdatedAt,
+    projectCountsUpdatedAt,
+    countOverlays,
+    projects: [...projects.values()],
+  };
+}
+
+function isOwnerMetadataMutation(value: unknown): value is OwnerMetadataMutation {
+  const mutation = value as OwnerMetadataMutation | null;
+  if (!mutation || typeof mutation !== "object" || typeof mutation.kind !== "string") return false;
+  if (mutation.kind === "merge") {
+    return (
+      typeof mutation.generatedAt === "string" &&
+      typeof mutation.observedAt === "string" &&
+      (mutation.countsUpdatedAt === null || typeof mutation.countsUpdatedAt === "string") &&
+      typeof mutation.countsComplete === "boolean" &&
+      typeof mutation.releaseDataComplete === "boolean" &&
+      (mutation.mode === "metadata" || mutation.mode === "hydrated") &&
+      Array.isArray(mutation.projects) &&
+      Array.isArray(mutation.removedRepos)
+    );
+  }
+  if (mutation.kind === "counts") {
+    return (
+      typeof mutation.updatedAt === "string" &&
+      typeof mutation.complete === "boolean" &&
+      Array.isArray(mutation.counts)
+    );
+  }
+  return (
+    (mutation.kind === "visibility" &&
+      typeof mutation.fullName === "string" &&
+      typeof mutation.archived === "boolean" &&
+      typeof mutation.observedAt === "string" &&
+      (mutation.repositoryUpdatedAt === null ||
+        typeof mutation.repositoryUpdatedAt === "string")) ||
+    ((mutation.kind === "remove" || mutation.kind === "restore") &&
+      typeof mutation.fullName === "string" &&
+      typeof mutation.observedAt === "string")
+  );
+}
+
+async function mutateOwnerMetadataSnapshot(
+  env: Env,
+  owner: string,
+  mutation: OwnerMetadataMutation,
+): Promise<OwnerMetadataSnapshot | null> {
+  const normalizedOwner = slugOwner(owner);
+  const requireDurablePrivacy = mutation.kind === "remove" || mutation.kind === "restore";
+  if (env.DASHBOARD_LOCKS) {
+    try {
+      const id = env.DASHBOARD_LOCKS.idFromName(`owner-metadata:${normalizedOwner}`);
+      const response = await env.DASHBOARD_LOCKS.get(id).fetch(
+        new Request("https://releasebar.internal/owner-metadata/mutate", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ owner: normalizedOwner, mutation }),
+        }),
+      );
+      if (response.status === 204) return null;
+      if (response.ok) return (await response.json()) as OwnerMetadataSnapshot;
+      if (requireDurablePrivacy) {
+        throw new Error(`owner metadata mutation returned ${response.status}`);
+      }
+    } catch (error) {
+      if (requireDurablePrivacy) throw error;
+      // KV fallback keeps preview and degraded Durable Object paths operational.
+    }
+  }
+  const existing = await readOwnerMetadataKv(env, normalizedOwner);
+  const updated = applyOwnerMetadataMutation(normalizedOwner, existing, mutation);
+  if (updated) await writeOwnerMetadata(env, updated);
+  return updated;
+}
+
+async function mergeOwnerMetadata(
+  env: Env,
+  payload: DashboardPayload,
+  observedAt = payload.generatedAt,
+): Promise<DashboardPayload> {
+  const owners = [
+    ...new Set([
+      ...payload.owners.map((owner) => slugOwner(owner.login)),
+      ...payload.projects.map((project) => slugOwner(project.owner)),
+    ]),
+  ];
+  if (owners.length === 0) return dashboardWithVisibleProjects(payload);
+  const snapshots = (
+    await Promise.all(owners.map((owner) => readDurableOwnerMetadata(env, owner)))
+  ).filter((snapshot): snapshot is OwnerMetadataSnapshot => Boolean(snapshot));
+  if (snapshots.length === 0) return dashboardWithVisibleProjects(payload);
+  const snapshotByOwner = new Map(snapshots.map((snapshot) => [snapshot.owner, snapshot]));
+  const payloadObservedAt = safeIso(observedAt);
+  const payloadProjectCountClocks = payload.cache?.projectCountsUpdatedAt ?? {};
+  const payloadCountClock = (fullName: string) =>
+    safeIso(
+      payloadProjectCountClocks[fullName] ??
+        (owners.length === 1 ? payload.cache?.countsUpdatedAt : observedAt),
+    );
+  const payloadOwnerCountClock = (owner: string) => {
+    const ownerProjects = payload.projects.filter((project) => slugOwner(project.owner) === owner);
+    const clocks = ownerProjects.map(
+      (project) => payloadProjectCountClocks[project.fullName.toLowerCase()],
+    );
+    if (clocks.length > 0 && clocks.every(Boolean)) {
+      return Math.min(...clocks.map((clock) => safeIso(clock)));
+    }
+    return safeIso(owners.length === 1 ? payload.cache?.countsUpdatedAt : observedAt);
+  };
+  const countSnapshotNewer = (snapshot: OwnerMetadataSnapshot) =>
+    canDisplayOwnerCounts(snapshot) &&
+    safeIso(snapshot.countsUpdatedAt) > payloadOwnerCountClock(snapshot.owner);
+  const metadataByRepo = new Map(
+    snapshots.flatMap((snapshot) =>
+      canDisplayOwnerMetadata(snapshot)
+        ? snapshot.projects.flatMap((project) => {
+            const fullName = project.fullName.toLowerCase();
+            return canDisplayOwnerProjectMetadata(snapshot, fullName) &&
+              safeIso(snapshot.projectMetadataUpdatedAt[fullName]) > payloadObservedAt
+              ? [[fullName, project] as const]
+              : [];
+          })
+        : [],
+    ),
+  );
+  const countsByRepo = new Map(
+    snapshots.flatMap((snapshot) =>
+      Object.entries(snapshot.countOverlays).flatMap(([fullName, count]) => {
+        return canDisplayOwnerProjectCounts(snapshot, fullName) &&
+          safeIso(snapshot.projectCountsUpdatedAt[fullName]) > payloadCountClock(fullName) &&
+          !count.private
+          ? [[fullName, count] as const]
+          : [];
+      }),
+    ),
+  );
+  const projects = payload.projects.flatMap((project) => {
+    const snapshot = snapshotByOwner.get(slugOwner(project.owner));
+    if (snapshot?.removedRepos[project.fullName.toLowerCase()]) {
+      return [];
+    }
+    if (
+      snapshot &&
+      countSnapshotNewer(snapshot) &&
+      snapshot.knownRepos &&
+      !snapshot.knownRepos.includes(project.fullName.toLowerCase())
+    ) {
+      return [];
+    }
+    const metadata = metadataByRepo.get(project.fullName.toLowerCase());
+    const counts = countsByRepo.get(project.fullName.toLowerCase());
+    const merged = metadata ? mergeProjectMetadata(project, metadata) : project;
+    if (!counts) return [merged];
+    const fullName = project.fullName.toLowerCase();
+    const metadataClock = metadata
+      ? safeIso(snapshot?.projectMetadataUpdatedAt[fullName])
+      : payloadObservedAt;
+    const countClock = safeIso(snapshot?.projectCountsUpdatedAt[fullName]);
+    return [
+      countClock >= metadataClock
+        ? mergeProjectCountFields(merged, counts)
+        : mergeProjectIssuePullCounts(merged, counts),
+    ];
+  });
+  const countsUpdatedAt =
+    owners.every((owner) => {
+      const snapshot = snapshotByOwner.get(owner);
+      return snapshot?.countsUpdatedAt && countSnapshotNewer(snapshot);
+    }) && projects.every((project) => countsByRepo.has(project.fullName.toLowerCase()))
+      ? snapshots
+          .map((snapshot) => snapshot.countsUpdatedAt)
+          .filter((value): value is string => Boolean(value))
+          .sort()[0]
+      : (payload.cache?.countsUpdatedAt ?? null);
+  const projectCountsUpdatedAt = Object.fromEntries(
+    projects.flatMap((project) => {
+      const fullName = project.fullName.toLowerCase();
+      const snapshot = countsByRepo.get(fullName);
+      const updatedAt = snapshot
+        ? snapshotByOwner.get(slugOwner(project.owner))?.projectCountsUpdatedAt[fullName]
+        : payloadProjectCountClocks[fullName];
+      return updatedAt ? [[fullName, updatedAt]] : [];
+    }),
+  );
+  return dashboardWithVisibleProjects({
+    ...payload,
+    cache: payload.cache
+      ? {
+          ...payload.cache,
+          countsUpdatedAt: countsUpdatedAt ?? payload.cache.countsUpdatedAt ?? null,
+          projectCountsUpdatedAt,
+        }
+      : payload.cache,
+    totals: dashboardTotals(projects),
+    projects,
+  });
+}
+
+async function readCachedWithOwnerMetadata(
+  env: Env,
+  key: string,
+): Promise<DashboardPayload | null> {
+  const payload = await readCachedRaw(env, key);
+  if (!payload) return null;
+  try {
+    return await mergeOwnerMetadata(env, payload);
+  } catch {
+    // Never serve cached public metadata when its durable privacy barrier is unavailable.
+    return null;
+  }
+}
+
+async function rememberOwnerMetadata(
+  env: Env,
+  payload: DashboardPayload,
+  mode: "metadata" | "hydrated",
+  removedRepos: Iterable<string> = [],
+  observedAt = payload.generatedAt,
+): Promise<void> {
+  const removed = new Set([...removedRepos].map((repo) => repo.toLowerCase()));
+  const owners = [
+    ...new Set([
+      ...payload.owners.map((owner) => slugOwner(owner.login)),
+      ...payload.projects.map((project) => slugOwner(project.owner)),
+    ]),
+  ];
+  await Promise.all(
+    owners.map(async (owner) => {
+      const incoming = payload.projects.filter((project) => slugOwner(project.owner) === owner);
+      const countsUpdatedAt = payload.cache?.countsUpdatedAt ?? null;
+      await mutateOwnerMetadataSnapshot(env, owner, {
+        kind: "merge",
+        generatedAt: payload.generatedAt,
+        observedAt,
+        countsUpdatedAt,
+        countsComplete: payload.cache?.progress?.done !== false,
+        releaseDataComplete: mode === "hydrated" && payload.cache?.progress?.done !== false,
+        mode,
+        projects: incoming,
+        removedRepos: [...removed],
+      });
+    }),
+  );
+}
+
 function safeIso(value: string | null | undefined): number {
   if (!value) return 0;
   const parsed = Date.parse(value);
@@ -3664,6 +4917,116 @@ function crawlerCacheOnlyResponse(message: string, status = 202): Response {
 
 function refreshTargetStorageKey(key: string): string {
   return `${refreshTargetPrefix}${key}`;
+}
+
+function refreshTargetIndexSource(kind: "owner" | "repo", source: string): string {
+  return `${refreshTargetIndexPrefix}${kind}:${encodeURIComponent(source.toLowerCase())}:`;
+}
+
+function refreshTargetSources(target: RefreshTarget): Array<{
+  kind: "owner" | "repo";
+  value: string;
+}> {
+  return [
+    ...new Set([
+      ...target.owners.map((owner) => `owner:${slugOwner(owner)}`),
+      ...(target.owner && target.owner !== "custom" ? [`owner:${slugOwner(target.owner)}`] : []),
+      ...target.repos.map((repo) => `repo:${repo.toLowerCase()}`),
+    ]),
+  ].map((source) => {
+    const separator = source.indexOf(":");
+    return {
+      kind: source.slice(0, separator) as "owner" | "repo",
+      value: source.slice(separator + 1),
+    };
+  });
+}
+
+type RefreshTargetIndexWrite = "accepted" | "rejected" | "unavailable";
+
+async function writeDurableRefreshTargetIndexes(
+  env: Env,
+  target: RefreshTarget,
+): Promise<RefreshTargetIndexWrite> {
+  if (!env.DASHBOARD_LOCKS) return "unavailable";
+  try {
+    const writes = await Promise.all(
+      refreshTargetSources(target).map(async ({ kind, value }) => {
+        const id = env.DASHBOARD_LOCKS!.idFromName(`refresh-target-index:${kind}:${value}`);
+        const stub = env.DASHBOARD_LOCKS!.get(id);
+        const response = await stub
+          .fetch(
+            new Request("https://releasebar.internal/target-index/upsert", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(target),
+            }),
+          )
+          .catch(() => null);
+        return { response, stub };
+      }),
+    );
+    if (writes.every(({ response }) => response?.ok)) return "accepted";
+    await Promise.allSettled(
+      writes
+        .filter(({ response }) => response?.headers.get("x-refresh-target-created") === "true")
+        .map(({ stub }) =>
+          stub.fetch(
+            new Request("https://releasebar.internal/target-index/delete", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ key: target.key }),
+            }),
+          ),
+        ),
+    );
+    return writes.some(({ response }) => response?.status === 429) ? "rejected" : "unavailable";
+  } catch {
+    return "unavailable";
+  }
+}
+
+async function writeRefreshTargetIndexes(
+  env: Env,
+  target: RefreshTarget,
+): Promise<RefreshTargetIndexWrite> {
+  const sources = refreshTargetSources(target);
+  const hash = (await sha256Base64Url(target.key)).slice(0, 32);
+  const durableIndex = await writeDurableRefreshTargetIndexes(env, target);
+  if (durableIndex === "rejected") return durableIndex;
+  await Promise.all(
+    env.DASHBOARD_CACHE
+      ? sources.map(({ kind, value }) =>
+          env.DASHBOARD_CACHE!.put(
+            `${refreshTargetIndexSource(kind, value)}${hash}`,
+            JSON.stringify(target.key),
+            { expirationTtl: dashboardStorageTtlSeconds },
+          ),
+        )
+      : [],
+  );
+  return durableIndex;
+}
+
+async function persistRefreshTargetWithIndexes(
+  env: Env,
+  target: RefreshTarget,
+  options: { requireAdmission?: boolean } = {},
+): Promise<{ target: RefreshTarget; persisted: boolean }> {
+  const indexed = { ...target, indexVersion: refreshTargetIndexVersion };
+  const indexWrite = await writeRefreshTargetIndexes(env, indexed);
+  const admissionFailed =
+    indexWrite === "rejected" ||
+    (options.requireAdmission === true &&
+      indexWrite === "unavailable" &&
+      Boolean(env.DASHBOARD_LOCKS));
+  if (admissionFailed) {
+    await env.DASHBOARD_CACHE?.delete?.(refreshTargetStorageKey(target.key));
+    return { target: { ...target, indexVersion: undefined }, persisted: false };
+  }
+  const persisted = indexWrite === "accepted" ? indexed : { ...target, indexVersion: undefined };
+  await writeRefreshTarget(env, persisted);
+  return { target: persisted, persisted: true };
 }
 
 function currentDashboardCacheKey(key: string): boolean {
@@ -3759,6 +5122,39 @@ function isRefreshJob(value: unknown): value is RefreshJob {
   );
 }
 
+function isGitHubWebhookJob(value: unknown): value is GitHubWebhookJob {
+  const job = value as GitHubWebhookJob | null;
+  return Boolean(
+    job &&
+    job.kind === "github-webhook" &&
+    typeof job.id === "string" &&
+    typeof job.event === "string" &&
+    typeof job.delivery === "string" &&
+    (job.attempts === undefined || typeof job.attempts === "number") &&
+    job.payload &&
+    typeof job.payload === "object",
+  );
+}
+
+function isGitHubWebhookFanoutJob(value: unknown): value is GitHubWebhookFanoutJob {
+  const job = value as GitHubWebhookFanoutJob | null;
+  return Boolean(
+    job &&
+    job.kind === "github-webhook-fanout" &&
+    typeof job.id === "string" &&
+    typeof job.event === "string" &&
+    typeof job.delivery === "string" &&
+    typeof job.createdAt === "string" &&
+    (job.source === "owner" || job.source === "repo" || job.source === "legacy") &&
+    job.payload &&
+    typeof job.payload === "object" &&
+    job.action &&
+    typeof job.action.reason === "string" &&
+    typeof job.action.includeReleaseDataOnly === "boolean" &&
+    typeof job.action.invalidateDashboard === "boolean",
+  );
+}
+
 function refreshJobActive(job: RefreshJob, now = Date.now()): boolean {
   return (
     (job.status === "queued" || job.status === "running") &&
@@ -3776,6 +5172,34 @@ function localRefreshJobReservationStore(env: Env): Map<string, StoredRefreshJob
   const created = new Map<string, StoredRefreshJobReservation>();
   localRefreshJobReservations.set(scope, created);
   return created;
+}
+
+function localRefreshDirtyMarkerStore(env: Env): Map<string, StoredRefreshDirty> {
+  const scope =
+    (env.DASHBOARD_CACHE as object | undefined) ??
+    (env.DASHBOARD_LOCKS as object | undefined) ??
+    localRefreshReservationFallbackScope;
+  const existing = localRefreshDirtyMarkers.get(scope);
+  if (existing) return existing;
+  const created = new Map<string, StoredRefreshDirty>();
+  localRefreshDirtyMarkers.set(scope, created);
+  return created;
+}
+
+function recordLocalRefreshDirty(env: Env, targetKey: string, dirty: StoredRefreshDirty): void {
+  const markers = localRefreshDirtyMarkerStore(env);
+  const existing = markers.get(targetKey);
+  if (!existing || safeIso(dirty.observedAt) >= safeIso(existing.observedAt)) {
+    markers.set(targetKey, dirty);
+  }
+}
+
+function takeLocalRefreshDirty(env: Env, targetKey: string): StoredRefreshDirty | null {
+  const markers = localRefreshDirtyMarkerStore(env);
+  const dirty = markers.get(targetKey);
+  if (!dirty) return null;
+  markers.delete(targetKey);
+  return dirty;
 }
 
 function isAuditEvent(value: unknown): value is SchedulerAuditEvent {
@@ -3875,11 +5299,13 @@ async function mutateRefreshTargetState(
   env: Env,
   snapshot: RefreshTarget | null,
   mutation: RefreshTargetMutation,
-): Promise<RefreshTarget> {
+): Promise<RefreshTarget | null> {
   const key = mutation.kind === "observe" ? mutation.input.key : snapshot?.key;
   if (!key) {
     throw new Error("refresh target key required");
   }
+  const observedCurrent = mutation.kind === "observe" ? await readRefreshTarget(env, key) : null;
+  const requireAdmission = mutation.kind === "observe" && observedCurrent === null;
   if (env.DASHBOARD_LOCKS) {
     try {
       const id = env.DASHBOARD_LOCKS.idFromName(key);
@@ -3891,16 +5317,23 @@ async function mutateRefreshTargetState(
       );
       if (response.ok) {
         const updated = (await response.json()) as RefreshTarget;
-        if (isRefreshTarget(updated)) return updated;
+        if (isRefreshTarget(updated)) {
+          const persisted = await persistRefreshTargetWithIndexes(env, updated, {
+            requireAdmission,
+          });
+          return persisted.persisted ? persisted.target : null;
+        }
       }
     } catch {
       // KV fallback keeps preview and degraded Durable Object paths operational.
     }
   }
-  const current = await readRefreshTarget(env, key);
+  const current = mutation.kind === "observe" ? observedCurrent : await readRefreshTarget(env, key);
   const updated = applyRefreshTargetMutation(snapshot, current, mutation);
-  await writeRefreshTarget(env, updated);
-  return updated;
+  const persisted = await persistRefreshTargetWithIndexes(env, updated, {
+    requireAdmission,
+  });
+  return persisted.persisted ? persisted.target : null;
 }
 
 async function rememberRefreshTarget(
@@ -3911,6 +5344,9 @@ async function rememberRefreshTarget(
   > & { profile?: DashboardProfile | null },
 ): Promise<RefreshTarget | null> {
   if (!env.DASHBOARD_CACHE) return null;
+  if (new TextEncoder().encode(input.path).byteLength > durableRefreshTargetEntryLimitBytes) {
+    return null;
+  }
   const now = new Date().toISOString();
   const { profile, ...targetInput } = input;
   const profileSnapshotKey =
@@ -3964,6 +5400,13 @@ async function listRefreshTargets(
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor && targets.length < limit);
   return targets;
+}
+
+async function backfillRefreshTargetIndexes(env: Env, targets: RefreshTarget[]): Promise<void> {
+  if (!env.DASHBOARD_CACHE) return;
+  const pending = targets.filter((target) => target.indexVersion !== refreshTargetIndexVersion);
+  const batch = pending.slice(0, refreshTargetIndexBackfillLimit);
+  await mapConcurrent(batch, 4, (target) => persistRefreshTargetWithIndexes(env, target));
 }
 
 async function readStringList(env: Env, key: string): Promise<string[]> {
@@ -4425,12 +5868,18 @@ function refreshQueueMessage(job: RefreshJob): RefreshJob {
   return message;
 }
 
-async function reserveRefreshJob(env: Env, targetKey: string, jobId: string): Promise<boolean> {
+async function reserveRefreshJob(
+  env: Env,
+  targetKey: string,
+  jobId: string,
+  dirtyOnConflict?: StoredRefreshDirty,
+): Promise<boolean> {
   const reserveFallback = async (): Promise<boolean> => {
     const reservations = localRefreshJobReservationStore(env);
     const now = Date.now();
     const local = reservations.get(targetKey);
     if (local && local.jobId !== jobId && local.expiresAt > now) {
+      if (dirtyOnConflict) recordLocalRefreshDirty(env, targetKey, dirtyOnConflict);
       return false;
     }
     reservations.set(targetKey, {
@@ -4445,6 +5894,7 @@ async function reserveRefreshJob(env: Env, targetKey: string, jobId: string): Pr
       if (reservations.get(targetKey)?.jobId === jobId) {
         reservations.delete(targetKey);
       }
+      if (dirtyOnConflict) recordLocalRefreshDirty(env, targetKey, dirtyOnConflict);
       return false;
     } catch (error) {
       if (reservations.get(targetKey)?.jobId === jobId) {
@@ -4461,7 +5911,7 @@ async function reserveRefreshJob(env: Env, targetKey: string, jobId: string): Pr
     const response = await env.DASHBOARD_LOCKS.get(id).fetch(
       new Request("https://releasebar.internal/job/reserve", {
         method: "POST",
-        body: JSON.stringify({ jobId }),
+        body: JSON.stringify({ jobId, dirtyOnConflict }),
       }),
     );
     if (response.status === 409) return false;
@@ -4489,21 +5939,34 @@ async function releaseRefreshJobReservation(
   env: Env,
   targetKey: string,
   jobId: string,
-): Promise<void> {
+  consumeDirty = false,
+): Promise<StoredRefreshDirty | null> {
   const reservations = localRefreshJobReservationStore(env);
+  let localDirty: StoredRefreshDirty | null = null;
   if (reservations.get(targetKey)?.jobId === jobId) {
     reservations.delete(targetKey);
+    if (consumeDirty) {
+      localDirty = takeLocalRefreshDirty(env, targetKey);
+    }
   }
-  if (!env.DASHBOARD_LOCKS) return;
+  if (!env.DASHBOARD_LOCKS) return localDirty;
   try {
     const id = env.DASHBOARD_LOCKS.idFromName(targetKey);
     const response = await env.DASHBOARD_LOCKS.get(id).fetch(
       new Request("https://releasebar.internal/job/release", {
         method: "POST",
-        body: JSON.stringify({ jobId }),
+        body: JSON.stringify({ jobId, consumeDirty }),
       }),
     );
-    if (response.ok) return;
+    if (response.ok) {
+      if (response.status === 200) {
+        const dirty = (await response.json()) as StoredRefreshDirty;
+        if (typeof dirty.observedAt === "string" && typeof dirty.reason === "string") {
+          return dirty;
+        }
+      }
+      return localDirty;
+    }
     await auditSyncEvent(env, {
       event: "job_reservation_release_failed",
       targetKey,
@@ -4520,6 +5983,7 @@ async function releaseRefreshJobReservation(
       reason: errorMessage(error),
     }).catch(() => undefined);
   }
+  return localDirty;
 }
 
 async function enqueueRefreshJob(
@@ -4529,7 +5993,11 @@ async function enqueueRefreshJob(
   reason: string,
   delaySeconds = refreshQueueDeliveryDelaySeconds,
 ): Promise<RefreshJob | null> {
-  if (reason !== "manual-refresh" && refreshTargetBackoffActive(target)) {
+  if (
+    reason !== "manual-refresh" &&
+    !reason.startsWith("webhook:") &&
+    refreshTargetBackoffActive(target)
+  ) {
     await auditSyncEvent(env, {
       event: "job_enqueue_skip",
       targetKey: target.key,
@@ -4540,7 +6008,10 @@ async function enqueueRefreshJob(
     return null;
   }
   const job = refreshJob(target, reason);
-  if (!(await reserveRefreshJob(env, target.key, job.id))) {
+  const dirtyOnConflict = reason.startsWith("webhook:")
+    ? { observedAt: new Date().toISOString(), reason }
+    : undefined;
+  if (!(await reserveRefreshJob(env, target.key, job.id, dirtyOnConflict))) {
     await auditSyncEvent(env, {
       event: "job_enqueue_skip",
       targetKey: target.key,
@@ -4563,8 +6034,14 @@ async function enqueueRefreshJob(
       });
     } else {
       context.waitUntil(
-        processRefreshJobFallback(job, env).finally(() =>
-          releaseRefreshJobReservation(env, target.key, job.id),
+        processRefreshJobFallback(job, env).then(
+          async (result) => {
+            await finishRefreshJobReservation(env, context, result);
+          },
+          async (error) => {
+            await finishRefreshJobReservation(env, context, job);
+            throw error;
+          },
         ),
       );
     }
@@ -4581,6 +6058,36 @@ async function enqueueRefreshJob(
     throw error;
   }
   return job;
+}
+
+async function finishRefreshJobReservation(
+  env: Env,
+  context: ExecutionContext,
+  job: RefreshJob,
+): Promise<void> {
+  const dirty = await releaseRefreshJobReservation(env, job.targetKey, job.id, true);
+  if (!dirty) return;
+  const target = job.target ?? (await readRefreshTarget(env, job.targetKey));
+  if (!target) {
+    await auditSyncEvent(env, {
+      event: "job_followup_failed",
+      targetKey: job.targetKey,
+      jobId: job.id,
+      status: "failed",
+      reason: "target missing",
+      detail: `webhookReason=${dirty.reason}`,
+    });
+    return;
+  }
+  await invalidateDashboardTargets(env, [target]);
+  const followup = await enqueueRefreshJob(env, context, target, `${dirty.reason}:follow-up`, 0);
+  await auditSyncEvent(env, {
+    event: followup ? "job_followup_enqueue" : "job_followup_defer",
+    targetKey: target.key,
+    jobId: followup?.id ?? job.id,
+    status: followup ? "queued" : "reserved",
+    reason: dirty.reason,
+  });
 }
 
 function refreshTargetDue(
@@ -4693,6 +6200,7 @@ async function schedulerTargetDue(
 
 async function schedulerDueOptions(env: Env): Promise<SchedulerDueOptions> {
   const operations = [
+    githubGraphqlOwnerCountsOperation,
     "ReleaseBarOwnerRepos.metadata",
     githubGraphqlOwnerReleaseOperation,
     githubGraphqlRepoDetailsOperation,
@@ -4714,6 +6222,133 @@ async function schedulerDueOptions(env: Env): Promise<SchedulerDueOptions> {
   };
 }
 
+async function mapConcurrent<T, R>(
+  values: T[],
+  concurrency: number,
+  operation: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const results = Array.from<R>({ length: values.length });
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+      while (next < values.length) {
+        const index = next;
+        next += 1;
+        results[index] = await operation(values[index]!);
+      }
+    }),
+  );
+  return results;
+}
+
+async function refreshOwnerCounts(
+  env: Env,
+  owner: string,
+  requiredRepo?: string,
+  context?: ExecutionContext,
+): Promise<{
+  status: "refreshed" | "missing" | "missing-repo" | "deferred";
+  exact?: OwnerRepoCount;
+}> {
+  const snapshot = await readOwnerMetadata(env, owner);
+  if (!snapshot) return { status: "missing" };
+  const observedAt = new Date().toISOString();
+  const token = await sourceInstallationToken(
+    env,
+    { owners: [owner], repos: [] },
+    { discover: false },
+  ).catch(() => null);
+  const quotaSource = token?.quotaSource ?? (env.GITHUB_TOKEN ? "shared" : "anonymous");
+  if (quotaSource === "anonymous") return { status: "deferred" };
+  if (
+    quotaSource === "shared" &&
+    ((await sharedQuotaCooldown(env))?.active ||
+      (await graphqlBackoffActive(env, quotaSource, null, githubGraphqlOwnerCountsOperation)))
+  ) {
+    return { status: "deferred" };
+  }
+  const result = await fetchOwnerRepoCounts({
+    owner,
+    token: token?.token ?? env.GITHUB_TOKEN,
+    quotaSource,
+    quotaAccount: token?.quotaAccount ?? null,
+    limit: 500,
+    fetch: auditGitHubFetch("dashboard", quotaSource, token?.quotaAccount ?? null, env, context),
+  });
+  await mutateOwnerMetadataSnapshot(env, owner, {
+    kind: "counts",
+    updatedAt: observedAt,
+    counts: result.repos,
+    complete: result.complete,
+  });
+  await env.DASHBOARD_CACHE?.delete?.(hotCacheKey);
+  const exact = requiredRepo
+    ? result.repos.find((repo) => repo.fullName.toLowerCase() === requiredRepo.toLowerCase())
+    : undefined;
+  if (requiredRepo && !exact) return { status: "missing-repo" };
+  return { status: "refreshed", exact };
+}
+
+async function refreshDueOwnerCounts(
+  env: Env,
+  context: ExecutionContext,
+  targets: RefreshTarget[],
+  now = Date.now(),
+): Promise<{ considered: number; refreshed: number; deferred: number; failed: number }> {
+  const owners = [
+    ...new Set(
+      targets
+        .filter((target) => now - safeIso(target.lastSeenAt) < schedulerRecentViewMs)
+        .flatMap((target) => [
+          ...target.owners,
+          ...target.repos.map((repo) => repo.split("/")[0] ?? ""),
+        ])
+        .map(slugOwner)
+        .filter(validOwnerSlug),
+    ),
+  ];
+  const cursor = await env.DASHBOARD_CACHE?.get(refreshOwnerCountCursorKey);
+  const cursorIndex = cursor ? owners.indexOf(cursor) : -1;
+  const rotatedOwners =
+    cursorIndex >= 0
+      ? [...owners.slice(cursorIndex + 1), ...owners.slice(0, cursorIndex + 1)]
+      : owners;
+  const due: string[] = [];
+  for (const owner of rotatedOwners) {
+    const snapshot = await readOwnerMetadata(env, owner);
+    if (
+      snapshot &&
+      now - safeIso(snapshot.countsAttemptedAt) >=
+        schedulerCountRefreshMs + jitterMs(owner, 3 * 60 * 1000)
+    ) {
+      due.push(owner);
+    }
+    if (due.length >= schedulerCountOwnerLimit) break;
+  }
+  if (due.length > 0) {
+    await env.DASHBOARD_CACHE?.put(refreshOwnerCountCursorKey, due.at(-1)!);
+  }
+  let refreshed = 0;
+  let deferred = 0;
+  let failed = 0;
+  await mapConcurrent(due, schedulerCountConcurrency, async (owner) => {
+    try {
+      const result = await refreshOwnerCounts(env, owner, undefined, context);
+      if (result.status === "refreshed") refreshed += 1;
+      if (result.status === "deferred") deferred += 1;
+    } catch (error) {
+      failed += 1;
+      await auditSyncEvent(env, {
+        event: "owner_counts_failed",
+        status: "failed",
+        account: owner,
+        reason: errorMessage(error),
+      });
+    }
+  });
+  return { considered: owners.length, refreshed, deferred, failed };
+}
+
 async function schedulerTick(
   env: Env,
   context: ExecutionContext,
@@ -4725,6 +6360,8 @@ async function schedulerTick(
     listRefreshJobs(env),
     schedulerDueOptions(env),
   ]);
+  await backfillRefreshTargetIndexes(env, targets);
+  const countRefresh = await refreshDueOwnerCounts(env, context, targets, dueOptions.now);
   const activeTargetKeys = new Set(
     jobs.filter((job) => refreshJobActive(job)).map((job) => job.targetKey),
   );
@@ -4760,6 +6397,7 @@ async function schedulerTick(
       considered: targets.length,
       due: due.length,
       enqueued,
+      countRefresh,
     }),
     { expirationTtl: dashboardStorageTtlSeconds },
   );
@@ -4767,7 +6405,7 @@ async function schedulerTick(
     event: "scheduler_tick",
     status: "ok",
     reason: cause,
-    detail: `considered=${targets.length} active=${activeTargetKeys.size} due=${due.length} enqueued=${enqueued}`,
+    detail: `considered=${targets.length} active=${activeTargetKeys.size} due=${due.length} enqueued=${enqueued} counts=${countRefresh.refreshed}/${countRefresh.considered} countFailed=${countRefresh.failed}`,
   });
   return { enqueued, considered: targets.length, due: due.length };
 }
@@ -5260,6 +6898,10 @@ function progressTombstoneKey(key: string): string {
 
 function isStoredBuildProgress(value: unknown): value is StoredBuildProgress {
   const progress = value as StoredBuildProgress | null;
+  const validOptionalIso = (timestamp: unknown) =>
+    timestamp === undefined ||
+    timestamp === null ||
+    (typeof timestamp === "string" && safeIso(timestamp) > 0);
   return Boolean(
     progress &&
     Array.isArray(progress.scannedRepos) &&
@@ -5267,6 +6909,16 @@ function isStoredBuildProgress(value: unknown): value is StoredBuildProgress {
     (progress.generationStartedAt === undefined ||
       (typeof progress.generationStartedAt === "string" &&
         safeIso(progress.generationStartedAt) > 0)) &&
+    validOptionalIso(progress.countsUpdatedAt) &&
+    (progress.projectCountsUpdatedAt === undefined ||
+      (progress.projectCountsUpdatedAt !== null &&
+        typeof progress.projectCountsUpdatedAt === "object" &&
+        !Array.isArray(progress.projectCountsUpdatedAt) &&
+        Object.values(progress.projectCountsUpdatedAt).every(
+          (timestamp) => typeof timestamp === "string" && safeIso(timestamp) > 0,
+        ))) &&
+    validOptionalIso(progress.releasesUpdatedAt) &&
+    validOptionalIso(progress.ciUpdatedAt) &&
     typeof progress.updatedAt === "string" &&
     safeIso(progress.updatedAt) > 0,
   );
@@ -5544,25 +7196,185 @@ async function partialDashboardPayload(
     ),
   ];
   const dashboards = (
-    await Promise.all([...new Set(keys)].map((key) => readCached(env, key)))
+    await Promise.all([...new Set(keys)].map((key) => readCachedWithOwnerMetadata(env, key)))
   ).filter(
     (payload): payload is DashboardPayload =>
       canDisplayCached(payload) && payload.cache?.state !== "error" && payload.projects.length > 0,
   );
-  if (dashboards.length === 0) return null;
+  const snapshotOwners = [
+    ...new Set([
+      ...ownerSlugs.map(slugOwner),
+      ...dashboard.includeRepos.map((repo) => slugOwner(repo.split("/")[0] ?? "")),
+    ]),
+  ].filter(validOwnerSlug);
+  const ownerSnapshots = (
+    await Promise.all(snapshotOwners.map((owner) => readDurableOwnerMetadata(env, owner)))
+  ).filter((snapshot): snapshot is OwnerMetadataSnapshot =>
+    Boolean(snapshot && canDisplayOwnerMetadata(snapshot)),
+  );
+  if (dashboards.length === 0 && ownerSnapshots.length === 0) return null;
 
+  const requestedOwners = new Set(ownerSlugs.map(slugOwner));
+  const requestedRepos = new Set(dashboard.includeRepos.map((repo) => repo.toLowerCase()));
+  const hiddenOwners = new Set(dashboard.profile?.hiddenOwners ?? []);
+  const hiddenRepos = new Set(dashboard.profile?.hiddenRepos ?? []);
+  const snapshotProjectVisible = (project: Project, checkRelease = true) => {
+    const owner = slugOwner(project.owner);
+    const fullName = project.fullName.toLowerCase();
+    if (!requestedOwners.has(owner) && !requestedRepos.has(fullName)) return false;
+    if (hiddenOwners.has(owner) || hiddenRepos.has(fullName)) return false;
+    if (!options.includeForks && project.fork) return false;
+    if (!options.includeArchived && project.archived) return false;
+    if (checkRelease && !options.includeUnreleased && !project.releaseDate) return false;
+    return true;
+  };
   const projectsByName = new Map<string, Project>();
+  const metadataUpdatedByName = new Map<string, number>();
+  const countsUpdatedByName = new Map<string, number>();
   for (const payload of dashboards) {
     for (const project of payload.projects) {
-      projectsByName.set(project.fullName.toLowerCase(), project);
+      if (!snapshotProjectVisible(project)) continue;
+      const fullName = project.fullName.toLowerCase();
+      const metadataUpdatedAt = safeIso(payload.generatedAt);
+      if (metadataUpdatedAt >= (metadataUpdatedByName.get(fullName) ?? 0)) {
+        projectsByName.set(fullName, project);
+        metadataUpdatedByName.set(fullName, metadataUpdatedAt);
+        countsUpdatedByName.set(
+          fullName,
+          safeIso(
+            payload.cache?.projectCountsUpdatedAt?.[fullName] ?? payload.cache?.countsUpdatedAt,
+          ),
+        );
+      }
     }
   }
-  const projects = [...projectsByName.values()];
+  for (const snapshot of ownerSnapshots) {
+    const snapshotCountsUpdatedAt = safeIso(snapshot.countsUpdatedAt);
+    if (snapshot.knownRepos) {
+      for (const [fullName, project] of projectsByName) {
+        if (
+          slugOwner(project.owner) === snapshot.owner &&
+          snapshotCountsUpdatedAt > (countsUpdatedByName.get(fullName) ?? 0) &&
+          !snapshot.knownRepos.includes(fullName)
+        ) {
+          projectsByName.delete(fullName);
+          metadataUpdatedByName.delete(fullName);
+          countsUpdatedByName.delete(fullName);
+        }
+      }
+    }
+    for (const metadata of snapshot.projects) {
+      const fullName = metadata.fullName.toLowerCase();
+      if (
+        !canDisplayOwnerProjectMetadata(snapshot, fullName) ||
+        !snapshotProjectVisible(metadata)
+      ) {
+        continue;
+      }
+      const snapshotMetadataUpdatedAt = safeIso(snapshot.projectMetadataUpdatedAt[fullName]);
+      const snapshotProjectCountsUpdatedAt = safeIso(snapshot.projectCountsUpdatedAt[fullName]);
+      if (snapshot.removedRepos[fullName]) {
+        projectsByName.delete(fullName);
+        metadataUpdatedByName.delete(fullName);
+        countsUpdatedByName.delete(fullName);
+        continue;
+      }
+      const existing = projectsByName.get(fullName);
+      const applyMetadata =
+        !existing || snapshotMetadataUpdatedAt > (metadataUpdatedByName.get(fullName) ?? 0);
+      const applyCounts =
+        canDisplayOwnerProjectCounts(snapshot, fullName) &&
+        snapshotProjectCountsUpdatedAt > (countsUpdatedByName.get(fullName) ?? 0);
+      const metadataOnly = projectWithoutReleaseData(metadata);
+      const merged =
+        existing && applyMetadata
+          ? mergeProjectMetadata(existing, metadataOnly)
+          : (existing ?? metadataOnly);
+      const counts = snapshot.countOverlays[fullName];
+      const metadataClock = applyMetadata
+        ? snapshotMetadataUpdatedAt
+        : (metadataUpdatedByName.get(fullName) ?? 0);
+      const project =
+        applyCounts && counts
+          ? snapshotProjectCountsUpdatedAt >= metadataClock
+            ? mergeProjectCountFields(merged, counts)
+            : mergeProjectIssuePullCounts(merged, counts)
+          : merged;
+      if (snapshotProjectVisible(project, false)) {
+        projectsByName.set(fullName, project);
+        if (applyMetadata) metadataUpdatedByName.set(fullName, snapshotMetadataUpdatedAt);
+        if (applyCounts) countsUpdatedByName.set(fullName, snapshotProjectCountsUpdatedAt);
+      } else {
+        projectsByName.delete(fullName);
+        metadataUpdatedByName.delete(fullName);
+        countsUpdatedByName.delete(fullName);
+      }
+    }
+    for (const [fullName, counts] of Object.entries(snapshot.countOverlays)) {
+      if (
+        snapshot.removedRepos[fullName] ||
+        !canDisplayOwnerProjectCounts(snapshot, fullName) ||
+        safeIso(snapshot.projectCountsUpdatedAt[fullName]) <=
+          (countsUpdatedByName.get(fullName) ?? 0)
+      ) {
+        continue;
+      }
+      const existing = projectsByName.get(fullName);
+      if (!existing || counts.private) continue;
+      const countClock = safeIso(snapshot.projectCountsUpdatedAt[fullName]);
+      const project =
+        countClock >= (metadataUpdatedByName.get(fullName) ?? 0)
+          ? mergeProjectCountFields(existing, counts)
+          : mergeProjectIssuePullCounts(existing, counts);
+      if (snapshotProjectVisible(project, false)) {
+        projectsByName.set(fullName, project);
+        countsUpdatedByName.set(fullName, safeIso(snapshot.projectCountsUpdatedAt[fullName]));
+      } else {
+        projectsByName.delete(fullName);
+        metadataUpdatedByName.delete(fullName);
+        countsUpdatedByName.delete(fullName);
+      }
+    }
+  }
+  const ownerCounts = new Map<string, number>();
+  const projects = [...projectsByName.values()]
+    .sort((left, right) => safeIso(right.pushedAt) - safeIso(left.pushedAt))
+    .filter((project) => {
+      const fullName = project.fullName.toLowerCase();
+      if (requestedRepos.has(fullName)) return true;
+      const owner = slugOwner(project.owner);
+      const count = ownerCounts.get(owner) ?? 0;
+      if (count >= repoLimit) return false;
+      ownerCounts.set(owner, count + 1);
+      return true;
+    });
   const generatedAt = dashboards
     .map((payload) => payload.generatedAt)
+    .concat(ownerSnapshots.map((snapshot) => snapshot.generatedAt))
     .filter((value) => !Number.isNaN(Date.parse(value)))
     .sort()[0];
   const firstQuota = dashboards.find((payload) => payload.cache?.quota)?.cache?.quota;
+  const oldestCompleteTimestamp = (values: Array<string | null | undefined>) => {
+    if (values.length === 0 || values.some((value) => !value)) return null;
+    return [...values].sort()[0] ?? null;
+  };
+  const countsUpdatedAt = oldestCompleteTimestamp([
+    ...dashboards.map((payload) => payload.cache?.countsUpdatedAt),
+    ...ownerSnapshots.map((snapshot) => snapshot.countsUpdatedAt),
+  ]);
+  const projectCountsUpdatedAt = Object.fromEntries(
+    projects.flatMap((project) => {
+      const fullName = project.fullName.toLowerCase();
+      const updatedAt = countsUpdatedByName.get(fullName);
+      return updatedAt ? [[fullName, new Date(updatedAt).toISOString()]] : [];
+    }),
+  );
+  const releasesUpdatedAt = oldestCompleteTimestamp(
+    dashboards.map((payload) => payload.cache?.releasesUpdatedAt),
+  );
+  const ciUpdatedAt = oldestCompleteTimestamp(
+    dashboards.map((payload) => payload.cache?.ciUpdatedAt),
+  );
   return withProfile(
     {
       title: "ReleaseBar",
@@ -5580,8 +7392,12 @@ async function partialDashboardPayload(
         capped: dashboards.some((payload) => payload.cache?.capped),
         repoLimit,
         generatedAt: generatedAt ?? new Date().toISOString(),
+        countsUpdatedAt,
+        projectCountsUpdatedAt,
+        releasesUpdatedAt,
+        ciUpdatedAt,
         ...(firstQuota ? { quota: firstQuota } : {}),
-        message: `showing cached data from ${dashboards.length} source${dashboards.length === 1 ? "" : "s"} while the combined dashboard updates`,
+        message: `showing cached data from ${dashboards.length + ownerSnapshots.length} source${dashboards.length + ownerSnapshots.length === 1 ? "" : "s"} while the combined dashboard updates`,
       },
       totals: dashboardTotals(projects),
       projects,
@@ -5609,8 +7425,9 @@ async function readCachedDashboards(env: Env): Promise<DashboardPayload[]> {
   for (const key of keys.slice(0, hotSourceLimit)) {
     const raw = await env.DASHBOARD_CACHE.get(key);
     if (!raw) continue;
-    const payload = tryJsonParse<DashboardPayload>(raw, `dashboard ${key}`);
-    if (!canDisplayCached(payload)) continue;
+    const rawPayload = tryJsonParse<DashboardPayload>(raw, `dashboard ${key}`);
+    if (!canDisplayCached(rawPayload)) continue;
+    const payload = await mergeOwnerMetadata(env, rawPayload);
     if (
       payload.cache?.state === "error" ||
       payload.options?.includeForks ||
@@ -5708,7 +7525,7 @@ function hotDashboardPayload(
 }
 
 async function hotResponse(env: Env): Promise<Response> {
-  const cached = await readCached(env, hotCacheKey);
+  const cached = await readCachedWithOwnerMetadata(env, hotCacheKey);
   const ageMs = cacheAgeMs(cached);
   if (cached && canDisplayCached(cached) && ageMs < hotCacheTtlMs) {
     return jsonResponse(withCacheState(cached, "fresh"));
@@ -5720,7 +7537,7 @@ async function hotResponse(env: Env): Promise<Response> {
 }
 
 async function cachedHotInitialData(env: Env): Promise<InitialPageData | null> {
-  const cached = await readCached(env, hotCacheKey);
+  const cached = await readCachedWithOwnerMetadata(env, hotCacheKey);
   if (!cached || !canDisplayCached(cached) || cached.cache?.state === "error") return null;
   return {
     route: "dashboard",
@@ -6620,6 +8437,30 @@ function activityTotals(events: OwnerActivityEvent[]): OwnerActivityPayload["tot
   };
 }
 
+async function publicOwnerActivity(
+  env: Env,
+  payload: OwnerActivityPayload,
+): Promise<OwnerActivityPayload | null> {
+  const privateNames = await privateRepositoryNames(
+    env,
+    payload.events.map((event) => event.repo),
+  );
+  if (!privateNames) return null;
+  if (privateNames.size === 0) return payload;
+  const events = payload.events.filter((event) => !privateNames.has(event.repo.toLowerCase()));
+  return {
+    ...payload,
+    totals: activityTotals(events),
+    repositories: activityRepositories(events),
+    events,
+    summary: unavailableActivitySummary(
+      activitySummaryModel(env),
+      null,
+      "Private repository activity was removed.",
+    ),
+  };
+}
+
 function activitySummaryModel(env: Env): string {
   return env.OPENAI_SUMMARY_MODEL || "chat-latest";
 }
@@ -7072,7 +8913,8 @@ async function refreshOwnerActivitySummary(
   if (!lock) return;
   try {
     const summary = await summarizeOwnerActivity(payload, env);
-    const latest = (await readOwnerActivity(env, key)) ?? payload;
+    const latest = await publicOwnerActivity(env, (await readOwnerActivity(env, key)) ?? payload);
+    if (!latest) return;
     const latestInputHash = (await sha256Base64Url(activitySummaryInput(latest))).slice(0, 32);
     if (
       latest.owner.login.toLowerCase() !== payload.owner.login.toLowerCase() ||
@@ -7087,7 +8929,8 @@ async function refreshOwnerActivitySummary(
       summary,
     });
   } catch (error) {
-    const latest = (await readOwnerActivity(env, key)) ?? payload;
+    const latest = await publicOwnerActivity(env, (await readOwnerActivity(env, key)) ?? payload);
+    if (!latest) return;
     const latestInputHash = (await sha256Base64Url(activitySummaryInput(latest))).slice(0, 32);
     if (
       latest.owner.login.toLowerCase() !== payload.owner.login.toLowerCase() ||
@@ -7125,7 +8968,11 @@ async function refreshOwnerActivity(
   const lock = await acquireBuildLock(env, key);
   if (!lock) return;
   try {
-    const payload = await buildOwnerActivity(ownerSlug, range, request, env);
+    const payload = await publicOwnerActivity(
+      env,
+      await buildOwnerActivity(ownerSlug, range, request, env),
+    );
+    if (!payload) return;
     await writeOwnerActivity(env, key, payload);
     if (ownerActivitySummaryNeedsRefresh(payload, env)) {
       await refreshOwnerActivitySummary(key, payload, env);
@@ -7147,7 +8994,8 @@ async function ownerActivityResponse(
   }
   const range = activityRangeFromUrl(url);
   const key = ownerActivityCacheKey(ownerSlug, range);
-  const cached = await readOwnerActivity(env, key);
+  const rawCached = await readOwnerActivity(env, key);
+  const cached = rawCached ? await publicOwnerActivity(env, rawCached) : null;
   const age = ownerActivityAgeMs(cached);
   const allowRefresh = allowRequestRefresh(request);
   if (cached && age < activityCacheTtlMs(range)) {
@@ -7179,7 +9027,13 @@ async function ownerActivityResponse(
   }
 
   try {
-    const payload = await buildOwnerActivity(ownerSlug, range, request, env);
+    const payload = await publicOwnerActivity(
+      env,
+      await buildOwnerActivity(ownerSlug, range, request, env),
+    );
+    if (!payload) {
+      throw new Error("repository privacy metadata unavailable");
+    }
     await writeOwnerActivity(env, key, payload);
     if (allowRefresh && ownerActivitySummaryNeedsRefresh(payload, env)) {
       context.waitUntil(refreshOwnerActivitySummary(key, payload, env).catch(() => undefined));
@@ -7324,9 +9178,15 @@ async function repoActivityResponse(
   if (!validRepoSlug(fullName)) {
     return jsonResponse({ error: "invalid repository" }, 400, { "cache-control": "no-store" });
   }
+  const barrier = await repositoryPublicCacheBarrier(env, fullName);
+  if (barrier === "blocked") {
+    return jsonResponse({ error: "repository unavailable" }, 404, {
+      "cache-control": "no-store",
+    });
+  }
   const range = activityRangeFromUrl(url);
   const key = repoActivityCacheKey(owner, repo, range);
-  const cached = await readRepoActivity(env, key);
+  const cached = barrier === "clear" ? await readRepoActivity(env, key) : null;
   const age = repoActivityAgeMs(cached);
   const allowRefresh = allowRequestRefresh(request);
   if (cached && age < activityCacheTtlMs(range)) {
@@ -7463,7 +9323,8 @@ function repoAudienceAgeMs(payload: RepoAudiencePayload | null): number {
 
 async function readRepoAudience(env: Env, key: string): Promise<RepoAudiencePayload | null> {
   const raw = await env.DASHBOARD_CACHE?.get(key);
-  return raw ? tryJsonParse<RepoAudiencePayload>(raw, `repo audience ${key}`) : null;
+  const payload = raw ? tryJsonParse<RepoAudiencePayload>(raw, `repo audience ${key}`) : null;
+  return payload ? publicRepoAudience(env, payload) : null;
 }
 
 async function writeRepoAudience(
@@ -7512,9 +9373,10 @@ async function readAudienceUserRepos(
   login: string,
 ): Promise<GitHubUserRepository[] | null> {
   const raw = await env.DASHBOARD_CACHE?.get(repoAudienceUserReposKey(login));
-  return raw
+  const repos = raw
     ? safeJsonParse(gitHubUserRepositoryListSchema, raw, `audience user repos ${login}`)
     : null;
+  return repos ? publicAudienceRepositories(env, repos) : null;
 }
 
 async function writeAudienceUserRepos(
@@ -7522,7 +9384,9 @@ async function writeAudienceUserRepos(
   login: string,
   repos: GitHubUserRepository[],
 ): Promise<void> {
-  await env.DASHBOARD_CACHE?.put(repoAudienceUserReposKey(login), JSON.stringify(repos), {
+  const publicRepos = await publicAudienceRepositories(env, repos);
+  if (!publicRepos) return;
+  await env.DASHBOARD_CACHE?.put(repoAudienceUserReposKey(login), JSON.stringify(publicRepos), {
     expirationTtl: repoAudienceUserTtlSeconds,
   });
 }
@@ -7811,7 +9675,13 @@ async function audienceUserRepos(
     undefined,
     env,
   );
-  const publicRepos = repos.filter(isPublicAudienceRepository);
+  const publicRepos = await publicAudienceRepositories(
+    env,
+    repos.filter(isPublicAudienceRepository),
+  );
+  if (!publicRepos) {
+    throw new Error("repository privacy metadata unavailable");
+  }
   await writeAudienceUserRepos(env, login, publicRepos);
   return publicRepos;
 }
@@ -7820,6 +9690,19 @@ function isPublicAudienceRepository(repo: GitHubUserRepository): boolean {
   if (repo.private === true) return false;
   if (repo.visibility && repo.visibility !== "public") return false;
   return true;
+}
+
+async function publicAudienceRepositories(
+  env: Env,
+  repos: GitHubUserRepository[],
+): Promise<GitHubUserRepository[] | null> {
+  const privateNames = await privateRepositoryNames(
+    env,
+    repos.map((repo) => repo.full_name),
+  );
+  return privateNames
+    ? repos.filter((repo) => !privateNames.has(repo.full_name.toLowerCase()))
+    : null;
 }
 
 async function audienceUserInsights(
@@ -7947,6 +9830,27 @@ function audienceUser(
   };
 }
 
+async function publicRepoAudience(
+  env: Env,
+  payload: RepoAudiencePayload,
+): Promise<RepoAudiencePayload | null> {
+  const privateNames = await privateRepositoryNames(
+    env,
+    payload.users.flatMap((user) => (user.topRepositories ?? []).map((repo) => repo.fullName)),
+  );
+  if (!privateNames) return null;
+  if (privateNames.size === 0) return payload;
+  return {
+    ...payload,
+    users: payload.users.map((user) => ({
+      ...user,
+      topRepositories: (user.topRepositories ?? []).filter(
+        (repo) => !privateNames.has(repo.fullName.toLowerCase()),
+      ),
+    })),
+  };
+}
+
 function roundedPercent(value: number, total: number): number {
   if (total <= 0) return 0;
   return Math.round((value / total) * 100);
@@ -7988,7 +9892,35 @@ function trustProfileAgeMs(payload: TrustProfilePayload | null): number {
 
 async function readTrustProfile(env: Env, key: string): Promise<TrustProfilePayload | null> {
   const raw = await env.DASHBOARD_CACHE?.get(key);
-  return raw ? tryJsonParse<TrustProfilePayload>(raw, `trust profile ${key}`) : null;
+  const payload = raw ? tryJsonParse<TrustProfilePayload>(raw, `trust profile ${key}`) : null;
+  return payload ? publicTrustProfile(env, payload) : null;
+}
+
+async function publicTrustProfile(
+  env: Env,
+  payload: TrustProfilePayload,
+): Promise<TrustProfilePayload | null> {
+  const privateNames = await privateRepositoryNames(
+    env,
+    (payload.topRepositories ?? []).map((repo) => repo.fullName),
+  );
+  if (!privateNames) return null;
+  if (privateNames.size === 0) return payload;
+  return {
+    ...payload,
+    topRepositories: (payload.topRepositories ?? []).filter(
+      (repo) => !privateNames.has(repo.fullName.toLowerCase()),
+    ),
+    stats: {
+      ...payload.stats,
+      totalStars: 0,
+      totalForks: 0,
+      recentRepositories: 0,
+      activeRepositories: 0,
+      languages: [],
+      topics: [],
+    },
+  };
 }
 
 function userTrustSignal(profile: TrustProfilePayload | null): UserTrustSignal | null {
@@ -8060,7 +9992,9 @@ async function writeTrustProfile(
   key: string,
   payload: TrustProfilePayload,
 ): Promise<void> {
-  await env.DASHBOARD_CACHE?.put(key, JSON.stringify(payload), {
+  const publicPayload = await publicTrustProfile(env, payload);
+  if (!publicPayload) return;
+  await env.DASHBOARD_CACHE?.put(key, JSON.stringify(publicPayload), {
     expirationTtl: dashboardStorageTtlSeconds,
   });
 }
@@ -8074,7 +10008,8 @@ async function refreshTrustProfile(
   const lock = await acquireBuildLock(env, `${key}:refresh`);
   if (!lock) return;
   try {
-    const payload = await buildTrustProfile(login, request, env);
+    const payload = await publicTrustProfile(env, await buildTrustProfile(login, request, env));
+    if (!payload) return;
     await writeTrustProfile(env, key, payload);
   } finally {
     await lock.release();
@@ -8412,7 +10347,10 @@ async function trustProfileResponse(
     return crawlerCacheOnlyResponse("cached trust profile unavailable for crawler");
   }
   try {
-    const payload = await buildTrustProfile(login, request, env);
+    const payload = await publicTrustProfile(env, await buildTrustProfile(login, request, env));
+    if (!payload) {
+      throw new Error("repository privacy metadata unavailable");
+    }
     await writeTrustProfile(env, key, payload);
     return jsonResponse(payload, 200, { "cache-control": "public, max-age=60" });
   } catch (error) {
@@ -8586,7 +10524,11 @@ async function refreshRepoAudience(
   const lock = await acquireBuildLock(env, `${key}:refresh`);
   if (!lock) return;
   try {
-    const payload = await buildRepoAudience(owner, repo, range, request, env, tokenOverride);
+    const payload = await publicRepoAudience(
+      env,
+      await buildRepoAudience(owner, repo, range, request, env, tokenOverride),
+    );
+    if (!payload) return;
     await writeRepoAudience(env, key, payload);
   } finally {
     await lock.release();
@@ -8606,9 +10548,15 @@ async function repoAudienceResponse(
   if (!validRepoSlug(fullName)) {
     return jsonResponse({ error: "invalid repository" }, 400, { "cache-control": "no-store" });
   }
+  const barrier = await repositoryPublicCacheBarrier(env, fullName);
+  if (barrier === "blocked") {
+    return jsonResponse({ error: "repository unavailable" }, 404, {
+      "cache-control": "no-store",
+    });
+  }
   const range = audienceRangeFromUrl(url);
   const key = repoAudienceCacheKey(owner, repo, range);
-  const cached = await readRepoAudience(env, key);
+  const cached = barrier === "clear" ? await readRepoAudience(env, key) : null;
   const ageMs = repoAudienceAgeMs(cached);
   const allowRefresh = allowRequestRefresh(request);
   if (cached && ageMs < repoAudienceCacheTtlMs) {
@@ -8660,7 +10608,13 @@ async function repoAudienceResponse(
   }
 
   try {
-    const payload = await buildRepoAudience(owner, repo, range, request, env, requestToken);
+    const payload = await publicRepoAudience(
+      env,
+      await buildRepoAudience(owner, repo, range, request, env, requestToken),
+    );
+    if (!payload) {
+      throw new Error("repository privacy metadata unavailable");
+    }
     await writeRepoAudience(env, key, payload);
     return jsonResponse(await withRepoAudienceTrustProfiles(payload, env), 200, {
       "cache-control": "public, max-age=60",
@@ -8694,6 +10648,12 @@ async function repoAudienceBackfillResponse(request: Request, env: Env): Promise
   if (!validRepoSlug(fullName)) {
     return jsonResponse({ error: "invalid repository" }, 400, { "cache-control": "no-store" });
   }
+  const barrier = await repositoryPublicCacheBarrier(env, fullName);
+  if (barrier === "blocked") {
+    return jsonResponse({ error: "repository unavailable" }, 404, {
+      "cache-control": "no-store",
+    });
+  }
   const requestToken = await requestInstallationToken(request, env, {
     owners: [],
     repos: [fullName],
@@ -8714,7 +10674,7 @@ async function repoAudienceBackfillResponse(request: Request, env: Env): Promise
   }> = [];
   for (const range of repoAudienceRanges) {
     const key = repoAudienceCacheKey(owner, repo, range);
-    const cached = await readRepoAudience(env, key);
+    const cached = barrier === "clear" ? await readRepoAudience(env, key) : null;
     const ageMs = repoAudienceAgeMs(cached);
     if (!force && cached && ageMs < repoAudienceCacheTtlMs) {
       ranges.push({
@@ -8736,7 +10696,13 @@ async function repoAudienceBackfillResponse(request: Request, env: Env): Promise
       continue;
     }
     try {
-      const payload = await buildRepoAudience(owner, repo, range, request, env, requestToken);
+      const payload = await publicRepoAudience(
+        env,
+        await buildRepoAudience(owner, repo, range, request, env, requestToken),
+      );
+      if (!payload) {
+        throw new Error("repository privacy metadata unavailable");
+      }
       await writeRepoAudience(env, key, payload);
       ranges.push({
         range,
@@ -9508,9 +11474,15 @@ async function repoDetailResponse(
   if (!validRepoSlug(fullName)) {
     return jsonResponse({ error: "invalid repository" }, 400, { "cache-control": "no-store" });
   }
+  const barrier = await repositoryPublicCacheBarrier(env, fullName);
+  if (barrier === "blocked") {
+    return jsonResponse({ error: "repository unavailable" }, 404, {
+      "cache-control": "no-store",
+    });
+  }
 
   const key = repoDetailCacheKey(owner, repo);
-  const cached = await readRepoDetail(env, key);
+  const cached = barrier === "clear" ? await readRepoDetail(env, key) : null;
   const ageMs = repoDetailAgeMs(cached);
   const allowRefresh = allowRequestRefresh(request);
   if (cached?.cache.state === "warming" && ageMs < repoDetailWarmingRefreshMs) {
@@ -9584,6 +11556,7 @@ async function repoDetailResponse(
 async function cachedRepoInitialData(env: Env, fullName: string): Promise<InitialPageData | null> {
   const [owner, repo] = fullName.split("/");
   if (!owner || !repo) return null;
+  if ((await repositoryPublicCacheBarrier(env, fullName)) !== "clear") return null;
   const cached = await readRepoDetail(env, repoDetailCacheKey(owner, repo));
   if (!cached || repoDetailAgeMs(cached) > maxDisplayStaleMs) return null;
   const payload =
@@ -10012,7 +11985,7 @@ async function discoverResponse(
   const period = discoverPeriod(url);
   const language = discoverLanguage(url);
   const key = discoverCacheKey(period, language);
-  const cached = await readCached(env, key);
+  const cached = await readCachedWithOwnerMetadata(env, key);
   const ageMs = cacheAgeMs(cached);
   const allowRefresh = allowRequestRefresh(request);
   if (cached && canDisplayCached(cached) && ageMs < discoverCacheTtlMs) {
@@ -10084,7 +12057,7 @@ async function discoverResponse(
 async function cachedDiscoverInitialData(env: Env, url: URL): Promise<InitialPageData | null> {
   const period = discoverPeriod(url);
   const language = discoverPageLanguage(url);
-  const cached = await readCached(env, discoverCacheKey(period, language));
+  const cached = await readCachedWithOwnerMetadata(env, discoverCacheKey(period, language));
   if (!cached || !canDisplayCached(cached) || cached.cache?.state === "error") return null;
   const state = discoverNeedsHydration(cached)
     ? "partial"
@@ -10131,22 +12104,43 @@ async function dashboardCacheKeyForPage(
       ? [primaryOwner, ...extraOwnerSlugs]
       : extraOwnerSlugs;
   const tokenSources = { owners: ownerSlugs, repos: includeRepos };
-  const allowRefresh = allowRequestRefresh(request);
-  const [token, sourceAppCovered] = allowRefresh
-    ? [await bestInstallationToken(request, env, tokenSources).catch(() => null), false]
-    : [null, await sourceInstallationRegistryCovers(env, tokenSources).catch(() => false)];
-  const includeReleaseData = await dashboardReleaseDataAllowed(request, env, tokenSources, token, {
-    sourceAppCovered,
-  });
-  return dashboardCacheKey({
+  const keyInput = {
     owner: primaryOwner ?? "custom",
     owners: extraOwnerSlugs,
     repos: includeRepos,
     salt: profile?.updatedAt,
     ...options,
-    includeReleaseData,
     schemaVersion: dashboardSchemaVersion,
+  };
+  const releaseKey = dashboardCacheKey({ ...keyInput, includeReleaseData: true });
+  const metadataKey = dashboardCacheKey({ ...keyInput, includeReleaseData: false });
+  const [releaseCached, registryCovered] = await Promise.all([
+    readCached(env, releaseKey),
+    sourceInstallationRegistryCovers(env, tokenSources).catch(() => false),
+  ]);
+  const unsyncedAppSource = appTokenConfigured(env) && !registryCovered;
+  const metadataPreferred =
+    unsyncedAppSource &&
+    !(await dashboardReleaseDataAllowed(request, env, tokenSources, null, {
+      sourceAppCovered: registryCovered,
+    }));
+  if (metadataPreferred) return metadataKey;
+  if (
+    releaseCached &&
+    releaseCached.cache?.state !== "error" &&
+    releaseCached.cache?.state !== "stale" &&
+    cacheAgeMs(releaseCached) < fullTtlMs
+  ) {
+    return releaseKey;
+  }
+  const allowRefresh = allowRequestRefresh(request);
+  const [token, sourceAppCovered] = allowRefresh
+    ? [await bestInstallationToken(request, env, tokenSources).catch(() => null), false]
+    : [null, registryCovered];
+  const includeReleaseData = await dashboardReleaseDataAllowed(request, env, tokenSources, token, {
+    sourceAppCovered,
   });
+  return includeReleaseData ? releaseKey : metadataKey;
 }
 
 async function cachedDashboardInitialData(
@@ -10156,14 +12150,9 @@ async function cachedDashboardInitialData(
   primaryOwner: string | null,
 ): Promise<InitialPageData | null> {
   const key = await dashboardCacheKeyForPage(request, url, env, primaryOwner);
-  const cached = key ? await readCached(env, key) : null;
+  const cached = key ? await readCachedWithOwnerMetadata(env, key) : null;
   if (!cached || !canDisplayCached(cached) || cached.cache?.state === "error") return null;
-  const state =
-    cached.cache?.progress?.done === false
-      ? "partial"
-      : cacheAgeMs(cached) < fullTtlMs
-        ? "fresh"
-        : "stale";
+  const state = dashboardStreamState(cached);
   return { route: "dashboard", payload: withCacheState(cached, state) };
 }
 
@@ -10229,10 +12218,11 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-function dashboardStreamState(
+export function dashboardStreamState(
   payload: DashboardPayload,
 ): NonNullable<DashboardPayload["cache"]>["state"] {
   if (payload.cache?.progress?.done === false) return "partial";
+  if (payload.cache?.state === "stale" || payload.cache?.stale) return "stale";
   return cacheAgeMs(payload) < fullTtlMs ? "fresh" : "stale";
 }
 
@@ -10240,30 +12230,7 @@ export function dashboardStreamSignature(
   payload: DashboardPayload,
   state: NonNullable<DashboardPayload["cache"]>["state"] = dashboardStreamState(payload),
 ): string {
-  const progress = payload.cache?.progress;
-  const projects = payload.projects
-    .map((project) =>
-      [
-        project.fullName,
-        project.openIssues,
-        project.openPullRequests,
-        project.commitsSinceRelease ?? "",
-        project.latestCommitSha ?? "",
-        project.ciState,
-        project.ciStatus ?? "",
-        project.ciConclusion ?? "",
-        project.version,
-      ].join(":"),
-    )
-    .join("|");
-  return [
-    payload.generatedAt,
-    state,
-    progress?.scanned ?? "",
-    progress?.done ?? "",
-    payload.projects.length,
-    projects,
-  ].join(":");
+  return JSON.stringify({ state, payload });
 }
 
 async function ownerEventsResponse(request: Request, env: Env): Promise<Response> {
@@ -10290,7 +12257,7 @@ async function ownerEventsResponse(request: Request, env: Env): Promise<Response
       let lastSignature = "";
       let sent = 0;
       for (let attempt = 0; attempt < 60; attempt += 1) {
-        const payload = await readCached(env, parts.key);
+        const payload = await readCachedWithOwnerMetadata(env, parts.key);
         if (canDisplayCached(payload)) {
           const state = dashboardStreamState(payload);
           const next = withCacheState(payload, state);
@@ -10405,10 +12372,14 @@ async function rebuild(
   signal?: AbortSignal,
 ): Promise<DashboardPayload> {
   const startedAt = Date.now();
-  const [storedProgress, generationStartedAt] = await Promise.all([
+  const [storedProgress, existingCached] = await Promise.all([
     readProgress(env, dashboard.key),
-    beginProgressGeneration(env, dashboard.key),
+    readCachedRaw(env, dashboard.key),
   ]);
+  const generationStartedAt =
+    storedProgress?.generationStartedAt ??
+    storedProgress?.updatedAt ??
+    (await beginProgressGeneration(env, dashboard.key));
   await auditSyncEvent(env, {
     event: "dashboard_build_start",
     targetKey: dashboard.key,
@@ -10422,6 +12393,8 @@ async function rebuild(
   });
   const scannedRepos = new Set(storedProgress?.scannedRepos ?? []);
   const progressProjects = storedProgress?.projects ?? [];
+  const removedOwnerRepos = new Set<string>();
+  const observedOwnerProjects = new Map<string, Project>();
   let lastProgressWriteAt = 0;
   const saveProgress = async (
     payload: DashboardPayload,
@@ -10431,10 +12404,19 @@ async function rebuild(
       done: boolean;
       phase: "metadata" | "hydrate" | "complete";
       removedRepos?: string[];
+      absentRepos?: string[];
+      observedProjects?: Project[];
     },
   ) => {
     for (const removedRepo of progress.removedRepos ?? []) {
-      scannedRepos.delete(removedRepo.toLowerCase());
+      const fullName = removedRepo.toLowerCase();
+      scannedRepos.delete(fullName);
+    }
+    for (const absentRepo of progress.absentRepos ?? []) {
+      removedOwnerRepos.add(absentRepo.toLowerCase());
+    }
+    for (const project of progress.observedProjects ?? []) {
+      observedOwnerProjects.set(project.fullName.toLowerCase(), project);
     }
     const scannedRepo = progress.scannedRepo;
     if (scannedRepo) {
@@ -10451,6 +12433,10 @@ async function rebuild(
       scannedRepos: [...scannedRepos],
       projects: profiled.projects,
       generationStartedAt,
+      countsUpdatedAt: profiled.cache?.countsUpdatedAt ?? null,
+      projectCountsUpdatedAt: profiled.cache?.projectCountsUpdatedAt ?? {},
+      releasesUpdatedAt: profiled.cache?.releasesUpdatedAt ?? null,
+      ciUpdatedAt: profiled.cache?.ciUpdatedAt ?? null,
       updatedAt: profiled.generatedAt,
     };
     await Promise.all([
@@ -10497,6 +12483,17 @@ async function rebuild(
       quotaSource:
         dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
       quotaAccount: dashboard.quotaAccount ?? null,
+      previousCountsUpdatedAt:
+        existingCached?.cache?.countsUpdatedAt ?? storedProgress?.countsUpdatedAt ?? null,
+      previousProjectCountsUpdatedAt:
+        existingCached?.cache?.projectCountsUpdatedAt ??
+        storedProgress?.projectCountsUpdatedAt ??
+        {},
+      previousReleasesUpdatedAt:
+        existingCached?.cache?.releasesUpdatedAt ?? storedProgress?.releasesUpdatedAt ?? null,
+      previousCiUpdatedAt:
+        existingCached?.cache?.ciUpdatedAt ?? storedProgress?.ciUpdatedAt ?? null,
+      generationStartedAt,
       fetch: auditGitHubFetch(
         "dashboard",
         dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
@@ -10509,35 +12506,58 @@ async function rebuild(
       onProgress: (partial, progress) => saveProgress(partial, progress),
     });
     const profiled = withProfile(payload, dashboard.profile);
-    if (profiled.cache?.progress?.done === false) {
+    await rememberOwnerMetadata(
+      env,
+      {
+        ...payload,
+        projects: [
+          ...payload.projects,
+          ...[...observedOwnerProjects.values()].filter(
+            (project) =>
+              !payload.projects.some(
+                (visible) => visible.fullName.toLowerCase() === project.fullName.toLowerCase(),
+              ),
+          ),
+        ],
+      },
+      "hydrated",
+      removedOwnerRepos,
+      generationStartedAt,
+    );
+    const merged = await mergeOwnerMetadata(env, profiled, generationStartedAt);
+    if (merged.cache?.progress?.done === false) {
       await Promise.all([
-        writeCached(env, dashboard.key, profiled),
+        writeCached(env, dashboard.key, merged),
         writeProgress(env, dashboard.key, {
           scannedRepos: [...scannedRepos],
-          projects: profiled.projects,
+          projects: merged.projects,
           generationStartedAt,
-          updatedAt: profiled.generatedAt,
+          countsUpdatedAt: merged.cache?.countsUpdatedAt ?? null,
+          projectCountsUpdatedAt: merged.cache?.projectCountsUpdatedAt ?? {},
+          releasesUpdatedAt: merged.cache?.releasesUpdatedAt ?? null,
+          ciUpdatedAt: merged.cache?.ciUpdatedAt ?? null,
+          updatedAt: merged.generatedAt,
         }),
       ]);
     } else {
       await deleteProgress(env, dashboard.key);
       await Promise.all([
-        writeCached(env, dashboard.key, profiled),
-        rememberHotDashboard(env, dashboard.key, profiled),
+        writeCached(env, dashboard.key, merged),
+        rememberHotDashboard(env, dashboard.key, merged),
       ]);
     }
     await auditSyncEvent(env, {
       event: "dashboard_build_done",
       targetKey: dashboard.key,
-      status: profiled.cache?.progress?.done === false ? "partial" : "fresh",
+      status: merged.cache?.progress?.done === false ? "partial" : "fresh",
       durationMs: Date.now() - startedAt,
-      projects: profiled.projects.length,
-      scanned: profiled.cache?.progress?.scanned,
-      limit: profiled.cache?.progress?.limit,
-      done: profiled.cache?.progress?.done,
-      detail: dashboardSyncDetail(profiled),
+      projects: merged.projects.length,
+      scanned: merged.cache?.progress?.scanned,
+      limit: merged.cache?.progress?.limit,
+      done: merged.cache?.progress?.done,
+      detail: dashboardSyncDetail(merged),
     });
-    return profiled;
+    return merged;
   } catch (error) {
     await auditSyncEvent(env, {
       event: isAbortError(error) ? "dashboard_build_aborted" : "dashboard_build_failed",
@@ -10726,9 +12746,10 @@ async function refreshDashboardMetadataFirst(
   }, buildLockRefreshMs);
   const startedAt = Date.now();
   try {
+    const existingCached = await readCached(env, dashboard.key);
     const storedProgress = resetProgress ? null : await readProgress(env, dashboard.key);
     if (storedProgress) {
-      const resumed = dashboardPayloadFromProgress(dashboard, env, storedProgress);
+      const resumed = dashboardPayloadFromProgress(dashboard, env, storedProgress, existingCached);
       await auditSyncEvent(env, {
         event: "dashboard_manual_refresh_resume",
         targetKey: dashboard.key,
@@ -10773,6 +12794,8 @@ async function refreshDashboardMetadataFirst(
       quotaSource:
         dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
       quotaAccount: dashboard.quotaAccount ?? null,
+      previousCountsUpdatedAt: existingCached?.cache?.countsUpdatedAt ?? null,
+      previousProjectCountsUpdatedAt: existingCached?.cache?.projectCountsUpdatedAt ?? {},
       fetch: auditGitHubFetch(
         "dashboard",
         dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
@@ -10799,6 +12822,9 @@ async function refreshDashboardMetadataFirst(
               ...payload.cache,
               capped: boundedInitialPage ? false : payload.cache.capped,
               repoLimit,
+              releasesUpdatedAt:
+                existingCached?.cache?.releasesUpdatedAt ?? payload.cache.releasesUpdatedAt ?? null,
+              ciUpdatedAt: existingCached?.cache?.ciUpdatedAt ?? payload.cache.ciUpdatedAt ?? null,
             },
           }
         : {}),
@@ -10806,31 +12832,37 @@ async function refreshDashboardMetadataFirst(
     const partial = withCacheState(
       metadataPayload,
       "partial",
-      "issue and PR counts refreshed; release data updating",
+      "repository metadata refreshed; release data updating",
     );
     if (partial.cache?.progress) {
       partial.cache.progress.done = false;
     }
     const profiled = withProfile(partial, dashboard.profile);
-    await writeCached(env, dashboard.key, profiled);
+    await rememberOwnerMetadata(env, partial, "metadata", [], generationStartedAt);
+    const merged = await mergeOwnerMetadata(env, profiled, generationStartedAt);
+    await writeCached(env, dashboard.key, merged);
     await writeProgress(env, dashboard.key, {
       scannedRepos: [],
-      projects: profiled.projects,
+      projects: merged.projects,
       generationStartedAt,
-      updatedAt: profiled.generatedAt,
+      countsUpdatedAt: merged.cache?.countsUpdatedAt ?? null,
+      projectCountsUpdatedAt: merged.cache?.projectCountsUpdatedAt ?? {},
+      releasesUpdatedAt: merged.cache?.releasesUpdatedAt ?? null,
+      ciUpdatedAt: merged.cache?.ciUpdatedAt ?? null,
+      updatedAt: merged.generatedAt,
     });
     await auditSyncEvent(env, {
       event: "dashboard_manual_refresh_metadata_done",
       targetKey: dashboard.key,
       status: "partial",
       durationMs: Date.now() - startedAt,
-      projects: profiled.projects.length,
-      scanned: profiled.cache?.progress?.scanned,
-      limit: profiled.cache?.progress?.limit,
-      done: profiled.cache?.progress?.done,
-      detail: dashboardSyncDetail(profiled),
+      projects: merged.projects.length,
+      scanned: merged.cache?.progress?.scanned,
+      limit: merged.cache?.progress?.limit,
+      done: merged.cache?.progress?.done,
+      detail: dashboardSyncDetail(merged),
     });
-    return profiled;
+    return merged;
   } finally {
     globalThis.clearInterval(refresh);
     await lock.release();
@@ -10841,6 +12873,7 @@ function dashboardPayloadFromProgress(
   dashboard: DashboardRequest,
   env: Env,
   progress: StoredBuildProgress,
+  existingCached: DashboardPayload | null = null,
 ): DashboardPayload {
   const generatedAt = progress.updatedAt;
   return withProfile(
@@ -10858,6 +12891,12 @@ function dashboardPayloadFromProgress(
         capped: false,
         repoLimit,
         generatedAt,
+        countsUpdatedAt: progress.countsUpdatedAt ?? existingCached?.cache?.countsUpdatedAt ?? null,
+        projectCountsUpdatedAt:
+          progress.projectCountsUpdatedAt ?? existingCached?.cache?.projectCountsUpdatedAt ?? {},
+        releasesUpdatedAt:
+          progress.releasesUpdatedAt ?? existingCached?.cache?.releasesUpdatedAt ?? null,
+        ciUpdatedAt: progress.ciUpdatedAt ?? existingCached?.cache?.ciUpdatedAt ?? null,
         quota: quotaForDashboard(dashboard, env),
         progress: {
           scanned: progress.scannedRepos.length,
@@ -10931,6 +12970,10 @@ function statusPayload(
       capped: false,
       repoLimit,
       generatedAt,
+      countsUpdatedAt: null,
+      projectCountsUpdatedAt: {},
+      releasesUpdatedAt: null,
+      ciUpdatedAt: null,
       quota: quotaForDashboard(dashboard, env),
       message,
     },
@@ -11120,6 +13163,94 @@ async function ownerResponse(
       ? [primaryOwner, ...extraOwnerSlugs]
       : extraOwnerSlugs;
   const tokenSources = { owners: ownerSlugs, repos: includeRepos };
+  const keyInput = {
+    owner: primaryOwner ?? "custom",
+    owners: extraOwnerSlugs,
+    repos: includeRepos,
+    salt: profile?.updatedAt,
+    ...options,
+    schemaVersion: dashboardSchemaVersion,
+  };
+  const releaseKey = dashboardCacheKey({ ...keyInput, includeReleaseData: true });
+  const metadataKey = dashboardCacheKey({ ...keyInput, includeReleaseData: false });
+  const [releaseCached, metadataCached, registryCovered] = await Promise.all([
+    readCachedWithOwnerMetadata(env, releaseKey),
+    readCachedWithOwnerMetadata(env, metadataKey),
+    sourceInstallationRegistryCovers(env, tokenSources).catch(() => false),
+  ]);
+  if (request.method === "GET") {
+    const releaseFastCached =
+      releaseCached &&
+      releaseCached.cache?.state !== "error" &&
+      releaseCached.cache?.state !== "stale" &&
+      releaseCached.cache?.progress?.done !== false &&
+      cacheAgeMs(releaseCached) < fullTtlMs
+        ? releaseCached
+        : null;
+    const metadataFastCached =
+      metadataCached &&
+      metadataCached.cache?.state !== "error" &&
+      metadataCached.cache?.state !== "stale" &&
+      metadataCached.cache?.progress?.done !== false &&
+      cacheAgeMs(metadataCached) < fullTtlMs
+        ? metadataCached
+        : null;
+    const unsyncedAppSource = appTokenConfigured(env) && !registryCovered;
+    const metadataPreferred =
+      unsyncedAppSource &&
+      !(await dashboardReleaseDataAllowed(request, env, tokenSources, null, {
+        sourceAppCovered: registryCovered,
+      }));
+    const fastCached = metadataPreferred
+      ? metadataFastCached
+        ? {
+            key: metadataKey,
+            payload: metadataFastCached,
+            includeReleaseData: false,
+            refreshKey: metadataKey,
+            refreshReleaseData: false,
+          }
+        : null
+      : releaseFastCached
+        ? {
+            key: releaseKey,
+            payload: releaseFastCached,
+            includeReleaseData: true,
+            refreshKey: releaseKey,
+            refreshReleaseData: true,
+          }
+        : null;
+    if (fastCached) {
+      if (allowRefresh) {
+        context.waitUntil(
+          rememberRefreshTarget(env, {
+            key: fastCached.refreshKey,
+            owner: primaryOwner ?? "custom",
+            owners: ownerSlugs,
+            repos: includeRepos,
+            profile,
+            includeReleaseData: fastCached.refreshReleaseData,
+            path: `${url.pathname}${url.search}`,
+            priority: primaryOwner ? 100 : 60,
+          }).catch(() => null),
+        );
+      }
+      const payload = fastCached.payload;
+      auditDashboardSync(context, env, {
+        event: "dashboard_request",
+        targetKey: fastCached.key,
+        status: "fresh",
+        source: "cache-fast-path",
+        projects: payload.projects.length,
+        detail: `owners=${ownerSlugs.length} repos=${includeRepos.length} includeReleaseData=${fastCached.includeReleaseData}`,
+      });
+      return jsonResponse(
+        withCacheState(payload, "fresh"),
+        200,
+        authDependentDashboardHeaders(env),
+      );
+    }
+  }
   const coldBuildStartedAt = allowRefresh && env.REFRESH_QUEUE ? Date.now() : null;
   const credentialController = coldBuildStartedAt === null ? null : new AbortController();
   const credentialTimer = credentialController
@@ -11135,21 +13266,11 @@ async function ownerResponse(
     globalThis.clearTimeout(credentialTimer);
   }
   const sourceAppCovered =
-    !allowRefresh || credentialController?.signal.aborted
-      ? await sourceInstallationRegistryCovers(env, tokenSources).catch(() => false)
-      : false;
+    !allowRefresh || credentialController?.signal.aborted ? registryCovered : false;
   const includeReleaseData = await dashboardReleaseDataAllowed(request, env, tokenSources, token, {
     sourceAppCovered,
   });
-  const key = dashboardCacheKey({
-    owner: primaryOwner ?? "custom",
-    owners: extraOwnerSlugs,
-    repos: includeRepos,
-    salt: profile?.updatedAt,
-    ...options,
-    includeReleaseData,
-    schemaVersion: dashboardSchemaVersion,
-  });
+  const key = includeReleaseData ? releaseKey : metadataKey;
   const refreshTarget = allowRefresh
     ? await rememberRefreshTarget(env, {
         key,
@@ -11162,7 +13283,8 @@ async function ownerResponse(
         priority: primaryOwner ? 100 : 60,
       })
     : null;
-  const cached = await readCached(env, key);
+  const cachedBase = includeReleaseData ? releaseCached : metadataCached;
+  const cached = cachedBase;
   const ageMs = cacheAgeMs(cached);
   const displayCached = canDisplayCached(cached);
   auditDashboardSync(context, env, {
@@ -11334,7 +13456,12 @@ async function ownerResponse(
     });
   }
 
-  if (displayCached && cached.cache?.progress?.done !== false && ageMs < fullTtlMs) {
+  if (
+    displayCached &&
+    cached.cache?.state !== "stale" &&
+    cached.cache?.progress?.done !== false &&
+    ageMs < fullTtlMs
+  ) {
     return jsonResponse(withCacheState(cached, "fresh"), 200, authDependentDashboardHeaders(env));
   }
 
@@ -11420,13 +13547,14 @@ async function ownerResponse(
     );
     const message = `refresh paused after repeated failures; retry scheduled ${refreshTarget.nextDueAt}`;
     const storedProgress = await readProgress(env, key);
-    const payload = storedProgress
+    const rawPayload = storedProgress
       ? withCacheState(
-          dashboardPayloadFromProgress(dashboard, env, storedProgress),
+          dashboardPayloadFromProgress(dashboard, env, storedProgress, cached),
           "partial",
           message,
         )
       : statusPayload(dashboard, env, "rebuilding", message, new Date().toISOString());
+    const payload = storedProgress ? await mergeOwnerMetadata(env, rawPayload) : rawPayload;
     auditDashboardSync(context, env, {
       event: "dashboard_response",
       targetKey: key,
@@ -11593,7 +13721,7 @@ async function ownerResponse(
         env.REFRESH_QUEUE ? undefined : build,
         queueDelaySeconds,
       );
-      const progressive = await readCached(env, key);
+      const progressive = await readCachedWithOwnerMetadata(env, key);
       if (canDisplayCached(progressive) && progressive.projects.length) {
         auditDashboardSync(context, env, {
           event: "dashboard_response",
@@ -11636,7 +13764,8 @@ async function ownerResponse(
         "cache-control": "no-store",
       });
     }
-    if (payload.cache?.progress?.done === false) {
+    const visiblePayload = await mergeOwnerMetadata(env, payload);
+    if (visiblePayload.cache?.progress?.done === false) {
       if (allowRefresh && (!refreshTarget || !refreshTargetBackoffActive(refreshTarget))) {
         const reason = metadataFirst ? "cold-metadata" : "partial-build";
         scheduleProgressiveBuild(dashboard, env, context, reason, refreshTarget);
@@ -11645,11 +13774,11 @@ async function ownerResponse(
           targetKey: key,
           status: "queued",
           reason,
-          projects: payload.projects.length,
-          scanned: payload.cache?.progress?.scanned,
-          limit: payload.cache?.progress?.limit,
-          done: payload.cache?.progress?.done,
-          detail: dashboardSyncDetail(payload),
+          projects: visiblePayload.projects.length,
+          scanned: visiblePayload.cache?.progress?.scanned,
+          limit: visiblePayload.cache?.progress?.limit,
+          done: visiblePayload.cache?.progress?.done,
+          detail: dashboardSyncDetail(visiblePayload),
         });
       } else if (allowRefresh && refreshTarget) {
         auditDashboardSync(context, env, {
@@ -11657,18 +13786,18 @@ async function ownerResponse(
           targetKey: key,
           status: "backoff",
           reason: metadataFirst ? "cold-metadata" : "partial-build",
-          projects: payload.projects.length,
-          scanned: payload.cache?.progress?.scanned,
-          limit: payload.cache?.progress?.limit,
-          done: payload.cache?.progress?.done,
+          projects: visiblePayload.projects.length,
+          scanned: visiblePayload.cache?.progress?.scanned,
+          limit: visiblePayload.cache?.progress?.limit,
+          done: visiblePayload.cache?.progress?.done,
           detail: `nextDueAt=${refreshTarget.nextDueAt} failureCount=${refreshTarget.failureCount}`,
         });
       }
-      return jsonResponse(payload, 200, {
+      return jsonResponse(visiblePayload, 200, {
         "cache-control": "no-store",
       });
     }
-    return jsonResponse(payload, 200, authDependentDashboardHeaders(env));
+    return jsonResponse(visiblePayload, 200, authDependentDashboardHeaders(env));
   } catch (error) {
     if (coldWaitTimer) {
       clearTimeout(coldWaitTimer);
@@ -11776,6 +13905,142 @@ export class DashboardBuildLock {
       return new Response(null, { status: 204 });
     }
 
+    if (url.pathname === "/target-index/upsert") {
+      const target = await request.json().catch(() => null);
+      if (!isRefreshTarget(target)) {
+        return new Response(null, { status: 400 });
+      }
+      if (
+        new TextEncoder().encode(JSON.stringify(target)).byteLength >
+        durableRefreshTargetEntryLimitBytes
+      ) {
+        return jsonResponse({ error: "refresh target too large" }, 413, {
+          "cache-control": "no-store",
+        });
+      }
+      const upsert = async () => {
+        const cutoff = Date.now() - dashboardStorageTtlSeconds * 1000;
+        const stored =
+          (await this.state.storage.get<RefreshTarget[]>("refresh-target-index")) ?? [];
+        const targets = new Map(
+          stored
+            .filter(
+              (candidate) => isRefreshTarget(candidate) && safeIso(candidate.lastSeenAt) >= cutoff,
+            )
+            .map((candidate) => [candidate.key, candidate]),
+        );
+        const created = !targets.has(target.key);
+        if (created && targets.size >= refreshTargetSourceLimit) {
+          return jsonResponse({ error: "refresh target source limit reached" }, 429, {
+            "cache-control": "no-store",
+          });
+        }
+        targets.set(target.key, target);
+        const updated = [...targets.values()]
+          .sort((left, right) => safeIso(right.lastSeenAt) - safeIso(left.lastSeenAt))
+          .slice(0, durableRefreshTargetIndexLimit);
+        if (
+          new TextEncoder().encode(JSON.stringify(updated)).byteLength >
+          durableRefreshTargetIndexLimitBytes
+        ) {
+          return jsonResponse({ error: "refresh target source byte limit reached" }, 429, {
+            "cache-control": "no-store",
+          });
+        }
+        await this.state.storage.put("refresh-target-index", updated);
+        return new Response(null, {
+          status: 204,
+          headers: { "x-refresh-target-created": String(created) },
+        });
+      };
+      return this.state.blockConcurrencyWhile ? this.state.blockConcurrencyWhile(upsert) : upsert();
+    }
+
+    if (url.pathname === "/target-index/delete") {
+      const body = (await request.json().catch(() => null)) as { key?: unknown } | null;
+      if (typeof body?.key !== "string") {
+        return new Response(null, { status: 400 });
+      }
+      const remove = async () => {
+        const stored =
+          (await this.state.storage.get<RefreshTarget[]>("refresh-target-index")) ?? [];
+        const updated = stored.filter(
+          (target) => isRefreshTarget(target) && target.key !== body.key,
+        );
+        if (updated.length === 0) {
+          await this.state.storage.delete("refresh-target-index");
+        } else if (updated.length !== stored.length) {
+          await this.state.storage.put("refresh-target-index", updated);
+        }
+        return new Response(null, { status: 204 });
+      };
+      return this.state.blockConcurrencyWhile ? this.state.blockConcurrencyWhile(remove) : remove();
+    }
+
+    if (url.pathname === "/target-index/list") {
+      const cutoff = Date.now() - dashboardStorageTtlSeconds * 1000;
+      const stored = (await this.state.storage.get<RefreshTarget[]>("refresh-target-index")) ?? [];
+      const targets = stored.filter(
+        (target) => isRefreshTarget(target) && safeIso(target.lastSeenAt) >= cutoff,
+      );
+      return Response.json(targets.slice(0, durableRefreshTargetIndexLimit));
+    }
+
+    if (url.pathname === "/target-index/page") {
+      const body = (await request.json().catch(() => null)) as {
+        cursor?: unknown;
+        limit?: unknown;
+      } | null;
+      const cursor = typeof body?.cursor === "string" ? body.cursor : "";
+      const limit =
+        typeof body?.limit === "number"
+          ? Math.max(1, Math.min(webhookTargetPageSize, Math.floor(body.limit)))
+          : webhookTargetPageSize;
+      const cutoff = Date.now() - dashboardStorageTtlSeconds * 1000;
+      const stored = (await this.state.storage.get<RefreshTarget[]>("refresh-target-index")) ?? [];
+      const targets = stored
+        .filter(
+          (target) =>
+            isRefreshTarget(target) &&
+            safeIso(target.lastSeenAt) >= cutoff &&
+            (!cursor || target.key > cursor),
+        )
+        .sort((left, right) => left.key.localeCompare(right.key));
+      const page = targets.slice(0, limit);
+      return Response.json({
+        targets: page,
+        nextCursor: page.length < targets.length ? (page.at(-1)?.key ?? null) : null,
+      });
+    }
+
+    if (url.pathname === "/owner-metadata/read") {
+      const body = (await request.json().catch(() => null)) as { owner?: unknown } | null;
+      const owner = typeof body?.owner === "string" ? slugOwner(body.owner) : "";
+      if (!validOwnerSlug(owner)) {
+        return new Response(null, { status: 400 });
+      }
+      const read = async () => {
+        let stored = normalizeOwnerMetadataSnapshot(
+          owner,
+          await this.state.storage.get<OwnerMetadataSnapshot>("owner-metadata"),
+        );
+        if (stored && Date.now() - safeIso(stored.generatedAt) > ownerMetadataTtlSeconds * 1000) {
+          await this.state.storage.delete("owner-metadata");
+          stored = null;
+        }
+        const cached = await readOwnerMetadataKv(this.env, owner);
+        const snapshot = reconcileOwnerMetadataSnapshots(owner, stored, cached, true);
+        if (snapshot) {
+          await this.state.storage.put("owner-metadata", snapshot);
+        }
+        return snapshot;
+      };
+      const snapshot = this.state.blockConcurrencyWhile
+        ? await this.state.blockConcurrencyWhile(read)
+        : await read();
+      return snapshot ? Response.json(snapshot) : new Response(null, { status: 204 });
+    }
+
     if (url.pathname === "/target/mutate") {
       const body = (await request.json().catch(() => null)) as {
         snapshot?: unknown;
@@ -11854,12 +14119,22 @@ export class DashboardBuildLock {
     }
 
     if (url.pathname === "/job/reserve") {
-      const body = (await request.json().catch(() => null)) as { jobId?: string } | null;
+      const body = (await request.json().catch(() => null)) as {
+        jobId?: string;
+        dirtyOnConflict?: StoredRefreshDirty;
+      } | null;
       if (!body?.jobId) {
         return new Response(null, { status: 400 });
       }
       const existing = await this.state.storage.get<StoredRefreshJobReservation>("refresh-job");
       if (existing && existing.jobId !== body.jobId && existing.expiresAt > Date.now()) {
+        const dirty = body.dirtyOnConflict;
+        if (dirty && typeof dirty.observedAt === "string" && typeof dirty.reason === "string") {
+          const current = await this.state.storage.get<StoredRefreshDirty>("refresh-dirty");
+          if (!current || safeIso(dirty.observedAt) >= safeIso(current.observedAt)) {
+            await this.state.storage.put("refresh-dirty", dirty);
+          }
+        }
         return new Response(null, { status: 409 });
       }
       await this.state.storage.put("refresh-job", {
@@ -11870,15 +14145,1008 @@ export class DashboardBuildLock {
     }
 
     if (url.pathname === "/job/release") {
-      const body = (await request.json().catch(() => null)) as { jobId?: string } | null;
+      const body = (await request.json().catch(() => null)) as {
+        jobId?: string;
+        consumeDirty?: boolean;
+      } | null;
       const existing = await this.state.storage.get<StoredRefreshJobReservation>("refresh-job");
       if (existing?.jobId === body?.jobId) {
-        await this.state.storage.delete("refresh-job");
+        const dirty = await this.state.storage.get<StoredRefreshDirty>("refresh-dirty");
+        await Promise.all([
+          this.state.storage.delete("refresh-job"),
+          ...(dirty && body?.consumeDirty ? [this.state.storage.delete("refresh-dirty")] : []),
+        ]);
+        if (dirty && body?.consumeDirty) {
+          return Response.json(dirty);
+        }
       }
       return new Response(null, { status: 204 });
     }
 
+    if (url.pathname === "/owner-metadata/mutate") {
+      const body = (await request.json().catch(() => null)) as {
+        owner?: unknown;
+        mutation?: unknown;
+      } | null;
+      const owner = typeof body?.owner === "string" ? slugOwner(body.owner) : "";
+      const mutation = isOwnerMetadataMutation(body?.mutation) ? body.mutation : null;
+      if (!validOwnerSlug(owner) || !mutation) {
+        return new Response(null, { status: 400 });
+      }
+      const mutate = async () => {
+        let stored = normalizeOwnerMetadataSnapshot(
+          owner,
+          await this.state.storage.get<OwnerMetadataSnapshot>("owner-metadata"),
+        );
+        if (stored && Date.now() - safeIso(stored.generatedAt) > ownerMetadataTtlSeconds * 1000) {
+          await this.state.storage.delete("owner-metadata");
+          stored = null;
+        }
+        const cached = await readOwnerMetadataKv(this.env, owner);
+        const existing = reconcileOwnerMetadataSnapshots(owner, stored, cached, true);
+        const updated = applyOwnerMetadataMutation(owner, existing, mutation);
+        if (!updated) return null;
+        await Promise.all([
+          this.state.storage.put("owner-metadata", updated),
+          writeOwnerMetadata(this.env, updated),
+        ]);
+        return updated;
+      };
+      const updated = this.state.blockConcurrencyWhile
+        ? await this.state.blockConcurrencyWhile(mutate)
+        : await mutate();
+      return updated ? Response.json(updated) : new Response(null, { status: 204 });
+    }
+
+    if (
+      url.pathname === "/webhook/enqueue" ||
+      url.pathname === "/webhook/process" ||
+      url.pathname === "/webhook/abandon"
+    ) {
+      const body = (await request.json().catch(() => null)) as {
+        event?: unknown;
+        delivery?: unknown;
+        payload?: unknown;
+        createdAt?: unknown;
+      } | null;
+      const event = typeof body?.event === "string" ? body.event : "";
+      const delivery = typeof body?.delivery === "string" ? body.delivery : "";
+      const payload =
+        body?.payload && typeof body.payload === "object"
+          ? (body.payload as Record<string, unknown>)
+          : null;
+      if (!delivery || (url.pathname !== "/webhook/abandon" && (!event || !payload))) {
+        return new Response(null, { status: 400 });
+      }
+      if (url.pathname === "/webhook/abandon") {
+        const abandonDelivery = async () => {
+          const [accepted, processed, active] = await Promise.all([
+            this.state.storage.get<StoredWebhookDelivery[]>("webhook-accepted"),
+            this.state.storage.get<StoredWebhookDelivery[]>("webhook-deliveries"),
+            this.state.storage.get<StoredWebhookProcessing>("webhook-active"),
+          ]);
+          await Promise.all([
+            this.state.storage.put(
+              "webhook-accepted",
+              (accepted ?? []).filter((item) => item.id !== delivery),
+            ),
+            this.state.storage.put(
+              "webhook-deliveries",
+              (processed ?? []).filter((item) => item.id !== delivery),
+            ),
+            ...(active?.delivery === delivery ? [this.state.storage.delete("webhook-active")] : []),
+          ]);
+          return new Response(null, { status: 204 });
+        };
+        return this.state.blockConcurrencyWhile
+          ? this.state.blockConcurrencyWhile(abandonDelivery)
+          : abandonDelivery();
+      }
+      if (url.pathname === "/webhook/enqueue") {
+        if (!this.env.REFRESH_QUEUE) {
+          return jsonResponse({ error: "webhook queue unavailable" }, 503, {
+            "cache-control": "no-store",
+          });
+        }
+        const enqueueDelivery = async () => {
+          const now = Date.now();
+          const deliveries = (
+            (await this.state.storage.get<StoredWebhookDelivery[]>("webhook-accepted")) ?? []
+          ).filter((item) => now - item.processedAt < githubWebhookDeliveryTtlMs);
+          if (deliveries.some((item) => item.id === delivery)) {
+            return jsonResponse({ ok: true, duplicate: true }, 202, {
+              "cache-control": "no-store",
+            });
+          }
+          await this.env.REFRESH_QUEUE!.send({
+            kind: "github-webhook",
+            id: randomNonce(),
+            event,
+            delivery,
+            payload: payload!,
+            createdAt: new Date(now).toISOString(),
+            attempts: 0,
+          });
+          deliveries.push({ id: delivery, processedAt: now });
+          await this.state.storage.put(
+            "webhook-accepted",
+            deliveries.slice(-githubWebhookDeliveryLimit),
+          );
+          return jsonResponse({ ok: true }, 202, { "cache-control": "no-store" });
+        };
+        return this.state.blockConcurrencyWhile
+          ? this.state.blockConcurrencyWhile(enqueueDelivery)
+          : enqueueDelivery();
+      }
+      const reserveProcessing = async () => {
+        const now = Date.now();
+        const deliveries = (
+          (await this.state.storage.get<StoredWebhookDelivery[]>("webhook-deliveries")) ?? []
+        ).filter((item) => now - item.processedAt < githubWebhookDeliveryTtlMs);
+        if (deliveries.some((item) => item.id === delivery)) {
+          return "duplicate" as const;
+        }
+        const active = await this.state.storage.get<StoredWebhookProcessing>("webhook-active");
+        if (active && active.expiresAt > now) return "busy" as const;
+        await this.state.storage.put("webhook-active", {
+          delivery,
+          expiresAt: now + githubWebhookProcessingLeaseMs,
+        } satisfies StoredWebhookProcessing);
+        return "reserved" as const;
+      };
+      const reservation = this.state.blockConcurrencyWhile
+        ? await this.state.blockConcurrencyWhile(reserveProcessing)
+        : await reserveProcessing();
+      if (reservation === "duplicate") {
+        return jsonResponse({ ok: true, duplicate: true }, 202, {
+          "cache-control": "no-store",
+        });
+      }
+      if (reservation === "busy") {
+        return jsonResponse({ error: "webhook processor busy" }, 409, {
+          "cache-control": "no-store",
+        });
+      }
+      try {
+        const waits: Promise<unknown>[] = [];
+        await processGitHubWebhook(
+          event,
+          delivery,
+          payload!,
+          typeof body?.createdAt === "string" ? body.createdAt : new Date().toISOString(),
+          this.env,
+          {
+            waitUntil: (promise) => waits.push(promise),
+          },
+        );
+        await Promise.all(waits);
+        const completeProcessing = async () => {
+          const now = Date.now();
+          const deliveries = (
+            (await this.state.storage.get<StoredWebhookDelivery[]>("webhook-deliveries")) ?? []
+          ).filter((item) => now - item.processedAt < githubWebhookDeliveryTtlMs);
+          if (!deliveries.some((item) => item.id === delivery)) {
+            deliveries.push({ id: delivery, processedAt: now });
+          }
+          await Promise.all([
+            this.state.storage.put(
+              "webhook-deliveries",
+              deliveries.slice(-githubWebhookDeliveryLimit),
+            ),
+            this.state.storage.delete("webhook-active"),
+          ]);
+        };
+        if (this.state.blockConcurrencyWhile) {
+          await this.state.blockConcurrencyWhile(completeProcessing);
+        } else {
+          await completeProcessing();
+        }
+        return jsonResponse({ ok: true }, 202, { "cache-control": "no-store" });
+      } catch (error) {
+        const releaseProcessing = async () => {
+          const active = await this.state.storage.get<StoredWebhookProcessing>("webhook-active");
+          if (active?.delivery === delivery) {
+            await this.state.storage.delete("webhook-active");
+          }
+        };
+        if (this.state.blockConcurrencyWhile) {
+          await this.state.blockConcurrencyWhile(releaseProcessing);
+        } else {
+          await releaseProcessing();
+        }
+        throw error;
+      }
+    }
+
     return new Response(null, { status: 404 });
+  }
+}
+
+function webhookHex(bytes: ArrayBuffer): string {
+  return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function validWebhookSignature(
+  secret: string,
+  body: string,
+  signature: string | null,
+): Promise<boolean> {
+  if (!signature?.startsWith("sha256=")) return false;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const expected = `sha256=${webhookHex(
+    await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body)),
+  )}`;
+  if (expected.length !== signature.length) return false;
+  let difference = 0;
+  for (let index = 0; index < expected.length; index += 1) {
+    difference |= expected.charCodeAt(index) ^ signature.charCodeAt(index);
+  }
+  return difference === 0;
+}
+
+function webhookRepo(payload: Record<string, unknown>): {
+  fullName: string;
+  owner: string;
+  archived: boolean | null;
+  private: boolean | null;
+  defaultBranch: string | null;
+  pushedAt: string | null;
+  updatedAt: string | null;
+} | null {
+  const repository = payload.repository;
+  if (!repository || typeof repository !== "object") return null;
+  const repo = repository as Record<string, unknown>;
+  const fullName = typeof repo.full_name === "string" ? repo.full_name.toLowerCase() : "";
+  if (!validRepoSlug(fullName)) return null;
+  return {
+    fullName,
+    owner: fullName.split("/")[0]!,
+    archived: typeof repo.archived === "boolean" ? repo.archived : null,
+    private:
+      typeof repo.private === "boolean"
+        ? repo.private
+        : repo.visibility === "private"
+          ? true
+          : repo.visibility === "public"
+            ? false
+            : null,
+    defaultBranch: typeof repo.default_branch === "string" ? repo.default_branch : null,
+    pushedAt: typeof repo.pushed_at === "string" ? repo.pushed_at : null,
+    updatedAt: typeof repo.updated_at === "string" ? repo.updated_at : null,
+  };
+}
+
+function compactGitHubWebhookPayload(
+  event: string,
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  const compact: Record<string, unknown> = {};
+  const repository =
+    payload.repository && typeof payload.repository === "object"
+      ? (payload.repository as Record<string, unknown>)
+      : null;
+  if (repository) {
+    compact.repository =
+      event === "repository" && payload.action === "privatized"
+        ? {
+            full_name: repository.full_name,
+            private: repository.private,
+            updated_at: repository.updated_at,
+          }
+        : {
+            full_name: repository.full_name,
+            archived: repository.archived,
+            private: repository.private,
+            visibility: repository.visibility,
+            default_branch: repository.default_branch,
+            pushed_at: repository.pushed_at,
+            updated_at: repository.updated_at,
+          };
+  }
+  if (typeof payload.action === "string") compact.action = payload.action;
+  if (event === "push") {
+    compact.ref = payload.ref;
+    compact.after = payload.after;
+    compact.deleted = payload.deleted;
+    const headCommit =
+      payload.head_commit && typeof payload.head_commit === "object"
+        ? (payload.head_commit as Record<string, unknown>)
+        : null;
+    if (headCommit) compact.head_commit = { timestamp: headCommit.timestamp };
+  }
+  if (event === "release") {
+    const release =
+      payload.release && typeof payload.release === "object"
+        ? (payload.release as Record<string, unknown>)
+        : null;
+    if (release) {
+      compact.release = {
+        tag_name: release.tag_name,
+        name: release.name,
+        html_url: release.html_url,
+        published_at: release.published_at,
+        draft: release.draft,
+      };
+    }
+  }
+  return compact;
+}
+
+function releaseWebhookAffectsDashboard(payload: Record<string, unknown>): boolean {
+  const release =
+    payload.release && typeof payload.release === "object"
+      ? (payload.release as Record<string, unknown>)
+      : null;
+  const action = String(payload.action ?? "");
+  if (!release || (release.draft === true && action !== "unpublished")) return false;
+  return Boolean(action);
+}
+
+type WebhookTargetPage = {
+  targets: RefreshTarget[];
+  next: Pick<GitHubWebhookFanoutJob, "source" | "cursor" | "backfillFailed"> | null;
+};
+
+function webhookTargetMatches(target: RefreshTarget, owner: string, fullName: string): boolean {
+  return target.owners.includes(owner) || target.repos.includes(fullName) || target.owner === owner;
+}
+
+function webhookTargetIndexedByOwner(target: RefreshTarget, owner: string): boolean {
+  return (
+    slugOwner(target.owner) === owner ||
+    target.owners.some((targetOwner) => slugOwner(targetOwner) === owner)
+  );
+}
+
+async function indexedWebhookTargets(
+  env: Env,
+  source: "owner" | "repo",
+  value: string,
+  cursor?: string,
+): Promise<WebhookTargetPage> {
+  if (env.DASHBOARD_LOCKS) {
+    const id = env.DASHBOARD_LOCKS.idFromName(`refresh-target-index:${source}:${value}`);
+    const response = await env.DASHBOARD_LOCKS.get(id).fetch(
+      new Request("https://releasebar.internal/target-index/page", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cursor, limit: webhookTargetPageSize }),
+      }),
+    );
+    if (!response.ok) {
+      throw new Error(`durable refresh target index returned ${response.status}`);
+    }
+    const stored = (await response.json()) as {
+      targets?: unknown;
+      nextCursor?: unknown;
+    };
+    if (!Array.isArray(stored.targets)) {
+      throw new Error("durable refresh target index returned invalid data");
+    }
+    const targets = [
+      ...new Map(
+        stored.targets
+          .filter((target): target is RefreshTarget => isRefreshTarget(target))
+          .map((target) => [target.key, target]),
+      ).values(),
+    ];
+    const nextCursor =
+      typeof stored.nextCursor === "string" && stored.nextCursor ? stored.nextCursor : undefined;
+    return {
+      targets,
+      next: nextCursor
+        ? { source, cursor: nextCursor, backfillFailed: undefined }
+        : source === "owner"
+          ? { source: "repo", cursor: undefined, backfillFailed: undefined }
+          : null,
+    };
+  }
+  if (!env.DASHBOARD_CACHE?.list) return { targets: [], next: null };
+  const page = await env.DASHBOARD_CACHE.list({
+    prefix: refreshTargetIndexSource(source, value),
+    limit: webhookTargetPageSize,
+    ...(cursor ? { cursor } : {}),
+  });
+  const indexed = await mapConcurrent(page.keys, 16, async (key) => {
+    const raw = await env.DASHBOARD_CACHE?.get(key.name);
+    const indexedValue = raw
+      ? tryJsonParse<RefreshTarget | string>(raw, `refresh target index ${key.name}`)
+      : null;
+    const targetKey =
+      typeof indexedValue === "string"
+        ? indexedValue
+        : isRefreshTarget(indexedValue)
+          ? indexedValue.key
+          : null;
+    return targetKey ? readRefreshTarget(env, targetKey) : null;
+  });
+  const targets = [
+    ...new Map(
+      indexed
+        .filter((target): target is RefreshTarget => target !== null)
+        .map((target) => [target.key, target]),
+    ).values(),
+  ];
+  const next = page.list_complete
+    ? source === "owner"
+      ? { source: "repo" as const, cursor: undefined, backfillFailed: undefined }
+      : null
+    : { source, cursor: page.cursor, backfillFailed: undefined };
+  return { targets, next };
+}
+
+async function legacyWebhookTargets(
+  env: Env,
+  owner: string,
+  fullName: string,
+  cursor?: string,
+  backfillFailed = false,
+): Promise<WebhookTargetPage> {
+  if (!env.DASHBOARD_CACHE?.list) return { targets: [], next: null };
+  const page = await env.DASHBOARD_CACHE.list({
+    prefix: refreshTargetPrefix,
+    limit: webhookTargetPageSize,
+    ...(cursor ? { cursor } : {}),
+  });
+  const readTargets = await mapConcurrent(page.keys, 16, async (key) => {
+    const raw = await env.DASHBOARD_CACHE?.get(key.name);
+    const target = raw ? tryJsonParse<RefreshTarget>(raw, `refresh target ${key.name}`) : null;
+    return isRefreshTarget(target) && currentDashboardCacheKey(target.key) ? target : null;
+  });
+  const validTargets = readTargets.filter((target): target is RefreshTarget => target !== null);
+  const backfillResults = await mapConcurrent(
+    validTargets.filter((target) => target.indexVersion !== refreshTargetIndexVersion),
+    4,
+    (target) => persistRefreshTargetWithIndexes(env, target),
+  );
+  const pageBackfillFailed = backfillResults.some(
+    (result) => result.persisted && result.target.indexVersion !== refreshTargetIndexVersion,
+  );
+  const failed = backfillFailed || pageBackfillFailed;
+  if (page.list_complete && !failed) {
+    await env.DASHBOARD_CACHE.put(refreshTargetIndexReadyKey, String(refreshTargetIndexVersion), {
+      expirationTtl: dashboardStorageTtlSeconds,
+    });
+  }
+  return {
+    targets: validTargets.filter((target) => webhookTargetMatches(target, owner, fullName)),
+    next: page.list_complete
+      ? null
+      : { source: "legacy", cursor: page.cursor, backfillFailed: failed },
+  };
+}
+
+async function legacyOwnerWebhookSeedTargets(
+  env: Env,
+  owner: string,
+  fullName: string,
+): Promise<RefreshTarget[]> {
+  if (!env.DASHBOARD_CACHE?.list) return [];
+  const page = await env.DASHBOARD_CACHE.list({
+    prefix: `${refreshTargetPrefix}${dashboardCachePrefix}${owner}:`,
+    limit: 25,
+  });
+  const targets = await mapConcurrent(page.keys, 8, async (key) => {
+    const raw = await env.DASHBOARD_CACHE?.get(key.name);
+    const target = raw ? tryJsonParse<RefreshTarget>(raw, `refresh target ${key.name}`) : null;
+    return isRefreshTarget(target) && webhookTargetMatches(target, owner, fullName) ? target : null;
+  });
+  return targets.filter((target): target is RefreshTarget => target !== null);
+}
+
+async function webhookTargetPage(
+  env: Env,
+  owner: string,
+  fullName: string,
+  source?: GitHubWebhookFanoutJob["source"],
+  cursor?: string,
+  backfillFailed?: boolean,
+): Promise<WebhookTargetPage> {
+  if (!env.DASHBOARD_CACHE?.list && !env.DASHBOARD_LOCKS) return { targets: [], next: null };
+  const indexReady =
+    (await env.DASHBOARD_CACHE?.get(refreshTargetIndexReadyKey)) ===
+    String(refreshTargetIndexVersion);
+  const selectedSource = source ?? (indexReady ? "owner" : "legacy");
+  if (selectedSource === "legacy") {
+    return legacyWebhookTargets(env, owner, fullName, cursor, backfillFailed);
+  }
+  const value = selectedSource === "owner" ? owner : fullName;
+  const page = await indexedWebhookTargets(env, selectedSource, value, cursor);
+  return {
+    ...page,
+    targets: page.targets.filter(
+      (target) =>
+        webhookTargetMatches(target, owner, fullName) &&
+        (selectedSource !== "repo" || !webhookTargetIndexedByOwner(target, owner)),
+    ),
+  };
+}
+
+async function mapWebhookTargets<T>(
+  targets: RefreshTarget[],
+  operation: (target: RefreshTarget) => Promise<T>,
+): Promise<T[]> {
+  const results: T[] = [];
+  for (let index = 0; index < targets.length; index += webhookTargetBatchSize) {
+    results.push(
+      ...(await mapConcurrent(
+        targets.slice(index, index + webhookTargetBatchSize),
+        webhookTargetConcurrency,
+        operation,
+      )),
+    );
+  }
+  return results;
+}
+
+async function invalidateRepoProjectCache(env: Env, fullName: string): Promise<void> {
+  await Promise.all(
+    [true, false].flatMap((includeUnreleased) =>
+      [true, false].map((includeReleaseData) =>
+        env.DASHBOARD_CACHE?.delete?.(
+          `repo:v2:${fullName}:${includeUnreleased ? "unreleased" : "released"}:${includeReleaseData ? "release" : "metadata"}`,
+        ),
+      ),
+    ),
+  );
+}
+
+async function deleteCachePrefix(env: Env, prefix: string): Promise<void> {
+  if (!env.DASHBOARD_CACHE?.list || !env.DASHBOARD_CACHE.delete) return;
+  let cursor: string | undefined;
+  do {
+    const page = await env.DASHBOARD_CACHE.list({
+      prefix,
+      limit: 1_000,
+      ...(cursor ? { cursor } : {}),
+    });
+    await mapConcurrent(page.keys, 16, (key) => env.DASHBOARD_CACHE!.delete!(key.name));
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+}
+
+async function invalidatePublicRepoCaches(env: Env, fullName: string): Promise<void> {
+  const [owner, repo] = fullName.split("/");
+  if (!owner || !repo) return;
+  await Promise.all([
+    invalidateRepoProjectCache(env, fullName),
+    env.DASHBOARD_CACHE?.delete?.(repoDetailCacheKey(owner, repo)),
+    env.DASHBOARD_CACHE?.delete?.(socialRepoCacheKey(owner, repo)),
+    ...(["day", "week", "month"] as ActivityRange[]).map((range) =>
+      env.DASHBOARD_CACHE?.delete?.(repoActivityCacheKey(owner, repo, range)),
+    ),
+    ...repoAudienceRanges.map((range) =>
+      env.DASHBOARD_CACHE?.delete?.(repoAudienceCacheKey(owner, repo, range)),
+    ),
+    env.DASHBOARD_CACHE?.delete?.(repoAudienceUserReposKey(owner)),
+    env.DASHBOARD_CACHE?.delete?.(trustProfileCacheKey(owner)),
+    ...(["day", "week", "month"] as ActivityRange[]).map((range) =>
+      env.DASHBOARD_CACHE?.delete?.(ownerActivityCacheKey(owner, range)),
+    ),
+    deleteCachePrefix(env, "repo-audience:v5:"),
+    deleteCachePrefix(env, "owner-activity:v1:"),
+    deleteCachePrefix(env, "owner-activity-summary:"),
+    deleteCachePrefix(
+      env,
+      `owner-activity-summary:v${activitySummaryPromptVersion}:${slugOwner(owner)}:`,
+    ),
+    deleteCachePrefix(
+      env,
+      `repo-activity-summary:v${activitySummaryPromptVersion}:${fullName.toLowerCase()}:`,
+    ),
+    deleteCachePrefix(
+      env,
+      `release-summary:v${releaseSummaryPromptVersion}:${fullName.toLowerCase()}:`,
+    ),
+    deleteCachePrefix(env, `discover:v${discoverCacheSchemaVersion}:`),
+  ]);
+}
+
+async function invalidateDashboardTargets(env: Env, targets: RefreshTarget[]): Promise<void> {
+  await env.DASHBOARD_CACHE?.delete?.(hotCacheKey);
+  await mapWebhookTargets(targets, async (target) => {
+    await Promise.all([env.DASHBOARD_CACHE?.delete?.(target.key), deleteProgress(env, target.key)]);
+  });
+}
+
+async function prepareGitHubWebhookEvent(
+  event: string,
+  payload: Record<string, unknown>,
+  env: Env,
+  context: ExecutionContext,
+  repo: NonNullable<ReturnType<typeof webhookRepo>>,
+  seedTargets: RefreshTarget[],
+): Promise<WebhookTargetAction | null> {
+  const action = payload.action;
+  const updatedAt = new Date().toISOString();
+  const repositoryObservedAt = repo.updatedAt;
+  if (event === "issues" || event === "pull_request") {
+    const countActions =
+      event === "issues"
+        ? ["opened", "reopened", "closed", "deleted", "transferred"]
+        : ["opened", "reopened", "closed", "deleted"];
+    if (!countActions.includes(String(action))) return null;
+    let snapshot = await readOwnerMetadata(env, repo.owner);
+    if (!snapshot?.projects.some((project) => project.fullName.toLowerCase() === repo.fullName)) {
+      for (const target of seedTargets) {
+        const cached = await readCachedRaw(env, target.key);
+        if (!cached?.projects.some((project) => project.fullName.toLowerCase() === repo.fullName)) {
+          continue;
+        }
+        await rememberOwnerMetadata(env, cached, "metadata");
+        break;
+      }
+      snapshot = await readOwnerMetadata(env, repo.owner);
+    }
+    if (!snapshot?.projects.some((project) => project.fullName.toLowerCase() === repo.fullName)) {
+      return {
+        reason: `webhook:${event}:missing-snapshot-repo`,
+        includeReleaseDataOnly: false,
+        invalidateDashboard: false,
+      };
+    }
+    const refresh = await refreshOwnerCounts(env, repo.owner, repo.fullName, context);
+    if (refresh.status === "missing-repo") {
+      return {
+        reason: `webhook:${event}:exact-count-missing`,
+        includeReleaseDataOnly: false,
+        invalidateDashboard: false,
+      };
+    }
+    if (refresh.status !== "refreshed" || !refresh.exact) {
+      throw new Error(`exact owner count refresh ${refresh.status}`);
+    }
+    return null;
+  }
+
+  if (event === "repository" && action === "privatized") {
+    await Promise.all([
+      mutateOwnerMetadataSnapshot(env, repo.owner, {
+        kind: "remove",
+        fullName: repo.fullName,
+        observedAt: repositoryObservedAt ?? updatedAt,
+      }),
+      invalidatePublicRepoCaches(env, repo.fullName),
+      env.DASHBOARD_CACHE?.delete?.(hotCacheKey),
+    ]);
+    return {
+      reason: "webhook:repository-privatized",
+      includeReleaseDataOnly: false,
+      invalidateDashboard: true,
+    };
+  }
+
+  if (event === "repository" && action === "publicized") {
+    const restore = repositoryObservedAt
+      ? mutateOwnerMetadataSnapshot(env, repo.owner, {
+          kind: "restore",
+          fullName: repo.fullName,
+          observedAt: repositoryObservedAt,
+        })
+      : refreshOwnerCounts(env, repo.owner, repo.fullName, context);
+    await Promise.all([
+      restore,
+      invalidateRepoProjectCache(env, repo.fullName),
+      env.DASHBOARD_CACHE?.delete?.(hotCacheKey),
+    ]);
+    return {
+      reason: "webhook:repository-publicized",
+      includeReleaseDataOnly: false,
+      invalidateDashboard: false,
+    };
+  }
+
+  if (event === "repository" && (action === "archived" || action === "unarchived")) {
+    let refresh: Awaited<ReturnType<typeof refreshOwnerCounts>>;
+    try {
+      refresh = await refreshOwnerCounts(env, repo.owner, repo.fullName, context);
+    } catch (error) {
+      await auditSyncEvent(env, {
+        event: "owner_counts_failed",
+        status: "failed",
+        account: repo.owner,
+        reason: errorMessage(error),
+        detail: `githubEvent=repository repo=${repo.fullName}`,
+      });
+      refresh = { status: "deferred" };
+    }
+    let visibilityApplied = false;
+    if (repositoryObservedAt) {
+      const archived = repo.archived ?? action === "archived";
+      const visibilitySnapshot = await mutateOwnerMetadataSnapshot(env, repo.owner, {
+        kind: "visibility",
+        fullName: repo.fullName,
+        archived,
+        observedAt: repositoryObservedAt,
+        repositoryUpdatedAt: repo.updatedAt,
+      });
+      visibilityApplied = Boolean(
+        visibilitySnapshot?.projects.some(
+          (project) =>
+            project.fullName.toLowerCase() === repo.fullName && project.archived === archived,
+        ),
+      );
+    }
+    const requiresFallback =
+      (refresh.status !== "refreshed" || !refresh.exact) && !visibilityApplied;
+    return {
+      reason: "webhook:repository",
+      includeReleaseDataOnly: false,
+      invalidateDashboard: requiresFallback,
+    };
+  }
+
+  if (event !== "push" && event !== "release") return null;
+  if (
+    event === "push" &&
+    (payload.deleted === true ||
+      (repo.defaultBranch && payload.ref !== `refs/heads/${repo.defaultBranch}`))
+  ) {
+    return null;
+  }
+  if (event === "release" && !releaseWebhookAffectsDashboard(payload)) {
+    return null;
+  }
+  await invalidateRepoProjectCache(env, repo.fullName);
+  return {
+    reason: `webhook:${event}`,
+    includeReleaseDataOnly: true,
+    invalidateDashboard: true,
+  };
+}
+
+async function applyWebhookTargetAction(
+  env: Env,
+  context: ExecutionContext,
+  targets: RefreshTarget[],
+  action: WebhookTargetAction,
+): Promise<void> {
+  const selected = action.includeReleaseDataOnly
+    ? targets.filter((target) => target.includeReleaseData)
+    : targets;
+  if (action.invalidateDashboard) {
+    await invalidateDashboardTargets(env, selected);
+  }
+  await mapWebhookTargets(selected, (target) =>
+    enqueueRefreshJob(env, context, target, action.reason),
+  );
+}
+
+async function enqueueWebhookFanout(
+  env: Env,
+  event: string,
+  delivery: string,
+  payload: Record<string, unknown>,
+  createdAt: string,
+  action: WebhookTargetAction,
+  next: WebhookTargetPage["next"],
+): Promise<void> {
+  if (!next) return;
+  if (!env.REFRESH_QUEUE) throw new Error("webhook queue unavailable");
+  await env.REFRESH_QUEUE.send({
+    kind: "github-webhook-fanout",
+    id: randomNonce(),
+    event,
+    delivery,
+    payload,
+    createdAt,
+    action,
+    source: next.source,
+    ...(next.cursor ? { cursor: next.cursor } : {}),
+    ...(next.backfillFailed ? { backfillFailed: true } : {}),
+  });
+}
+
+async function processGitHubWebhookFanout(
+  job: GitHubWebhookFanoutJob,
+  env: Env,
+  context: ExecutionContext,
+): Promise<void> {
+  const repo = webhookRepo(job.payload);
+  if (!repo) return;
+  const page = await webhookTargetPage(
+    env,
+    repo.owner,
+    repo.fullName,
+    job.source,
+    job.cursor,
+    job.backfillFailed,
+  );
+  await applyWebhookTargetAction(env, context, page.targets, job.action);
+  await enqueueWebhookFanout(
+    env,
+    job.event,
+    job.delivery,
+    job.payload,
+    job.createdAt,
+    job.action,
+    page.next,
+  );
+}
+
+async function processGitHubWebhook(
+  event: string,
+  delivery: string,
+  payload: Record<string, unknown>,
+  createdAt: string,
+  env: Env,
+  context: ExecutionContext,
+): Promise<void> {
+  const repo = webhookRepo(payload);
+  if (!repo) return;
+  const page = await webhookTargetPage(env, repo.owner, repo.fullName);
+  const ownerSeedTargets = await legacyOwnerWebhookSeedTargets(env, repo.owner, repo.fullName);
+  const seedTargets = [
+    ...new Map(
+      [...page.targets, ...ownerSeedTargets].map((target) => [target.key, target]),
+    ).values(),
+  ];
+  const action = await prepareGitHubWebhookEvent(event, payload, env, context, repo, seedTargets);
+  if (!action) return;
+  await applyWebhookTargetAction(env, context, seedTargets, action);
+  await enqueueWebhookFanout(env, event, delivery, payload, createdAt, action, page.next);
+}
+
+async function githubWebhookRetryDelaySeconds(env: Env, error: unknown): Promise<number> {
+  const cooldown = await sharedQuotaCooldown(env).catch(() => null);
+  if (cooldown?.active) {
+    return Math.max(
+      30,
+      Math.min(
+        12 * 60 * 60,
+        Math.ceil((Date.parse(sharedQuotaDeferUntil(cooldown)) - Date.now()) / 1000) + 5,
+      ),
+    );
+  }
+  const reason = errorMessage(error);
+  if (
+    reason.includes("dashboard locked") ||
+    reason.includes("processor busy") ||
+    reason.includes("target reserved")
+  ) {
+    return 60;
+  }
+  if (reason.includes("GraphQL") || reason.includes("deferred")) {
+    return githubGraphqlBackoffSeconds;
+  }
+  return 5 * 60;
+}
+
+async function abandonGitHubWebhookDelivery(
+  env: Env,
+  delivery: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  if (!env.DASHBOARD_LOCKS) return;
+  const owner = webhookRepo(payload)?.owner ?? delivery;
+  const objectNames = ["github-webhook-admission", `github-webhook-process:${owner}`];
+  const responses = await Promise.all(
+    objectNames.map((name) =>
+      env.DASHBOARD_LOCKS!.get(env.DASHBOARD_LOCKS!.idFromName(name)).fetch(
+        new Request("https://releasebar.internal/webhook/abandon", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ delivery }),
+        }),
+      ),
+    ),
+  );
+  const failed = responses.find((response) => !response.ok);
+  if (failed) {
+    throw new Error(`webhook delivery abandon returned ${failed.status}`);
+  }
+}
+
+async function boundedRequestText(request: Request, limit: number): Promise<string | null> {
+  const contentLength = Number(request.headers.get("content-length") ?? "0");
+  if (Number.isFinite(contentLength) && contentLength > limit) return null;
+  if (!request.body) return "";
+
+  const chunks: Uint8Array[] = [];
+  const reader = request.body.getReader();
+  let length = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    length += value.byteLength;
+    if (length > limit) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+
+  const body = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(body);
+}
+
+async function githubWebhookResponse(
+  request: Request,
+  env: Env,
+  _context: ExecutionContext,
+): Promise<Response> {
+  if (!env.GITHUB_WEBHOOK_SECRET) {
+    return jsonResponse({ error: "webhook not configured" }, 503, {
+      "cache-control": "no-store",
+    });
+  }
+  const body = await boundedRequestText(request, githubWebhookBodyLimitBytes);
+  if (body === null) {
+    return jsonResponse({ error: "webhook payload too large" }, 413, {
+      "cache-control": "no-store",
+    });
+  }
+  if (
+    !(await validWebhookSignature(
+      env.GITHUB_WEBHOOK_SECRET,
+      body,
+      request.headers.get("x-hub-signature-256"),
+    ))
+  ) {
+    return jsonResponse({ error: "invalid signature" }, 401, { "cache-control": "no-store" });
+  }
+  const delivery = request.headers.get("x-github-delivery") ?? "";
+  const payload = tryJsonParse<Record<string, unknown>>(body, "GitHub webhook");
+  if (!payload) {
+    return jsonResponse({ error: "invalid payload" }, 400, { "cache-control": "no-store" });
+  }
+  const event = request.headers.get("x-github-event") ?? "";
+  if (event === "ping") {
+    return jsonResponse({ ok: true }, 200, { "cache-control": "no-store" });
+  }
+  const repo = webhookRepo(payload);
+  if (!delivery) {
+    return jsonResponse({ error: "webhook delivery unavailable" }, 503, {
+      "cache-control": "no-store",
+    });
+  }
+  if (!repo) {
+    return jsonResponse({ ok: true, ignored: true }, 202, {
+      "cache-control": "no-store",
+    });
+  }
+  const action = String(payload.action ?? "");
+  if (repo.private === true && !(event === "repository" && action === "privatized")) {
+    return jsonResponse({ ok: true, ignored: true }, 202, {
+      "cache-control": "no-store",
+    });
+  }
+  if (!env.DASHBOARD_LOCKS) {
+    return jsonResponse({ error: "webhook delivery unavailable" }, 503, {
+      "cache-control": "no-store",
+    });
+  }
+  try {
+    const id = env.DASHBOARD_LOCKS.idFromName("github-webhook-admission");
+    const compactPayload = compactGitHubWebhookPayload(event, payload);
+    return await env.DASHBOARD_LOCKS.get(id).fetch(
+      new Request("https://releasebar.internal/webhook/enqueue", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ event, delivery, payload: compactPayload }),
+      }),
+    );
+  } catch (error) {
+    await auditSyncEvent(env, {
+      event: "github_webhook_failed",
+      status: "failed",
+      reason: errorMessage(error),
+      detail: `githubEvent=${event} delivery=${delivery}`,
+    }).catch(() => undefined);
+    return jsonResponse({ error: "webhook processing failed" }, 500, {
+      "cache-control": "no-store",
+    });
   }
 }
 
@@ -11900,6 +15168,7 @@ export default {
       request.method === "POST";
     const ownerRefreshWrite = isOwnerRefreshApiPath(url.pathname) && request.method === "POST";
     const clientTimingWrite = url.pathname === "/api/_client-timing" && request.method === "POST";
+    const githubWebhookWrite = url.pathname === "/api/github/webhook" && request.method === "POST";
     if (
       request.method !== "GET" &&
       !isHead &&
@@ -11907,7 +15176,8 @@ export default {
       !audienceBackfillWrite &&
       !adminWrite &&
       !ownerRefreshWrite &&
-      !clientTimingWrite
+      !clientTimingWrite &&
+      !githubWebhookWrite
     ) {
       return jsonResponse({ error: "method not allowed" }, 405, { allow: "GET" });
     }
@@ -11925,11 +15195,110 @@ export default {
     context.waitUntil(schedulerTick(env, context, `cron:${event.cron}`, schedulerBatchLimit));
   },
   async queue(
-    batch: MessageBatch<RefreshJob>,
+    batch: MessageBatch<WorkerQueueMessage>,
     env: Env,
-    _context: ExecutionContext,
+    context: ExecutionContext,
   ): Promise<void> {
     for (const message of batch.messages) {
+      if (isGitHubWebhookFanoutJob(message.body)) {
+        const fanoutJob = message.body;
+        try {
+          await processGitHubWebhookFanout(fanoutJob, env, context);
+          message.ack();
+        } catch (error) {
+          const delaySeconds = await githubWebhookRetryDelaySeconds(env, error);
+          const attempts = message.attempts ?? 1;
+          const expired = Date.now() - safeIso(fanoutJob.createdAt) >= githubWebhookDeliveryTtlMs;
+          if (attempts >= refreshQueueMaxAttempts || expired) {
+            await abandonGitHubWebhookDelivery(env, fanoutJob.delivery, fanoutJob.payload).catch(
+              async (abandonError) =>
+                auditSyncEvent(env, {
+                  event: "github_webhook_admission_abandon_failed",
+                  status: "failed",
+                  reason: errorMessage(abandonError),
+                  detail: `githubEvent=${fanoutJob.event} delivery=${fanoutJob.delivery} fanout=true`,
+                }),
+            );
+          }
+          await auditSyncEvent(env, {
+            event: "github_webhook_fanout_failed",
+            status: "failed",
+            reason: errorMessage(error),
+            detail: `githubEvent=${fanoutJob.event} delivery=${fanoutJob.delivery} source=${fanoutJob.source} attempts=${attempts}`,
+          }).catch(() => undefined);
+          message.retry({ delaySeconds: Math.min(delaySeconds, 5 * 60) });
+        }
+        continue;
+      }
+      if (isGitHubWebhookJob(message.body)) {
+        const webhookJob = message.body;
+        try {
+          if (!env.DASHBOARD_LOCKS) throw new Error("webhook processor unavailable");
+          const owner = webhookRepo(webhookJob.payload)?.owner ?? webhookJob.delivery;
+          const id = env.DASHBOARD_LOCKS.idFromName(`github-webhook-process:${owner}`);
+          const response = await env.DASHBOARD_LOCKS.get(id).fetch(
+            new Request("https://releasebar.internal/webhook/process", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(webhookJob),
+            }),
+          );
+          if (!response.ok) {
+            throw new Error(`webhook processor returned ${response.status}`);
+          }
+          message.ack();
+        } catch (error) {
+          const delaySeconds = await githubWebhookRetryDelaySeconds(env, error);
+          const attempts = (webhookJob.attempts ?? 0) + 1;
+          const expired = Date.now() - safeIso(webhookJob.createdAt) >= githubWebhookDeliveryTtlMs;
+          if (attempts > githubWebhookRequeueLimit || expired) {
+            await abandonGitHubWebhookDelivery(env, webhookJob.delivery, webhookJob.payload).catch(
+              async (abandonError) =>
+                auditSyncEvent(env, {
+                  event: "github_webhook_admission_abandon_failed",
+                  status: "failed",
+                  reason: errorMessage(abandonError),
+                  detail: `githubEvent=${webhookJob.event} delivery=${webhookJob.delivery}`,
+                }),
+            );
+            await auditSyncEvent(env, {
+              event: "github_webhook_failed",
+              status: "failed",
+              reason: `${errorMessage(error)}; durable requeue limit reached`,
+              detail: `githubEvent=${webhookJob.event} delivery=${webhookJob.delivery} attempts=${attempts}`,
+            });
+            message.ack();
+            continue;
+          }
+          try {
+            if (!env.REFRESH_QUEUE) throw new Error("webhook queue unavailable");
+            await env.REFRESH_QUEUE.send(
+              {
+                ...webhookJob,
+                id: randomNonce(),
+                attempts,
+              },
+              { delaySeconds },
+            );
+            await auditSyncEvent(env, {
+              event: "github_webhook_requeued",
+              status: "queued",
+              reason: errorMessage(error),
+              detail: `githubEvent=${webhookJob.event} delivery=${webhookJob.delivery} delaySeconds=${delaySeconds}`,
+            });
+            message.ack();
+          } catch (requeueError) {
+            await auditSyncEvent(env, {
+              event: "github_webhook_failed",
+              status: "failed",
+              reason: `${errorMessage(error)}; requeue failed: ${errorMessage(requeueError)}`,
+              detail: `githubEvent=${webhookJob.event} delivery=${webhookJob.delivery}`,
+            });
+            message.retry({ delaySeconds: Math.min(delaySeconds, 5 * 60) });
+          }
+        }
+        continue;
+      }
       const deliveryAttempts = message.attempts ?? message.body.attempts + 1;
       const exhausted = deliveryAttempts >= refreshQueueMaxAttempts;
       let processedJob: RefreshJob | null = null;
@@ -11947,7 +15316,7 @@ export default {
               : incompleteBuildRetrySeconds;
           if (exhausted) {
             await failExhaustedRefreshJob(job, env, deliveryAttempts);
-            await releaseRefreshJobReservation(env, job.targetKey, job.id);
+            await finishRefreshJobReservation(env, context, job);
             message.retry({ delaySeconds });
             continue;
           }
@@ -11955,7 +15324,7 @@ export default {
             delaySeconds,
           });
         } else {
-          await releaseRefreshJobReservation(env, job.targetKey, job.id);
+          await finishRefreshJobReservation(env, context, job);
           message.ack();
         }
       } catch (error) {
@@ -11971,7 +15340,7 @@ export default {
               deliveryAttempts,
             ).catch(() => undefined);
           }
-          await releaseRefreshJobReservation(env, job.targetKey, job.id).catch(() => undefined);
+          await finishRefreshJobReservation(env, context, job).catch(() => undefined);
         }
         message.retry({ delaySeconds: 300 });
       }
@@ -12004,6 +15373,9 @@ async function routeRequest(
   }
   if (url.pathname === "/api/_client-timing" && request.method === "POST") {
     return clientTimingResponse(request, env, context);
+  }
+  if (url.pathname === "/api/github/webhook" && request.method === "POST") {
+    return githubWebhookResponse(request, env, context);
   }
   if (url.pathname.startsWith("/api/admin/")) {
     return adminResponse(request, env, context);

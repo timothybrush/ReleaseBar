@@ -151,6 +151,8 @@ type ExecutionContext = {
   waitUntil(promise: Promise<unknown>): void;
 };
 
+const githubAccessWriteChains = new WeakMap<ExecutionContext, Promise<void>>();
+
 type ScheduledEvent = {
   cron: string;
   scheduledTime: number;
@@ -177,6 +179,7 @@ const installationAcknowledgementGraceMs = 15 * 60 * 1000;
 const installationRegistryFastPathMaxAgeMs = 15 * 60 * 1000;
 const coldBuildWaitMs = 15 * 1000;
 const initialMetadataRepoLimit = 25;
+const authenticatedReleaseOwnerPageSize = 50;
 const progressiveBuildBudgetMs = 25 * 1000;
 const queuedProgressiveBuildBudgetMs = 12 * 60 * 1000;
 const progressWriteIntervalMs = 1100;
@@ -239,8 +242,11 @@ const githubAccessPrefix = `github:access:v1:`;
 const githubAccessTtlSeconds = 14 * 24 * 60 * 60;
 const githubAccessShardCount = 16;
 const githubSharedBudgetPrefix = `github:budget:v1:shared:`;
-const githubGraphqlBackoffPrefix = `github:backoff:v1:graphql:`;
-const githubGraphqlBackoffSeconds = 15 * 60;
+const githubGraphqlBackoffPrefix = `github:backoff:v2:graphql:`;
+const githubGraphqlBackoffSeconds = 2 * 60;
+const githubGraphqlOwnerReleaseOperation = "ReleaseBarOwnerRepos.release";
+const githubGraphqlRepoDetailsOperation = "ReleaseBarRepoDetails";
+const githubGraphqlRepoStargazersOperation = "ReleaseBarRepoStargazers";
 const githubAccessAdminHours = 24;
 const githubAccessAdminRouteLimit = 30;
 const crawlerUserAgentPattern =
@@ -750,7 +756,10 @@ function auditGitHubTokenUse(
 function githubPathBucket(path: string): string {
   const url = new URL(path, "https://api.github.com");
   const parts = url.pathname.split("/").filter(Boolean);
-  if (url.pathname === "/graphql") return "graphql";
+  if (url.pathname === "/graphql") {
+    const operation = url.searchParams.get("operation");
+    return operation ? `graphql/${operation}` : "graphql";
+  }
   if (parts[0] === "users" && parts[2] === "repos") return "users/:owner/repos";
   if (parts[0] === "orgs" && parts[2] === "repos") return "orgs/:owner/repos";
   if (parts[0] === "users" && parts.length === 2) return "users/:owner";
@@ -884,31 +893,61 @@ function sharedQuotaDeferUntil(cooldown: SharedQuotaCooldown): string {
   return new Date(next).toISOString();
 }
 
-function githubGraphqlBackoffKey(source: ApiQuota["source"], account: string | null): string {
-  return `${githubGraphqlBackoffPrefix}${source}:${account ?? "_"}`;
+function githubGraphqlOperation(init?: RequestInit): string {
+  if (typeof init?.body !== "string") return "unknown";
+  const payload = tryJsonParse<{
+    query?: unknown;
+    variables?: { includeReleases?: unknown };
+  }>(init.body, "GitHub GraphQL request");
+  if (typeof payload?.query !== "string") return "unknown";
+  const name = payload.query.match(/\b(?:query|mutation)\s+([A-Za-z_][A-Za-z0-9_]*)/)?.[1];
+  if (!name) return "anonymous";
+  if (name === "ReleaseBarOwnerRepos") {
+    return payload.variables?.includeReleases
+      ? githubGraphqlOwnerReleaseOperation
+      : "ReleaseBarOwnerRepos.metadata";
+  }
+  return name;
+}
+
+function githubGraphqlAuditPath(operation: string): string {
+  return `/graphql?operation=${encodeURIComponent(operation)}`;
+}
+
+function githubGraphqlBackoffKey(
+  source: ApiQuota["source"],
+  account: string | null,
+  operation: string,
+): string {
+  return `${githubGraphqlBackoffPrefix}${source}:${account ?? "_"}:${operation}`;
 }
 
 async function graphqlBackoffActive(
   env: Env | undefined,
   source: ApiQuota["source"],
   account: string | null,
+  operation: string,
 ): Promise<boolean> {
-  return Boolean(await env?.DASHBOARD_CACHE?.get(githubGraphqlBackoffKey(source, account)));
+  return Boolean(
+    await env?.DASHBOARD_CACHE?.get(githubGraphqlBackoffKey(source, account, operation)),
+  );
 }
 
 async function markGraphqlBackoff(
   env: Env | undefined,
   source: ApiQuota["source"],
   account: string | null,
+  operation: string,
   status: number,
 ): Promise<void> {
   await env?.DASHBOARD_CACHE?.put(
-    githubGraphqlBackoffKey(source, account),
+    githubGraphqlBackoffKey(source, account, operation),
     JSON.stringify({
       active: true,
       status,
       source,
       account,
+      operation,
       at: new Date().toISOString(),
     }),
     { expirationTtl: githubGraphqlBackoffSeconds },
@@ -989,19 +1028,30 @@ async function recordAuditedGitHubAccess(
   context?: ExecutionContext,
 ): Promise<void> {
   auditGitHubTokenUse(area, path, status, quota);
-  const write = recordGitHubAccessCounter(env, area, path, status, quota)
-    .then(() =>
-      sharedQuotaPressure(status, quota, rateLimited)
-        ? markSharedQuotaCooldown(env, quota, sharedQuotaCooldownReason(status, quota, rateLimited))
-        : undefined,
-    )
-    .catch(() => undefined);
-  if (forceWait || sharedQuotaPressure(status, quota, rateLimited)) {
-    await write;
-  } else if (context) {
-    context.waitUntil(write);
+  const write = () =>
+    recordGitHubAccessCounter(env, area, path, status, quota)
+      .then(() =>
+        sharedQuotaPressure(status, quota, rateLimited)
+          ? markSharedQuotaCooldown(
+              env,
+              quota,
+              sharedQuotaCooldownReason(status, quota, rateLimited),
+            )
+          : undefined,
+      )
+      .catch(() => undefined);
+  const mustWait = forceWait || sharedQuotaPressure(status, quota, rateLimited);
+  if (context) {
+    const previous = githubAccessWriteChains.get(context) ?? Promise.resolve();
+    const chained = previous.then(write, write);
+    githubAccessWriteChains.set(context, chained);
+    if (mustWait) {
+      await chained;
+    } else {
+      context.waitUntil(chained);
+    }
   } else {
-    await write;
+    await write();
   }
 }
 
@@ -1028,11 +1078,13 @@ function auditGitHubFetch(
 ): typeof fetch {
   return async (input, init) => {
     const url = new URL(String(input));
+    const graphqlOperation =
+      url.hostname === "api.github.com" && url.pathname === "/graphql"
+        ? githubGraphqlOperation(init)
+        : null;
     if (
-      url.hostname === "api.github.com" &&
-      url.pathname === "/graphql" &&
-      quotaSource === "shared" &&
-      (await graphqlBackoffActive(env, quotaSource, quotaAccount))
+      graphqlOperation &&
+      (await graphqlBackoffActive(env, quotaSource, quotaAccount, graphqlOperation))
     ) {
       console.log(
         JSON.stringify({
@@ -1040,17 +1092,24 @@ function auditGitHubFetch(
           area,
           source: quotaSource,
           account: quotaAccount,
+          operation: graphqlOperation,
         }),
       );
+      const hardBackoff = quotaSource === "shared";
       return jsonResponse(
         { message: "GitHub GraphQL temporarily paused after upstream errors" },
         503,
-        { "cache-control": "no-store", "x-releasebar-github-backoff": "graphql" },
+        {
+          "cache-control": "no-store",
+          ...(hardBackoff ? { "x-releasebar-github-backoff": "graphql" } : {}),
+        },
       );
     }
     const response = await workerFetch(input, signal ? { ...init, signal } : init);
     if (url.hostname === "api.github.com") {
-      const path = `${url.pathname}${url.search}`;
+      const path = graphqlOperation
+        ? githubGraphqlAuditPath(graphqlOperation)
+        : `${url.pathname}${url.search}`;
       const quota = quotaFromGitHubResponse(response, quotaSource, quotaAccount);
       const rateLimited =
         quota.source === "shared" ? await responseRateLimitSignal(response) : false;
@@ -1070,7 +1129,13 @@ function auditGitHubFetch(
         context,
       );
       if (isGraphqlServerError) {
-        const backoffWrite = markGraphqlBackoff(env, quotaSource, quotaAccount, response.status);
+        const backoffWrite = markGraphqlBackoff(
+          env,
+          quotaSource,
+          quotaAccount,
+          graphqlOperation ?? "unknown",
+          response.status,
+        );
         if (quotaSource === "shared") {
           await Promise.all([accessRecord, backoffWrite.catch(() => undefined)]);
           return jsonResponse(
@@ -1079,7 +1144,12 @@ function auditGitHubFetch(
             { "cache-control": "no-store", "x-releasebar-github-backoff": "graphql" },
           );
         }
-        void backoffWrite.catch(() => undefined);
+        const durableBackoffWrite = backoffWrite.catch(() => undefined);
+        if (context) {
+          context.waitUntil(durableBackoffWrite);
+        } else {
+          await durableBackoffWrite;
+        }
       }
       if (shouldWaitAccess || !context) await accessRecord;
     }
@@ -1393,6 +1463,7 @@ async function resolveOwners(
   quotaSource: ApiQuota["source"] = token || env.GITHUB_TOKEN ? "shared" : "anonymous",
   quotaAccount: string | null = null,
   signal?: AbortSignal,
+  context?: ExecutionContext,
 ): Promise<Owner[] | null> {
   const owners: Owner[] = [];
   for (const owner of ownerSlugs) {
@@ -1402,13 +1473,18 @@ async function resolveOwners(
       continue;
     }
     const resolved = await resolveOwnerType(owner, {
-      fetch: auditGitHubFetch("dashboard", quotaSource, quotaAccount, env, undefined, signal),
+      fetch: auditGitHubFetch("dashboard", quotaSource, quotaAccount, env, context, signal),
       token: token ?? env.GITHUB_TOKEN,
     });
     if (!resolved) {
       return null;
     }
-    await writeCachedOwner(env, resolved).catch(() => undefined);
+    const write = writeCachedOwner(env, resolved).catch(() => undefined);
+    if (context) {
+      context.waitUntil(write);
+    } else {
+      await write;
+    }
     owners.push(resolved);
   }
   return owners;
@@ -4229,14 +4305,15 @@ async function githubAccessSummary(
       topRoutes: [],
     };
   }
-  const keys: string[] = [];
-  for (const hour of githubAccessHours(hours)) {
-    const page = await env.DASHBOARD_CACHE.list({
-      prefix: `${githubAccessPrefix}${hour}:`,
-      limit: 1000,
-    });
-    keys.push(...page.keys.map((key) => key.name));
-  }
+  const pages = await Promise.all(
+    githubAccessHours(hours).map((hour) =>
+      env.DASHBOARD_CACHE!.list!({
+        prefix: `${githubAccessPrefix}${hour}:`,
+        limit: 1000,
+      }),
+    ),
+  );
+  const keys = pages.flatMap((page) => page.keys.map((key) => key.name));
 
   const counters = await Promise.all(
     keys.map(async (key): Promise<GitHubAccessRouteSummary[]> => {
@@ -4541,9 +4618,24 @@ function sharedQuotaDeferredTarget(target: RefreshTarget): boolean {
 
 type SchedulerDueOptions = {
   sharedQuotaPaused: boolean;
-  sharedGraphqlPaused: boolean;
+  sharedGraphqlPausedOperations: ReadonlySet<string>;
   now: number;
 };
+
+function refreshTargetGraphqlOperations(target: RefreshTarget): string[] {
+  const operations: string[] = [];
+  if (target.owners.length > 0) {
+    operations.push(
+      target.includeReleaseData
+        ? githubGraphqlOwnerReleaseOperation
+        : "ReleaseBarOwnerRepos.metadata",
+    );
+  }
+  if (target.includeReleaseData && target.owners.length > 0) {
+    operations.push(githubGraphqlRepoDetailsOperation);
+  }
+  return operations;
+}
 
 function dormantSharedTargetDue(target: RefreshTarget, now: number): boolean {
   const lastSeenAt = safeIso(target.lastSeenAt);
@@ -4564,7 +4656,7 @@ async function schedulerTargetDue(
   cached: DashboardPayload | null,
   options: SchedulerDueOptions = {
     sharedQuotaPaused: false,
-    sharedGraphqlPaused: false,
+    sharedGraphqlPausedOperations: new Set<string>(),
     now: Date.now(),
   },
 ): Promise<boolean> {
@@ -4576,10 +4668,10 @@ async function schedulerTargetDue(
   if (sharedQuotaDeferredTarget(target)) {
     return hasAppTokenCoverage();
   }
-  if (
-    (options.sharedQuotaPaused || options.sharedGraphqlPaused) &&
-    !(await hasAppTokenCoverage())
-  ) {
+  const sharedGraphqlPaused = refreshTargetGraphqlOperations(target).some((operation) =>
+    options.sharedGraphqlPausedOperations.has(operation),
+  );
+  if ((options.sharedQuotaPaused || sharedGraphqlPaused) && !(await hasAppTokenCoverage())) {
     return false;
   }
   if (!refreshTargetDue(target, cached, options.now)) return false;
@@ -4600,13 +4692,24 @@ async function schedulerTargetDue(
 }
 
 async function schedulerDueOptions(env: Env): Promise<SchedulerDueOptions> {
-  const [cooldown, graphBackoff] = await Promise.all([
+  const operations = [
+    "ReleaseBarOwnerRepos.metadata",
+    githubGraphqlOwnerReleaseOperation,
+    githubGraphqlRepoDetailsOperation,
+  ];
+  const [cooldown, ...backoffs] = await Promise.all([
     env.GITHUB_TOKEN ? sharedQuotaCooldown(env) : Promise.resolve(null),
-    env.GITHUB_TOKEN ? graphqlBackoffActive(env, "shared", null) : Promise.resolve(false),
+    ...operations.map((operation) =>
+      env.GITHUB_TOKEN
+        ? graphqlBackoffActive(env, "shared", null, operation)
+        : Promise.resolve(false),
+    ),
   ]);
   return {
     sharedQuotaPaused: Boolean(cooldown?.active),
-    sharedGraphqlPaused: graphBackoff,
+    sharedGraphqlPausedOperations: new Set(
+      operations.filter((_operation, index) => backoffs[index]),
+    ),
     now: Date.now(),
   };
 }
@@ -4825,7 +4928,17 @@ async function processRefreshJob(
     }
     const quotaSource = token?.quotaSource ?? (env.GITHUB_TOKEN ? "shared" : "anonymous");
     const quotaAccount = token?.quotaAccount ?? null;
-    if (await graphqlBackoffActive(env, quotaSource, quotaAccount)) {
+    const graphqlStates =
+      quotaSource === "shared"
+        ? await Promise.all(
+            refreshTargetGraphqlOperations(target).map(async (operation) => ({
+              operation,
+              active: await graphqlBackoffActive(env, quotaSource, quotaAccount, operation),
+            })),
+          )
+        : [];
+    const graphqlBackoff = graphqlStates.find((state) => state.active);
+    if (graphqlBackoff) {
       const nextDueAt = githubGraphqlBackoffDeferUntil();
       const now = new Date().toISOString();
       await mutateRefreshTargetState(env, target, {
@@ -4849,7 +4962,7 @@ async function processRefreshJob(
         jobId: job.id,
         status: "skipped",
         reason: "graphql-backoff",
-        detail: `until=${nextDueAt} source=${quotaSource} account=${quotaAccount ?? "_"}`,
+        detail: `until=${nextDueAt} source=${quotaSource} account=${quotaAccount ?? "_"} operation=${graphqlBackoff.operation}`,
       });
       return skipped;
     }
@@ -7565,8 +7678,13 @@ async function recentRepoStargazersGraphql(
   env: Env,
 ): Promise<GitHubStargazer[] | null> {
   if (!token) return null;
-  if (quotaSource === "shared" && (await graphqlBackoffActive(env, quotaSource, quotaAccount))) {
-    throw new GitHubRateLimitError("GitHub GraphQL backoff active", 15 * 60);
+  if (
+    await graphqlBackoffActive(env, quotaSource, quotaAccount, githubGraphqlRepoStargazersOperation)
+  ) {
+    if (quotaSource === "shared") {
+      throw new GitHubRateLimitError("GitHub GraphQL backoff active", githubGraphqlBackoffSeconds);
+    }
+    return null;
   }
   const response = await workerFetch("https://api.github.com/graphql", {
     method: "POST",
@@ -7588,14 +7706,26 @@ async function recentRepoStargazersGraphql(
   await recordAuditedGitHubAccess(
     env,
     "repo-audience",
-    "/graphql",
+    githubGraphqlAuditPath(githubGraphqlRepoStargazersOperation),
     response.status,
     quota,
     rateLimited,
   );
-  if (quota.source === "shared" && response.status >= 500 && response.status < 600) {
-    await markGraphqlBackoff(env, quota.source, quota.account, response.status);
-    throw new GitHubRateLimitError("GitHub GraphQL temporarily unavailable", 15 * 60);
+  if (response.status >= 500 && response.status < 600) {
+    await markGraphqlBackoff(
+      env,
+      quota.source,
+      quota.account,
+      githubGraphqlRepoStargazersOperation,
+      response.status,
+    );
+    if (quota.source === "shared") {
+      throw new GitHubRateLimitError(
+        "GitHub GraphQL temporarily unavailable",
+        githubGraphqlBackoffSeconds,
+      );
+    }
+    return null;
   }
   const body = (await response.json().catch(() => null)) as GraphQLStargazerResponse | null;
   const message = body?.errors
@@ -10352,6 +10482,12 @@ async function rebuild(
       repoLimit,
       repoScanLimit: repoScanBatchSize,
       repoScanTarget: repoLimit,
+      ownerPageSize:
+        dashboard.includeReleaseData &&
+        (dashboard.quotaSource ??
+          (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous")) === "app"
+          ? authenticatedReleaseOwnerPageSize
+          : 100,
       initialProjects: progressProjects,
       skipRepos: [...scannedRepos],
       token: dashboard.token ?? env.GITHUB_TOKEN,
@@ -10572,6 +10708,7 @@ async function refreshDashboardMetadataFirst(
   signal?: AbortSignal,
   resetProgress = false,
   boundedInitialPage = false,
+  context?: ExecutionContext,
 ): Promise<DashboardPayload | null> {
   const lock = await acquireBuildLock(env, dashboard.key);
   if (!lock) {
@@ -10641,7 +10778,7 @@ async function refreshDashboardMetadataFirst(
         dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
         dashboard.quotaAccount ?? null,
         env,
-        undefined,
+        context,
         signal,
       ),
       projectCache: env.DASHBOARD_CACHE,
@@ -11078,6 +11215,8 @@ async function ownerResponse(
           token?.token,
           token?.quotaSource,
           token?.quotaAccount ?? null,
+          undefined,
+          context,
         );
       } catch (error) {
         return jsonResponse({ error: dashboardErrorMessage(error) }, errorStatus(error), {
@@ -11122,7 +11261,14 @@ async function ownerResponse(
 
     let payload: DashboardPayload | null;
     try {
-      payload = await refreshDashboardMetadataFirst(dashboard, env, undefined, true);
+      payload = await refreshDashboardMetadataFirst(
+        dashboard,
+        env,
+        undefined,
+        true,
+        false,
+        context,
+      );
     } catch (error) {
       const failed = errorPayload(dashboard, env, dashboardErrorMessage(error));
       if (!displayCached) {
@@ -11318,6 +11464,7 @@ async function ownerResponse(
       token?.quotaSource,
       token?.quotaAccount ?? null,
       coldBuildController?.signal,
+      context,
     );
   } catch (error) {
     if (coldWaitTimer) {
@@ -11385,7 +11532,14 @@ async function ownerResponse(
   );
   const metadataFirst = options.includeUnreleased && dashboard.includeReleaseData;
   const build = metadataFirst
-    ? refreshDashboardMetadataFirst(dashboard, env, coldBuildController?.signal, false, true)
+    ? refreshDashboardMetadataFirst(
+        dashboard,
+        env,
+        coldBuildController?.signal,
+        false,
+        true,
+        context,
+      )
     : rebuildWithBuildLock(dashboard, env, coldBuildController?.signal);
   const buildReason = metadataFirst ? "cold-metadata" : "cold-build";
   try {

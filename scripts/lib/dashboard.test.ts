@@ -177,10 +177,23 @@ test("worker records client dashboard timing beacons in audit log", async () => 
 });
 
 test("worker stores GitHub access counters and cached owner identity", async () => {
-  const cache = kvStore();
+  const backingCache = kvStore();
+  let releaseAuditWrites: () => void = () => undefined;
+  const auditWriteGate = new Promise<void>((resolve) => {
+    releaseAuditWrites = resolve;
+  });
+  const cache = {
+    ...backingCache,
+    async put(key: string, value: string) {
+      if (key.startsWith("github:access:")) await auditWriteGate;
+      await backingCache.put(key, value);
+    },
+  };
   const originalFetch = globalThis.fetch;
+  const originalRandom = Math.random;
   const waits: Array<Promise<unknown>> = [];
   try {
+    Math.random = () => 0;
     globalThis.fetch = async (input) => {
       const url = new URL(String(input));
       if (url.pathname === "/users/owner") {
@@ -223,13 +236,24 @@ test("worker stores GitHub access counters and cached owner identity", async () 
       throw new Error(`unexpected ${url.pathname}`);
     };
 
-    const response = await worker.fetch(
-      new Request("https://release.bar/api/owner"),
-      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "token" },
-      { waitUntil: (promise) => waits.push(promise) },
-    );
+    let foregroundTimeout: ReturnType<typeof setTimeout> | undefined;
+    const response = await Promise.race([
+      worker.fetch(
+        new Request("https://release.bar/api/owner"),
+        { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "token" },
+        { waitUntil: (promise) => waits.push(promise) },
+      ),
+      new Promise<never>((_resolve, reject) => {
+        foregroundTimeout = setTimeout(
+          () => reject(new Error("foreground response waited for GitHub audit KV")),
+          1000,
+        );
+      }),
+    ]);
+    if (foregroundTimeout) clearTimeout(foregroundTimeout);
 
     assert.equal(response.status, 200);
+    releaseAuditWrites();
     await Promise.all(waits);
     const owner = JSON.parse((await cache.get("owner:v1:owner")) ?? "{}") as {
       login?: string;
@@ -247,10 +271,14 @@ test("worker stores GitHub access counters and cached owner identity", async () 
     assert.ok(
       records.some(
         (record) =>
-          record.area === "dashboard" && record.source === "shared" && record.route === "graphql",
+          record.area === "dashboard" &&
+          record.source === "shared" &&
+          record.route === "graphql/ReleaseBarOwnerRepos.metadata",
       ),
     );
   } finally {
+    releaseAuditWrites();
+    Math.random = originalRandom;
     globalThis.fetch = originalFetch;
   }
 });
@@ -4893,7 +4921,7 @@ test("worker manual dashboard refresh returns metadata before release hydration"
     }
     if (url.pathname === "/graphql") {
       const body = JSON.parse(String(init?.body ?? "{}")) as {
-        variables?: { first?: number };
+        variables?: { first?: number; includeReleases?: boolean };
       };
       assert.equal(body.variables?.first, 100);
       return Response.json({
@@ -5214,7 +5242,7 @@ test("worker GraphQL backoff does not fall through to shared REST scans", async 
     throw new Error(`unexpected fetch ${url.pathname}`);
   };
   const cache = kvStore({
-    "github:backoff:v1:graphql:shared:_": JSON.stringify({
+    "github:backoff:v2:graphql:shared:_:ReleaseBarOwnerRepos.metadata": JSON.stringify({
       active: true,
       status: 502,
       source: "shared",
@@ -5278,7 +5306,7 @@ test("worker GraphQL upstream failure does not fall through to shared REST scans
     const body = (await response.json()) as DashboardPayload;
     assert.equal(body.cache?.state, "error");
     assert.deepEqual(paths, ["/users/owner", "/graphql"]);
-    assert.ok(await cache.get("github:backoff:v1:graphql:shared:_"));
+    assert.ok(await cache.get("github:backoff:v2:graphql:shared:_:ReleaseBarOwnerRepos.metadata"));
     assert.ok(await cache.get("github:budget:v1:shared:graphql"));
   } finally {
     globalThis.fetch = originalFetch;
@@ -8700,6 +8728,8 @@ test("worker uses GitHub App installation token for cold owner dashboards", asyn
   const originalFetch = globalThis.fetch;
   const waits: Promise<unknown>[] = [];
   let ownerResolvedWithInstallationToken = false;
+  let appRestFallbacks = 0;
+  const appReleasePageSizes: number[] = [];
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
     const authorization = new Headers(init?.headers).get("authorization");
@@ -8731,8 +8761,22 @@ test("worker uses GitHub App installation token for cold owner dashboards", asyn
       ownerResolvedWithInstallationToken = true;
       return Response.json({ login: "openclaw", type: "Organization" });
     }
+    if (url.pathname === "/orgs/openclaw/repos") {
+      assert.equal(authorization, "Bearer installation-token");
+      appRestFallbacks += 1;
+      return Response.json([]);
+    }
     if (url.pathname === "/graphql") {
       assert.equal(authorization, "Bearer installation-token");
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        variables?: { first?: number; includeReleases?: boolean };
+      };
+      if (!body.variables?.includeReleases) {
+        return Response.json({ message: "upstream unavailable" }, { status: 502 });
+      }
+      if (body.variables?.includeReleases && body.variables.first) {
+        appReleasePageSizes.push(body.variables.first);
+      }
       return Response.json(
         {
           data: {
@@ -8771,7 +8815,14 @@ test("worker uses GitHub App installation token for cold owner dashboards", asyn
     await Promise.all(waits);
     assert.equal(body.cache?.quota?.source, "app");
     assert.equal(body.cache?.quota?.account, "openclaw");
-    assert.equal(body.cache?.quota?.remaining, 4997);
+    assert.equal(body.cache?.quota?.remaining, null);
+    assert.equal(appRestFallbacks, 1);
+    assert.deepEqual(appReleasePageSizes, [50]);
+    assert.ok(
+      await env.DASHBOARD_CACHE.get(
+        "github:backoff:v2:graphql:app:openclaw:ReleaseBarOwnerRepos.metadata",
+      ),
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -9810,7 +9861,7 @@ test("worker scheduler skips shared cold targets while GraphQL is backed off", a
     owner: "backedoff",
     owners: ["backedoff"],
     repos: [],
-    includeReleaseData: false,
+    includeReleaseData: true,
     path: "/backedoff",
     priority: 100,
     lastSeenAt: new Date().toISOString(),
@@ -9833,7 +9884,7 @@ test("worker scheduler skips shared cold targets while GraphQL is backed off", a
       exp,
     }),
     [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
-    "github:backoff:v1:graphql:shared:_": JSON.stringify({
+    "github:backoff:v2:graphql:shared:_:ReleaseBarRepoDetails": JSON.stringify({
       active: true,
       status: 502,
       source: "shared",
@@ -9867,6 +9918,75 @@ test("worker scheduler skips shared cold targets while GraphQL is backed off", a
   assert.equal(body.due, 0);
   assert.equal(body.enqueued, 0);
   assert.deepEqual(sentJobs, []);
+});
+
+test("worker scheduler keeps repo-only targets runnable during RepoDetails backoff", async () => {
+  const sessionId = "session-admin-repo-only-graphql-backoff";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const target: RefreshTarget = {
+    key: "dashboard:v6:repo-only",
+    kind: "dashboard",
+    owner: "custom",
+    owners: [],
+    repos: ["acme/releasebar"],
+    includeReleaseData: true,
+    path: "/custom",
+    priority: 100,
+    lastSeenAt: new Date().toISOString(),
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextDueAt: "2000-01-01T00:00:00Z",
+    failureCount: 0,
+  };
+  const cache = kvStore({
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+    [`refresh:target:v1:${target.key}`]: JSON.stringify(target),
+    "github:backoff:v2:graphql:shared:_:ReleaseBarRepoDetails": JSON.stringify({
+      active: true,
+      status: 502,
+      source: "shared",
+      account: null,
+      at: new Date().toISOString(),
+    }),
+  });
+  const sentJobs: RefreshJob[] = [];
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler/run", {
+      method: "POST",
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    {
+      AUTH_COOKIE_SECRET: "test-secret",
+      DASHBOARD_CACHE: cache,
+      GITHUB_TOKEN: "shared-token",
+      REFRESH_QUEUE: {
+        async send(job: RefreshJob) {
+          sentJobs.push(job);
+        },
+      },
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { due: number; enqueued: number };
+  assert.equal(body.due, 1);
+  assert.equal(body.enqueued, 1);
+  assert.equal(sentJobs.length, 1);
+  assert.equal(sentJobs[0]?.targetKey, target.key);
 });
 
 test("worker scheduler keeps dormant shared targets on weekly cadence after success", async () => {
@@ -11950,7 +12070,7 @@ test("worker refresh jobs defer shared work while GraphQL is backed off", async 
   const cache = kvStore({
     [`refresh:target:v1:${key}`]: JSON.stringify(target),
     [`refresh:job:v1:${job.id}`]: JSON.stringify(job),
-    "github:backoff:v1:graphql:shared:_": JSON.stringify({
+    "github:backoff:v2:graphql:shared:_:ReleaseBarRepoDetails": JSON.stringify({
       active: true,
       status: 502,
       source: "shared",

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.1 - Unreleased
+## 0.2.0 - 2026-06-13
 
 - Condensed owner dashboard activity totals, ranked repositories, metadata, and drill-down navigation into a responsive two-row digest.
 - Collapsed repository event logs by default on owner activity pages so the ranked summaries stay compact until expanded.
@@ -10,6 +10,7 @@
 - Prioritized webhook-triggered push and release refreshes by recent dashboard activity and skipped eager deep hydration for variants not viewed in the last day, reducing stale archived and fork variant queue and GitHub quota pressure.
 - Coalesced per-owner webhook bursts so issue and pull request events for the same repository share one authoritative count refresh, push and release bursts share one release refresh, and follower deliveries stop contending and requeueing behind active processing.
 - Returned current issue and PR counts before deep release scans when authenticated GitHub quota provides an exact split, marked anonymous REST splits unavailable without per-repository fan-out, moved progressive dashboard hydration to deadline-bounded Queue consumers with Durable Object checkpoints and strongly consistent target backoff state, removed stale cross-request build promises that could freeze scan progress, reduced oversized owner release GraphQL pages without changing prerelease selection, moved audit writes off foreground responses, scoped short upstream backoffs by GraphQL operation, and parallelized admin access-log reads.
+- Updated Svelte, Node.js type definitions, Oxfmt, and Oxlint to their latest compatible patch releases.
 
 ## 0.1.0 - 2026-06-11
 

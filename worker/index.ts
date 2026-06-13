@@ -2202,12 +2202,33 @@ function openApiSpec(origin: string): Record<string, unknown> {
     openapi: "3.1.0",
     info: {
       title: "ReleaseBar Public API",
-      version: "0.1.0",
+      version: "0.2.0",
       description:
         "Cached public GitHub release, people trust, org signal, and stargazer audience context for dashboards and PR-triage agents.",
     },
     servers: [{ url: origin }],
     paths: {
+      "/api/{owner}/activity": {
+        get: {
+          summary: "Get recent public GitHub activity grouped and ranked by repository",
+          parameters: [
+            { name: "owner", in: "path", required: true, schema: { type: "string" } },
+            {
+              name: "range",
+              in: "query",
+              schema: { enum: ["day", "week", "month"], default: "week" },
+            },
+          ],
+          responses: {
+            "200": {
+              description: "Owner activity",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/OwnerActivity" } },
+              },
+            },
+          },
+        },
+      },
       "/api/users/{login}/trust": {
         get: {
           summary: "Get cached public people trust or org signal context for one GitHub profile",
@@ -2265,6 +2286,122 @@ function openApiSpec(origin: string): Record<string, unknown> {
     components: {
       schemas: {
         CacheState: cacheState,
+        OwnerActivityEvent: {
+          type: "object",
+          required: ["id", "kind", "title", "repo", "url", "createdAt", "count"],
+          properties: {
+            id: { type: "string" },
+            kind: {
+              enum: [
+                "commit",
+                "pull_request",
+                "issue",
+                "comment",
+                "release",
+                "repository",
+                "other",
+              ],
+            },
+            title: { type: "string" },
+            repo: { type: "string" },
+            url: { type: ["string", "null"], format: "uri" },
+            createdAt: { type: "string", format: "date-time" },
+            count: { type: "number" },
+          },
+        },
+        OwnerActivityRepository: {
+          type: "object",
+          required: [
+            "fullName",
+            "url",
+            "events",
+            "commits",
+            "pullRequests",
+            "issues",
+            "comments",
+            "releases",
+            "lastActiveAt",
+          ],
+          properties: {
+            fullName: { type: "string" },
+            url: { type: "string", format: "uri" },
+            events: { type: "number" },
+            commits: { type: "number" },
+            pullRequests: { type: "number" },
+            issues: { type: "number" },
+            comments: { type: "number" },
+            releases: { type: "number" },
+            lastActiveAt: { type: "string", format: "date-time" },
+          },
+        },
+        OwnerActivitySummary: {
+          type: "object",
+          required: ["state", "text"],
+          properties: {
+            state: { enum: ["ready", "warming", "unavailable"] },
+            text: { type: ["string", "null"] },
+            repositories: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["fullName", "text"],
+                properties: {
+                  fullName: { type: "string" },
+                  text: { type: "string" },
+                },
+              },
+            },
+          },
+        },
+        OwnerActivity: {
+          type: "object",
+          required: ["owner", "range", "generatedAt", "cache", "totals", "repositories", "events"],
+          properties: {
+            owner: {
+              type: "object",
+              required: ["login", "type"],
+              properties: {
+                login: { type: "string" },
+                type: { enum: ["user", "org"] },
+                avatarUrl: { type: "string", format: "uri" },
+                url: { type: "string", format: "uri" },
+              },
+            },
+            range: { enum: ["day", "week", "month"] },
+            generatedAt: { type: "string", format: "date-time" },
+            cache: { $ref: "#/components/schemas/CacheState" },
+            totals: {
+              type: "object",
+              required: [
+                "events",
+                "commits",
+                "pullRequests",
+                "issues",
+                "comments",
+                "releases",
+                "repositories",
+              ],
+              properties: {
+                events: { type: "number" },
+                commits: { type: "number" },
+                pullRequests: { type: "number" },
+                issues: { type: "number" },
+                comments: { type: "number" },
+                releases: { type: "number" },
+                repositories: { type: "number" },
+              },
+            },
+            repositories: {
+              type: "array",
+              items: { $ref: "#/components/schemas/OwnerActivityRepository" },
+            },
+            events: {
+              type: "array",
+              items: { $ref: "#/components/schemas/OwnerActivityEvent" },
+            },
+            summary: { $ref: "#/components/schemas/OwnerActivitySummary" },
+          },
+        },
         TrustDimensions: trustDimensions,
         TrustFactor: trustFactor,
         TrustProfile: {
@@ -15908,15 +16045,26 @@ export default {
           const attempts = message.attempts ?? 1;
           const expired = Date.now() - safeIso(fanoutJob.createdAt) >= githubWebhookDeliveryTtlMs;
           if (attempts >= refreshQueueMaxAttempts || expired) {
-            await abandonGitHubWebhookDelivery(env, fanoutJob.delivery, fanoutJob.payload).catch(
-              async (abandonError) =>
-                auditSyncEvent(env, {
-                  event: "github_webhook_admission_abandon_failed",
-                  status: "failed",
-                  reason: errorMessage(abandonError),
-                  detail: `githubEvent=${fanoutJob.event} delivery=${fanoutJob.delivery} fanout=true`,
-                }),
-            );
+            try {
+              await abandonGitHubWebhookDelivery(env, fanoutJob.delivery, fanoutJob.payload);
+            } catch (abandonError) {
+              await auditSyncEvent(env, {
+                event: "github_webhook_admission_abandon_failed",
+                status: "failed",
+                reason: errorMessage(abandonError),
+                detail: `githubEvent=${fanoutJob.event} delivery=${fanoutJob.delivery} fanout=true`,
+              });
+              message.retry({ delaySeconds: Math.min(delaySeconds, 5 * 60) });
+              continue;
+            }
+            await auditSyncEvent(env, {
+              event: "github_webhook_fanout_failed",
+              status: "failed",
+              reason: `${errorMessage(error)}; durable retry limit reached`,
+              detail: `githubEvent=${fanoutJob.event} delivery=${fanoutJob.delivery} source=${fanoutJob.source} attempts=${attempts}`,
+            }).catch(() => undefined);
+            message.ack();
+            continue;
           }
           await auditSyncEvent(env, {
             event: "github_webhook_fanout_failed",

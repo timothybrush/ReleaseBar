@@ -2975,18 +2975,23 @@ test("worker serves OpenAPI spec aliases for Swagger tooling", async () => {
     assert.equal(response.status, 200);
     const body = (await response.json()) as {
       openapi?: string;
+      info?: { version?: string };
       paths?: Record<string, unknown>;
       components?: {
         schemas?: {
           CacheState?: {
             properties?: Record<string, unknown>;
           };
+          OwnerActivity?: unknown;
         };
       };
     };
     assert.equal(body.openapi, "3.1.0");
+    assert.equal(body.info?.version, "0.2.0");
+    assert.ok(body.paths?.["/api/{owner}/activity"]);
     assert.ok(body.paths?.["/api/users/{login}/trust"]);
     assert.ok(body.paths?.["/api/repos/{owner}/{repo}/audience"]);
+    assert.ok(body.components?.schemas?.OwnerActivity);
     assert.ok(body.components?.schemas?.CacheState?.properties?.countsUpdatedAt);
     assert.ok(body.components?.schemas?.CacheState?.properties?.releasesUpdatedAt);
     assert.ok(body.components?.schemas?.CacheState?.properties?.ciUpdatedAt);
@@ -20600,6 +20605,7 @@ test("worker quickly requeues busy webhook jobs without consuming their failure 
 
 test("terminal webhook fanout clears admission and processing deduplication", async () => {
   const abandoned: string[] = [];
+  let acknowledged = false;
   let retried = false;
   const locks = {
     idFromName: (name: string) => name,
@@ -20646,7 +20652,7 @@ test("terminal webhook fanout clears admission and processing deduplication", as
           },
           attempts: 11,
           ack() {
-            throw new Error("failed fanout should retry");
+            acknowledged = true;
           },
           retry() {
             retried = true;
@@ -20662,5 +20668,67 @@ test("terminal webhook fanout clears admission and processing deduplication", as
   );
 
   assert.deepEqual(abandoned.sort(), ["github-webhook-admission", "github-webhook-process:owner"]);
+  assert.equal(acknowledged, true);
+  assert.equal(retried, false);
+});
+
+test("terminal webhook fanout retries when durable abandonment fails", async () => {
+  let acknowledged = false;
+  let retried = false;
+  const locks = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: async () => new Response(null, { status: 500 }),
+    }),
+  };
+  const cache = {
+    ...kvStore(),
+    async list() {
+      throw new Error("fanout page failed");
+    },
+  };
+
+  await worker.queue(
+    {
+      messages: [
+        {
+          body: {
+            kind: "github-webhook-fanout",
+            id: "fanout-terminal-abandon-failed",
+            event: "push",
+            delivery: "delivery-fanout-terminal-abandon-failed",
+            payload: {
+              ref: "refs/heads/main",
+              repository: {
+                full_name: "owner/repo",
+                default_branch: "main",
+              },
+            },
+            createdAt: new Date().toISOString(),
+            action: {
+              reason: "webhook:push",
+              includeReleaseDataOnly: true,
+              invalidateDashboard: true,
+            },
+            source: "owner",
+          },
+          attempts: 11,
+          ack() {
+            acknowledged = true;
+          },
+          retry() {
+            retried = true;
+          },
+        } as never,
+      ],
+    },
+    {
+      DASHBOARD_CACHE: cache,
+      DASHBOARD_LOCKS: locks,
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(acknowledged, false);
   assert.equal(retried, true);
 });

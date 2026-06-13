@@ -3029,7 +3029,7 @@
                   {/if}
                 </div>
 
-                <details class="activity-event-details" open={index < 3}>
+                <details class="activity-event-details">
                   <summary>
                     <span>event log</span>
                     <small>{activityRepositoryEvents(repo.fullName).length} grouped entries</small>

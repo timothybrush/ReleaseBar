@@ -559,6 +559,12 @@ test("owner route parsing keeps root hot board and owners API-backed", () => {
   );
 });
 
+test("owner activity event logs are collapsed by default", async () => {
+  const source = await readFile("src/App.svelte", "utf8");
+  assert.match(source, /<details class="activity-event-details">/);
+  assert.doesNotMatch(source, /<details class="activity-event-details"[^>]*\bopen(?:=|\s|>)/);
+});
+
 test("dashboard view state restores search, filters, sorting, and dev columns", () => {
   assert.deepEqual(
     parseViewState("?q=CodexBar&lang=Swift&filter=attention&sort=issues&dir=asc", false),

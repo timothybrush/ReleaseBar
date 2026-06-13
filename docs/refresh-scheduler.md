@@ -31,7 +31,7 @@ Every cron tick first refreshes lean issue, pull request, archive, and activity 
 
 The same tick schedules deep dashboard work:
 
-1. Lists known refresh targets.
+1. Lists one rotating page of up to 120 current-schema refresh targets, ignoring obsolete cache-schema records.
 2. Reads the cached dashboard payload for each target.
 3. Marks a target due when the cache is missing, expired, errored, incomplete, or past `nextDueAt`.
 4. Skips targets that already have a queued or running job.
@@ -81,6 +81,8 @@ This means popular or installed accounts can refresh without burning the shared 
 - queue-backed vs direct fallback mode
 - sharded GitHub token-use counters from the last 24 hours, also available at `/api/admin/github-access`
 - recent targets, jobs, and audit events
+
+The target total comes from lightweight key listings. Due counts describe the most recent bounded scheduler scan rather than forcing the admin request to read every target and dashboard cache.
 
 Audit events are stored in KV and logged to Worker logs with `area: "scheduler"`. Keep audit detail short and structured so production logs remain searchable.
 

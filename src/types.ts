@@ -586,6 +586,7 @@ export type SchedulerAdminPayload = {
   authorized: boolean;
   status: {
     targets: number;
+    scannedTargets: number;
     dueTargets: number;
     queuedJobs: number;
     runningJobs: number;

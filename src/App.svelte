@@ -1672,7 +1672,7 @@
         admin = body;
         generatedLabel = `scheduler · ${numberFormat.format(body.status.targets)} targets`;
         generatedDetail = [
-          `${numberFormat.format(body.status.dueTargets)} due`,
+          `${numberFormat.format(body.status.dueTargets)} due in ${numberFormat.format(body.status.scannedTargets)}-target scan`,
           `${numberFormat.format(body.status.runningJobs)} running`,
           body.status.queueConfigured ? "queue configured" : "direct fallback",
         ].join(" · ");
@@ -2712,7 +2712,7 @@
             <strong>{numberFormat.format(admin.status.targets)}</strong>
           </div>
           <div>
-            <span>due</span>
+            <span>due in scan</span>
             <strong>{numberFormat.format(admin.status.dueTargets)}</strong>
           </div>
           <div>

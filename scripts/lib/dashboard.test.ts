@@ -2289,7 +2289,7 @@ test("worker serves stale discovery caches to crawlers without searching GitHub"
 test("worker builds cached repository detail with releases and stats", async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;
-  globalThis.fetch = async (input) => {
+  globalThis.fetch = async (input, init) => {
     calls += 1;
     const url = new URL(String(input));
     const path = url.pathname;
@@ -2402,20 +2402,21 @@ test("worker builds cached repository detail with releases and stats", async () 
     if (path === "/repos/acme/releasebar/stats/code_frequency") {
       return Response.json([[1778889600, 120, -20]]);
     }
-    if (path === "/search/issues") {
-      const query = url.searchParams.get("q") ?? "";
-      if (query.includes("is:issue") && query.includes("created:>=")) {
-        return Response.json({ total_count: 5 });
-      }
-      if (query.includes("is:issue") && query.includes("closed:>=")) {
-        return Response.json({ total_count: 3 });
-      }
-      if (query.includes("is:pr") && query.includes("created:>=")) {
-        return Response.json({ total_count: 4 });
-      }
-      if (query.includes("is:pr") && query.includes("closed:>=")) {
-        return Response.json({ total_count: 2 });
-      }
+    if (path === "/graphql") {
+      const payload = JSON.parse(String(init?.body)) as {
+        query?: string;
+        variables?: Record<string, string>;
+      };
+      assert.match(payload.query ?? "", /ReleaseBarRepoWorkTrend/);
+      assert.match(payload.variables?.issuesOpened30d ?? "", /is:issue created:>=/);
+      return Response.json({
+        data: {
+          issuesOpened30d: { issueCount: 5 },
+          issuesClosed30d: { issueCount: 3 },
+          pullRequestsOpened30d: { issueCount: 4 },
+          pullRequestsClosed30d: { issueCount: 2 },
+        },
+      });
     }
     throw new Error(`unexpected fetch ${url.pathname}`);
   };
@@ -2494,7 +2495,7 @@ test("worker builds cached repository detail with releases and stats", async () 
     const cachedBody = (await cached.json()) as RepoDetailPayload;
     assert.equal(cachedBody.contributors[0]?.trustScore, 62);
     assert.equal(cachedBody.contributors[0]?.trustTier, "medium");
-    assert.equal(calls, 14);
+    assert.equal(calls, 11);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -5544,7 +5545,7 @@ test("worker does not cache repository detail when optional calls are rate limit
   }
 });
 
-test("worker keeps repository detail when work trend search is rate limited", async () => {
+test("worker keeps repository detail when work trend GraphQL is rate limited", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input) => {
     const url = new URL(String(input));
@@ -5584,7 +5585,7 @@ test("worker keeps repository detail when work trend search is rate limited", as
     }
     if (path === "/repos/acme/trendbar/stats/commit_activity") return Response.json([]);
     if (path === "/repos/acme/trendbar/stats/code_frequency") return Response.json([]);
-    if (path === "/search/issues") {
+    if (path === "/graphql") {
       return Response.json(
         { message: "API rate limit exceeded" },
         { status: 403, headers: { "x-ratelimit-remaining": "0" } },
@@ -5612,7 +5613,7 @@ test("worker reuses repository detail auxiliary caches across rebuilds", async (
   const originalFetch = globalThis.fetch;
   const calls = new Map<string, number>();
   const count = (key: string) => calls.set(key, (calls.get(key) ?? 0) + 1);
-  globalThis.fetch = async (input) => {
+  globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
     const path = url.pathname;
     if (path === "/repos/acme/cachebar") {
@@ -5688,9 +5689,18 @@ test("worker reuses repository detail auxiliary caches across rebuilds", async (
       count("code_frequency");
       return new Response("", { status: 202 });
     }
-    if (path === "/search/issues") {
-      count(`search:${url.searchParams.get("q") ?? ""}`);
-      return Response.json({ total_count: 1 });
+    if (path === "/graphql") {
+      const payload = JSON.parse(String(init?.body)) as { query?: string };
+      assert.match(payload.query ?? "", /ReleaseBarRepoWorkTrend/);
+      count("work_trend");
+      return Response.json({
+        data: {
+          issuesOpened30d: { issueCount: 1 },
+          issuesClosed30d: { issueCount: 1 },
+          pullRequestsOpened30d: { issueCount: 1 },
+          pullRequestsClosed30d: { issueCount: 1 },
+        },
+      });
     }
     throw new Error(`unexpected fetch ${url.pathname}`);
   };
@@ -5712,7 +5722,7 @@ test("worker reuses repository detail auxiliary caches across rebuilds", async (
     assert.equal(calls.get("languages"), 1);
     assert.equal(calls.get("commit_activity"), 1);
     assert.equal(calls.get("code_frequency") ?? 0, 0);
-    assert.equal([...calls.keys()].filter((key) => key.startsWith("search:")).length, 4);
+    assert.equal(calls.get("work_trend"), 1);
 
     await cache.delete("repo-detail:v4:acme/cachebar");
 
@@ -5731,7 +5741,7 @@ test("worker reuses repository detail auxiliary caches across rebuilds", async (
     assert.equal(calls.get("languages"), 1);
     assert.equal(calls.get("commit_activity"), 1);
     assert.equal(calls.get("code_frequency") ?? 0, 0);
-    assert.equal([...calls.keys()].filter((key) => key.startsWith("search:")).length, 4);
+    assert.equal(calls.get("work_trend"), 1);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -10799,6 +10809,7 @@ test("worker admin scheduler requires an admin session and reports refresh targe
   assert.equal(response.status, 200);
   const body = (await response.json()) as SchedulerAdminPayload;
   assert.equal(body.status.targets, 1);
+  assert.equal(body.status.scannedTargets, 1);
   assert.equal(body.status.dueTargets, 0);
   assert.equal(body.status.queuedJobs, 1);
   assert.equal(body.targets[0]?.owner, "openclaw");
@@ -10829,6 +10840,108 @@ test("worker admin scheduler requires an admin session and reports refresh targe
   assert.equal(runBody.enqueued, 0);
   assert.equal(runBody.due, 0);
   assert.deepEqual(sentJobs, []);
+});
+
+test("worker scheduler rotates bounded current-schema target pages", async () => {
+  const sessionId = "session-admin-pagination";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const now = new Date().toISOString();
+  const entries: Record<string, string> = {
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+  };
+  for (let index = 0; index < 121; index += 1) {
+    const owner = `page-${String(index).padStart(3, "0")}`;
+    const key = `dashboard:v6:${owner}`;
+    const target: RefreshTarget = {
+      key,
+      kind: "dashboard",
+      indexVersion: 2,
+      owner,
+      owners: [],
+      repos: [],
+      includeReleaseData: false,
+      path: `/${owner}`,
+      priority: 60,
+      lastSeenAt: now,
+      lastAttemptAt: now,
+      lastSuccessAt: now,
+      nextDueAt: "2999-01-01T00:00:00Z",
+      failureCount: 0,
+    };
+    entries[`refresh:target:v1:${key}`] = JSON.stringify(target);
+    entries[key] = JSON.stringify(testDashboard(owner, []));
+  }
+  entries["refresh:target:v1:dashboard:v5:obsolete"] = JSON.stringify({
+    key: "dashboard:v5:obsolete",
+    kind: "dashboard",
+    owner: "obsolete",
+    owners: [],
+    repos: [],
+    includeReleaseData: false,
+    path: "/obsolete",
+    priority: 60,
+    lastSeenAt: now,
+    lastAttemptAt: now,
+    lastSuccessAt: now,
+    nextDueAt: "2999-01-01T00:00:00Z",
+    failureCount: 0,
+  } satisfies RefreshTarget);
+  const cache = kvStore(entries);
+  const run = async () => {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/admin/scheduler/run", {
+        method: "POST",
+        headers: { cookie: `rd_session=${authCookie}` },
+      }),
+      {
+        AUTH_COOKIE_SECRET: "test-secret",
+        DASHBOARD_CACHE: cache,
+      },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    return (await response.json()) as { considered: number; due: number; enqueued: number };
+  };
+
+  assert.deepEqual(await run(), { ok: true, considered: 120, due: 0, enqueued: 0 });
+  const firstState = JSON.parse((await cache.get("refresh:state:v1")) ?? "{}") as {
+    targetCursor?: string;
+  };
+  assert.equal(firstState.targetCursor, "120");
+
+  assert.deepEqual(await run(), { ok: true, considered: 1, due: 0, enqueued: 0 });
+  const secondState = JSON.parse((await cache.get("refresh:state:v1")) ?? "{}") as {
+    targetCursor?: string;
+  };
+  assert.equal(secondState.targetCursor, undefined);
+
+  const admin = await worker.fetch(
+    new Request("https://release.bar/api/admin/scheduler", {
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    {
+      AUTH_COOKIE_SECRET: "test-secret",
+      DASHBOARD_CACHE: cache,
+    },
+    { waitUntil: () => undefined },
+  );
+  assert.equal(admin.status, 200);
+  const adminBody = (await admin.json()) as SchedulerAdminPayload;
+  assert.equal(adminBody.status.targets, 121);
+  assert.equal(adminBody.status.scannedTargets, 1);
+  assert.equal(adminBody.targets.length, 120);
 });
 
 test("worker queue skips jobs from obsolete dashboard schemas", async () => {

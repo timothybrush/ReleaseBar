@@ -298,6 +298,7 @@ const githubGraphqlOwnerCountsOperation = "ReleaseBarOwnerCounts";
 const githubGraphqlOwnerReleaseOperation = "ReleaseBarOwnerRepos.release";
 const githubGraphqlRepoDetailsOperation = "ReleaseBarRepoDetails";
 const githubGraphqlRepoStargazersOperation = "ReleaseBarRepoStargazers";
+const githubGraphqlRepoWorkTrendOperation = "ReleaseBarRepoWorkTrend";
 const githubAccessAdminHours = 24;
 const githubAccessAdminRouteLimit = 30;
 const crawlerUserAgentPattern =
@@ -339,7 +340,6 @@ const githubWebhookPendingLimit = 256;
 const githubWebhookPendingLimitBytes = 96 * 1024;
 const manualRefreshCooldownPrefix = `refresh:manual:v1:`;
 const manualRefreshCooldownSeconds = 10 * 60;
-const refreshTargetListLimit = 5000;
 const refreshTargetSourceLimit = 512;
 const durableRefreshTargetIndexLimit = refreshTargetSourceLimit;
 const durableRefreshTargetEntryLimitBytes = 8 * 1024;
@@ -354,6 +354,8 @@ const webhookRecentTargetMs = 24 * 60 * 60 * 1000;
 const refreshJobListLimit = 80;
 const refreshAuditListLimit = 80;
 const schedulerBatchLimit = 20;
+const schedulerTargetPageLimit = 120;
+const adminTargetListLimit = 120;
 const schedulerSharedDormantRefreshMs = 7 * 24 * 60 * 60 * 1000;
 const schedulerSharedDormantAfterMs = 24 * 60 * 60 * 1000;
 const schedulerRecentViewMs = 7 * 24 * 60 * 60 * 1000;
@@ -5570,27 +5572,58 @@ async function refreshTargetProfile(
 
 async function listRefreshTargets(
   env: Env,
-  limit = refreshTargetListLimit,
-): Promise<RefreshTarget[]> {
-  if (!env.DASHBOARD_CACHE?.list) return [];
-  const targets: RefreshTarget[] = [];
+  limit = schedulerTargetPageLimit,
+  cursor?: string,
+): Promise<{ targets: RefreshTarget[]; nextCursor?: string }> {
+  if (!env.DASHBOARD_CACHE?.list) return { targets: [] };
+  const page = await env.DASHBOARD_CACHE.list({
+    prefix: `${refreshTargetPrefix}${dashboardCachePrefix}`,
+    limit,
+    ...(cursor ? { cursor } : {}),
+  });
+  const targets = await mapConcurrent(page.keys, 16, async (key) => {
+    const raw = await env.DASHBOARD_CACHE?.get(key.name);
+    if (!raw) return null;
+    const target = tryJsonParse<RefreshTarget>(raw, `refresh target ${key.name}`);
+    return isRefreshTarget(target) && currentDashboardCacheKey(target.key) ? target : null;
+  });
+  return {
+    targets: targets.filter((target): target is RefreshTarget => target !== null),
+    nextCursor: page.list_complete ? undefined : page.cursor,
+  };
+}
+
+async function refreshTargetInventory(
+  env: Env,
+  sampleLimit = adminTargetListLimit,
+): Promise<{ total: number; targets: RefreshTarget[] }> {
+  if (!env.DASHBOARD_CACHE?.list) return { total: 0, targets: [] };
+  const sampleKeys: string[] = [];
+  let total = 0;
   let cursor: string | undefined;
   do {
     const page = await env.DASHBOARD_CACHE.list({
-      prefix: refreshTargetPrefix,
-      limit: Math.min(1000, limit - targets.length),
+      prefix: `${refreshTargetPrefix}${dashboardCachePrefix}`,
+      limit: 1000,
       ...(cursor ? { cursor } : {}),
     });
+    total += page.keys.length;
     for (const key of page.keys) {
-      const raw = await env.DASHBOARD_CACHE.get(key.name);
-      if (!raw) continue;
-      const target = tryJsonParse<RefreshTarget>(raw, `refresh target ${key.name}`);
-      if (isRefreshTarget(target) && currentDashboardCacheKey(target.key)) targets.push(target);
-      if (targets.length >= limit) break;
+      if (sampleKeys.length >= sampleLimit) break;
+      sampleKeys.push(key.name);
     }
     cursor = page.list_complete ? undefined : page.cursor;
-  } while (cursor && targets.length < limit);
-  return targets;
+  } while (cursor);
+  const targets = await mapConcurrent(sampleKeys, 16, async (key) => {
+    const raw = await env.DASHBOARD_CACHE?.get(key);
+    if (!raw) return null;
+    const target = tryJsonParse<RefreshTarget>(raw, `refresh target ${key}`);
+    return isRefreshTarget(target) && currentDashboardCacheKey(target.key) ? target : null;
+  });
+  return {
+    total,
+    targets: targets.filter((target): target is RefreshTarget => target !== null),
+  };
 }
 
 async function backfillRefreshTargetIndexes(env: Env, targets: RefreshTarget[]): Promise<void> {
@@ -6546,25 +6579,31 @@ async function schedulerTick(
   cause: string,
   limit = schedulerBatchLimit,
 ): Promise<{ enqueued: number; considered: number; due: number }> {
-  const [targets, jobs, dueOptions] = await Promise.all([
-    listRefreshTargets(env),
+  const [stateRaw, jobs, dueOptions] = await Promise.all([
+    env.DASHBOARD_CACHE?.get(refreshStateKey),
     listRefreshJobs(env),
     schedulerDueOptions(env),
   ]);
+  const previousState = stateRaw
+    ? tryJsonParse<{
+        targetCursor?: string;
+      }>(stateRaw, "refresh state")
+    : null;
+  const page = await listRefreshTargets(env, schedulerTargetPageLimit, previousState?.targetCursor);
+  const targets = page.targets;
   await backfillRefreshTargetIndexes(env, targets);
   const countRefresh = await refreshDueOwnerCounts(env, context, targets, dueOptions.now);
   const activeTargetKeys = new Set(
     jobs.filter((job) => refreshJobActive(job)).map((job) => job.targetKey),
   );
-  const pairs = await Promise.all(
-    targets.map(async (target) => ({ target, cached: await readCached(env, target.key) })),
-  );
-  const duePairs = await Promise.all(
-    pairs.map(async (pair) => ({
-      ...pair,
-      due: await schedulerTargetDue(env, pair.target, pair.cached, dueOptions),
-    })),
-  );
+  const pairs = await mapConcurrent(targets, 16, async (target) => ({
+    target,
+    cached: await readCached(env, target.key),
+  }));
+  const duePairs = await mapConcurrent(pairs, 16, async (pair) => ({
+    ...pair,
+    due: await schedulerTargetDue(env, pair.target, pair.cached, dueOptions),
+  }));
   const due = duePairs
     .filter(({ due }) => due)
     .filter(({ target }) => !activeTargetKeys.has(target.key))
@@ -6588,6 +6627,12 @@ async function schedulerTick(
       considered: targets.length,
       due: due.length,
       enqueued,
+      targetCursor: page.nextCursor,
+      nextDueAt:
+        targets
+          .map((target) => target.nextDueAt)
+          .filter((value) => safeIso(value) > 0)
+          .sort()[0] ?? null,
       countRefresh,
     }),
     { expirationTtl: dashboardStorageTtlSeconds },
@@ -7028,8 +7073,8 @@ async function processRefreshJobFallback(input: RefreshJob, env: Env): Promise<R
 }
 
 async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
-  const [targets, jobs, events, stateRaw, access, auth, dueOptions] = await Promise.all([
-    listRefreshTargets(env, refreshTargetListLimit),
+  const [inventory, jobs, events, stateRaw, access, auth, dueOptions] = await Promise.all([
+    refreshTargetInventory(env),
     listRefreshJobs(env),
     listAuditEvents(env),
     env.DASHBOARD_CACHE?.get(refreshStateKey),
@@ -7037,38 +7082,53 @@ async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
     authFunnelSummary(env),
     schedulerDueOptions(env),
   ]);
-  const state = stateRaw ? tryJsonParse<{ lastTickAt?: string }>(stateRaw, "refresh state") : null;
+  const state = stateRaw
+    ? tryJsonParse<{
+        lastTickAt?: string;
+        considered?: number;
+        due?: number;
+        nextDueAt?: string | null;
+      }>(stateRaw, "refresh state")
+    : null;
+  const targets = inventory.targets;
   const activeTargetKeys = new Set(
     jobs.filter((job) => refreshJobActive(job)).map((job) => job.targetKey),
   );
   const activeJobs = jobs.filter((job) => refreshJobActive(job));
-  const targetStates = await Promise.all(
-    targets.map(async (target) => ({ target, cached: await readCached(env, target.key) })),
-  );
-  const dueTargetStates = await Promise.all(
-    targetStates.map(async (state) => ({
-      ...state,
-      due: await schedulerTargetDue(env, state.target, state.cached, dueOptions),
-    })),
-  );
-  const dueTargets = dueTargetStates.filter(
-    ({ target, due }) => due && !activeTargetKeys.has(target.key),
-  ).length;
+  let scannedTargets = state?.considered ?? 0;
+  let dueTargets = state?.due ?? 0;
+  let nextDueAt = state?.nextDueAt ?? null;
+  if (inventory.total <= adminTargetListLimit) {
+    const targetStates = await mapConcurrent(targets, 16, async (target) => ({
+      target,
+      cached: await readCached(env, target.key),
+    }));
+    const dueTargetStates = await mapConcurrent(targetStates, 16, async (targetState) => ({
+      ...targetState,
+      due: await schedulerTargetDue(env, targetState.target, targetState.cached, dueOptions),
+    }));
+    scannedTargets = targets.length;
+    dueTargets = dueTargetStates.filter(
+      ({ target, due }) => due && !activeTargetKeys.has(target.key),
+    ).length;
+    nextDueAt =
+      targets
+        .map((target) => target.nextDueAt)
+        .filter((value) => safeIso(value) > 0)
+        .sort()[0] ?? null;
+  }
   return {
     generatedAt: new Date().toISOString(),
     authorized: true,
     status: {
-      targets: targets.length,
+      targets: inventory.total,
+      scannedTargets,
       dueTargets,
       queuedJobs: activeJobs.filter((job) => job.status === "queued").length,
       runningJobs: activeJobs.filter((job) => job.status === "running").length,
       failedJobs: jobs.filter((job) => job.status === "failed").length,
       lastTickAt: state?.lastTickAt ?? null,
-      nextDueAt:
-        targets
-          .map((target) => target.nextDueAt)
-          .filter((value) => safeIso(value) > 0)
-          .sort()[0] ?? null,
+      nextDueAt,
       queueConfigured: Boolean(env.REFRESH_QUEUE),
     },
     targets: targets.sort((a, b) => safeIso(a.nextDueAt) - safeIso(b.nextDueAt)).slice(0, 120),
@@ -8185,6 +8245,116 @@ async function detailGitHubSearchCount(
   return count;
 }
 
+type RepoWorkTrendQueries = {
+  issuesOpened30d: string;
+  issuesClosed30d: string;
+  pullRequestsOpened30d: string;
+  pullRequestsClosed30d: string;
+};
+
+type RepoWorkTrendGraphqlResponse = {
+  data?: {
+    issuesOpened30d?: { issueCount?: number };
+    issuesClosed30d?: { issueCount?: number };
+    pullRequestsOpened30d?: { issueCount?: number };
+    pullRequestsClosed30d?: { issueCount?: number };
+  };
+  errors?: Array<{ message?: string; type?: string }>;
+};
+
+const repoWorkTrendQuery = /* GraphQL */ `
+  query ReleaseBarRepoWorkTrend(
+    $issuesOpened30d: String!
+    $issuesClosed30d: String!
+    $pullRequestsOpened30d: String!
+    $pullRequestsClosed30d: String!
+  ) {
+    issuesOpened30d: search(query: $issuesOpened30d, type: ISSUE, first: 1) {
+      issueCount
+    }
+    issuesClosed30d: search(query: $issuesClosed30d, type: ISSUE, first: 1) {
+      issueCount
+    }
+    pullRequestsOpened30d: search(query: $pullRequestsOpened30d, type: ISSUE, first: 1) {
+      issueCount
+    }
+    pullRequestsClosed30d: search(query: $pullRequestsClosed30d, type: ISSUE, first: 1) {
+      issueCount
+    }
+  }
+`;
+
+async function detailGitHubWorkTrend(
+  queries: RepoWorkTrendQueries,
+  token: string,
+  quotaSource: ApiQuota["source"],
+  quotaAccount: string | null,
+  onQuota: (quota: ApiQuota) => void,
+  auditArea: GitHubAuditArea,
+  env?: Env,
+): Promise<Omit<RepoDetailWorkTrend, "since">> {
+  if (
+    await graphqlBackoffActive(env, quotaSource, quotaAccount, githubGraphqlRepoWorkTrendOperation)
+  ) {
+    throw new GitHubRateLimitError("GitHub GraphQL backoff active", githubGraphqlBackoffSeconds);
+  }
+  const response = await workerFetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "user-agent": "ReleaseBar",
+      "x-github-api-version": "2022-11-28",
+    },
+    body: JSON.stringify({ query: repoWorkTrendQuery, variables: queries }),
+  });
+  const quota = quotaFromGitHubResponse(response, quotaSource, quotaAccount);
+  onQuota(quota);
+  const rateLimited = quota.source === "shared" ? await responseRateLimitSignal(response) : false;
+  await recordAuditedGitHubAccess(
+    env,
+    auditArea,
+    githubGraphqlAuditPath(githubGraphqlRepoWorkTrendOperation),
+    response.status,
+    quota,
+    rateLimited,
+  );
+  if (response.status >= 500 && response.status < 600) {
+    await markGraphqlBackoff(
+      env,
+      quota.source,
+      quota.account,
+      githubGraphqlRepoWorkTrendOperation,
+      response.status,
+    );
+  }
+  const body = (await response.json().catch(() => null)) as RepoWorkTrendGraphqlResponse | null;
+  const message = body?.errors
+    ?.map((error) => error.message ?? error.type)
+    .filter(Boolean)
+    .join("; ");
+  if (isRateLimitResponse(response, message ?? "")) {
+    throw new GitHubRateLimitError(
+      message ?? "GitHub GraphQL rate limit",
+      parseHeaderInt(response.headers.get("retry-after")),
+    );
+  }
+  if (!response.ok || body?.errors?.length) {
+    throw new Error(message || `GitHub GraphQL ${response.status}`);
+  }
+  const counts = {
+    issuesOpened30d: body?.data?.issuesOpened30d?.issueCount,
+    issuesClosed30d: body?.data?.issuesClosed30d?.issueCount,
+    pullRequestsOpened30d: body?.data?.pullRequestsOpened30d?.issueCount,
+    pullRequestsClosed30d: body?.data?.pullRequestsClosed30d?.issueCount,
+  };
+  if (Object.values(counts).some((count) => typeof count !== "number")) {
+    throw new Error("GitHub GraphQL returned incomplete repository work trend");
+  }
+  return counts as Omit<RepoDetailWorkTrend, "since">;
+}
+
 async function buildWorkTrend(
   fullName: string,
   token: string | null,
@@ -8196,45 +8366,60 @@ async function buildWorkTrend(
 ): Promise<RepoDetailWorkTrend> {
   const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const repoQuery = `repo:${fullName}`;
+  const queries: RepoWorkTrendQueries = {
+    issuesOpened30d: `${repoQuery} is:issue created:>=${since}`,
+    issuesClosed30d: `${repoQuery} is:issue closed:>=${since}`,
+    pullRequestsOpened30d: `${repoQuery} is:pr created:>=${since}`,
+    pullRequestsClosed30d: `${repoQuery} is:pr closed:>=${since}`,
+  };
+  const cachedCounts = await Promise.all(
+    Object.values(queries).map((query) =>
+      readRepoDetailAux<number>(
+        env,
+        repoDetailAuxCacheKey("search-count", query),
+        repoDetailSearchCountCacheTtlMs,
+      ),
+    ),
+  );
+  if (cachedCounts.every((count) => count !== null)) {
+    const [issuesOpened30d, issuesClosed30d, pullRequestsOpened30d, pullRequestsClosed30d] =
+      cachedCounts as number[];
+    return {
+      since,
+      issuesOpened30d: issuesOpened30d!,
+      issuesClosed30d: issuesClosed30d!,
+      pullRequestsOpened30d: pullRequestsOpened30d!,
+      pullRequestsClosed30d: pullRequestsClosed30d!,
+    };
+  }
+  if (token) {
+    const counts = await detailGitHubWorkTrend(
+      queries,
+      token,
+      quotaSource,
+      quotaAccount,
+      onQuota,
+      auditArea,
+      env,
+    );
+    await Promise.all(
+      Object.entries(queries).map(([key, query]) =>
+        writeRepoDetailAux(
+          env,
+          repoDetailAuxCacheKey("search-count", query),
+          counts[key as keyof typeof counts],
+          Math.floor(repoDetailSearchCountCacheTtlMs / 1000),
+        ),
+      ),
+    );
+    return { since, ...counts };
+  }
   const [issuesOpened30d, issuesClosed30d, pullRequestsOpened30d, pullRequestsClosed30d] =
-    await Promise.all([
-      detailGitHubSearchCount(
-        `${repoQuery} is:issue created:>=${since}`,
-        token,
-        quotaSource,
-        quotaAccount,
-        onQuota,
-        auditArea,
-        env,
+    await Promise.all(
+      Object.values(queries).map((query) =>
+        detailGitHubSearchCount(query, token, quotaSource, quotaAccount, onQuota, auditArea, env),
       ),
-      detailGitHubSearchCount(
-        `${repoQuery} is:issue closed:>=${since}`,
-        token,
-        quotaSource,
-        quotaAccount,
-        onQuota,
-        auditArea,
-        env,
-      ),
-      detailGitHubSearchCount(
-        `${repoQuery} is:pr created:>=${since}`,
-        token,
-        quotaSource,
-        quotaAccount,
-        onQuota,
-        auditArea,
-        env,
-      ),
-      detailGitHubSearchCount(
-        `${repoQuery} is:pr closed:>=${since}`,
-        token,
-        quotaSource,
-        quotaAccount,
-        onQuota,
-        auditArea,
-        env,
-      ),
-    ]);
+    );
   return {
     since,
     issuesOpened30d,

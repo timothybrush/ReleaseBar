@@ -99,8 +99,10 @@ export type AuthFunnelEvent = {
 
 export type AuthFunnelSummary = {
   generatedAt: string;
+  installationCount: number;
   installations: AuthInstallationRecord[];
   events: AuthFunnelEvent[];
+  counterCount: number;
   counts: Array<{ key: string; count: number }>;
 };
 
@@ -598,8 +600,6 @@ export type SchedulerAdminPayload = {
   targets: RefreshTarget[];
   jobs: RefreshJob[];
   events: SchedulerAuditEvent[];
-  githubAccess: GitHubAccessSummary;
-  auth: AuthFunnelSummary;
 };
 
 export type GitHubAccessRouteSummary = {

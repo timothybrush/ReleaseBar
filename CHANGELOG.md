@@ -5,6 +5,7 @@
 - Updated CI and local tooling to Node.js 24 LTS and refreshed the Worker compatibility date.
 - Hid contributor-fork activity when the upstream repository belongs to the activity profile, while preserving unrelated external project work.
 - Kept scheduler and admin scans within Workers KV operation limits by rotating bounded current-schema target pages, and reduced authenticated repository work-trend requests from four REST searches to one GraphQL query.
+- Kept the admin console responsive by loading scheduler, quota, and installation summaries independently and bounding installation and auth-counter samples while preserving their totals.
 
 ## 0.2.0 - 2026-06-13
 

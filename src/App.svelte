@@ -44,8 +44,10 @@
     ApiQuota,
     ActivityRange,
     AudienceRange,
+    AuthFunnelSummary,
     AuthPayload,
     DashboardPayload,
+    GitHubAccessSummary,
     Owner,
     OwnerActivityPayload,
     Project,
@@ -66,6 +68,10 @@
   const activityPageRoute = ownerActivityFromPath(location.pathname);
   const repoRoute = activityPageRoute ? null : repoFromPath(location.pathname);
   const initialRoute = dashboardRoute(location.pathname, location.search);
+  type AdminDashboardPayload = SchedulerAdminPayload & {
+    githubAccess: GitHubAccessSummary;
+    auth: AuthFunnelSummary;
+  };
   type InitialPageData =
     | { route: "dashboard"; payload: DashboardPayload }
     | { route: "repo"; payload: RepoDetailPayload };
@@ -153,7 +159,7 @@
   let audienceBackfillMessage = "";
   let audienceRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let ownerTab: "overview" | "trust" = initialOwnerTab;
-  let admin: SchedulerAdminPayload | null = null;
+  let admin: AdminDashboardPayload | null = null;
   let adminLoading = false;
   let adminError = "";
   let adminActionMessage = "";
@@ -1658,24 +1664,80 @@
     }
   }
 
+  function emptyGithubAccessSummary(): GitHubAccessSummary {
+    return {
+      generatedAt: new Date().toISOString(),
+      hours: 24,
+      buckets: 0,
+      total: 0,
+      cooldown: {
+        active: false,
+        resource: null,
+        remaining: null,
+        limit: null,
+        resetAt: null,
+        reason: null,
+      },
+      byArea: [],
+      bySource: [],
+      byStatus: [],
+      topRoutes: [],
+    };
+  }
+
+  function emptyAuthFunnelSummary(): AuthFunnelSummary {
+    return {
+      generatedAt: new Date().toISOString(),
+      installationCount: 0,
+      installations: [],
+      events: [],
+      counterCount: 0,
+      counts: [],
+    };
+  }
+
+  async function loadAdminSection<T>(path: string): Promise<T | null> {
+    try {
+      const response = await fetch(path, { cache: "no-store" });
+      return response.ok ? ((await response.json()) as T) : null;
+    } catch {
+      return null;
+    }
+  }
+
   async function loadAdmin(): Promise<void> {
     if (!adminRoute) return;
     adminLoading = !admin;
     adminError = "";
     try {
-      const response = await fetch("/api/admin/scheduler", { cache: "no-store" });
+      const [response, accessSummary, authSummary] = await Promise.all([
+        fetch("/api/admin/scheduler", { cache: "no-store" }),
+        loadAdminSection<GitHubAccessSummary>("/api/admin/github-access"),
+        loadAdminSection<AuthFunnelSummary>("/api/admin/installations"),
+      ]);
       const body = (await response.json().catch(() => null)) as
         | SchedulerAdminPayload
         | { error?: string }
         | null;
       if (response.ok && body && "status" in body) {
-        admin = body;
+        const unavailable = [
+          accessSummary ? "" : "GitHub access",
+          authSummary ? "" : "installation",
+        ].filter(Boolean);
+        admin = {
+          ...body,
+          githubAccess: accessSummary ?? admin?.githubAccess ?? emptyGithubAccessSummary(),
+          auth: authSummary ?? admin?.auth ?? emptyAuthFunnelSummary(),
+        };
         generatedLabel = `scheduler · ${numberFormat.format(body.status.targets)} targets`;
         generatedDetail = [
           `${numberFormat.format(body.status.dueTargets)} due in ${numberFormat.format(body.status.scannedTargets)}-target scan`,
           `${numberFormat.format(body.status.runningJobs)} running`,
           body.status.queueConfigured ? "queue configured" : "direct fallback",
-        ].join(" · ");
+          unavailable.length > 0 ? `${unavailable.join(" and ")} data unavailable` : "",
+        ]
+          .filter(Boolean)
+          .join(" · ");
         return;
       }
       throw new Error(
@@ -2675,6 +2737,8 @@
           <small>Admin access requires signing in as @steipete.</small>
           {#if auth?.configured && !auth.user}
             <button type="button" onclick={login}>Connect GitHub</button>
+          {:else}
+            <button type="button" disabled={adminLoading} onclick={loadAdmin}>retry</button>
           {/if}
         </div>
       {:else if adminLoading && !admin}
@@ -2737,7 +2801,7 @@
           </div>
           <div>
             <span>installs</span>
-            <strong>{numberFormat.format(admin.auth.installations.length)}</strong>
+            <strong>{numberFormat.format(admin.auth.installationCount)}</strong>
           </div>
           <div>
             <span>auth events</span>
@@ -2751,7 +2815,9 @@
                 <span class="panel-kicker">GitHub App installs</span>
                 <h2>sync coverage</h2>
               </div>
-              <strong>{numberFormat.format(admin.auth.installations.length)}</strong>
+              <strong>
+                {numberFormat.format(admin.auth.installations.length)} of {numberFormat.format(admin.auth.installationCount)}
+              </strong>
             </div>
             <div class="admin-list compact">
               {#each admin.auth.installations as installation}
@@ -2780,7 +2846,7 @@
                 <span class="panel-kicker">auth funnel</span>
                 <h2>recent events</h2>
               </div>
-              <strong>{numberFormat.format(admin.auth.counts.length)} counters</strong>
+              <strong>{numberFormat.format(admin.auth.counterCount)} counters</strong>
             </div>
             <div class="admin-list compact token-use">
               {#each admin.auth.events as event}

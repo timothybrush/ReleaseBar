@@ -41,7 +41,9 @@ import {
   type DashboardViewState,
 } from "../../src/dashboard-view.js";
 import type {
+  AuthFunnelSummary,
   DashboardPayload,
+  GitHubAccessSummary,
   OwnerActivityPayload,
   Project,
   AudienceRange,
@@ -10813,8 +10815,8 @@ test("worker admin scheduler requires an admin session and reports refresh targe
   assert.equal(body.status.dueTargets, 0);
   assert.equal(body.status.queuedJobs, 1);
   assert.equal(body.targets[0]?.owner, "openclaw");
-  assert.equal(body.githubAccess.total, 3);
-  assert.equal(body.githubAccess.topRoutes[0]?.route, "graphql");
+  assert.equal("githubAccess" in body, false);
+  assert.equal("auth" in body, false);
 
   const access = await worker.fetch(
     new Request("https://release.bar/api/admin/github-access?hours=1", {
@@ -10824,8 +10826,21 @@ test("worker admin scheduler requires an admin session and reports refresh targe
     { waitUntil: () => undefined },
   );
   assert.equal(access.status, 200);
-  const accessBody = (await access.json()) as { total?: number };
+  const accessBody = (await access.json()) as GitHubAccessSummary;
   assert.equal(accessBody.total, 3);
+  assert.equal(accessBody.topRoutes[0]?.route, "graphql");
+
+  const installations = await worker.fetch(
+    new Request("https://release.bar/api/admin/installations", {
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    env,
+    { waitUntil: () => undefined },
+  );
+  assert.equal(installations.status, 200);
+  const installationBody = (await installations.json()) as AuthFunnelSummary;
+  assert.equal(installationBody.installationCount, 0);
+  assert.equal(installationBody.counterCount, 0);
 
   const run = await worker.fetch(
     new Request("https://release.bar/api/admin/scheduler/run", {
@@ -10840,6 +10855,72 @@ test("worker admin scheduler requires an admin session and reports refresh targe
   assert.equal(runBody.enqueued, 0);
   assert.equal(runBody.due, 0);
   assert.deepEqual(sentJobs, []);
+});
+
+test("worker admin installation summary bounds record and counter reads", async () => {
+  const sessionId = "session-admin-installation-bounds";
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const authCookie = await signedJson("test-secret", { id: sessionId, exp });
+  const entries: Record<string, string> = {
+    [`auth:session:${sessionId}`]: JSON.stringify({
+      user: {
+        id: 1,
+        login: "steipete",
+        name: null,
+        avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        url: "https://github.com/steipete",
+      },
+      accessToken: "user-token",
+      iat: exp - 600,
+      exp,
+    }),
+  };
+  for (let index = 0; index < 121; index += 1) {
+    const account = `account-${String(index).padStart(3, "0")}`;
+    entries[`auth:installation:v1:${account}`] = JSON.stringify({
+      id: index + 1,
+      accountLogin: account,
+      accountType: "user",
+      accountUrl: `https://github.com/${account}`,
+      avatarUrl: `https://avatars.githubusercontent.com/u/${index + 1}`,
+      repositorySelection: "all",
+      repositories: [],
+      updatedAt: new Date(index * 1000).toISOString(),
+    });
+    entries[`auth:funnel-counter:v1:2026-06-13:event-${String(index).padStart(3, "0")}:_:ok`] =
+      String(index + 1);
+  }
+  const baseCache = kvStore(entries);
+  let installationReads = 0;
+  let counterReads = 0;
+  const cache = {
+    ...baseCache,
+    async get(key: string) {
+      if (key.startsWith("auth:installation:v1:")) installationReads += 1;
+      if (key.startsWith("auth:funnel-counter:v1:")) counterReads += 1;
+      return baseCache.get(key);
+    },
+  };
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/admin/installations", {
+      headers: { cookie: `rd_session=${authCookie}` },
+    }),
+    {
+      AUTH_COOKIE_SECRET: "test-secret",
+      DASHBOARD_CACHE: cache,
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as AuthFunnelSummary;
+  assert.equal(body.installationCount, 121);
+  assert.equal(body.installations.length, 80);
+  assert.equal(body.counterCount, 121);
+  assert.equal(body.counts.length, 80);
+  assert.equal(installationReads, 80);
+  assert.equal(counterReads, 80);
 });
 
 test("worker scheduler rotates bounded current-schema target pages", async () => {

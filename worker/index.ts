@@ -306,6 +306,8 @@ const crawlerUserAgentPattern =
 const authFunnelPrefix = `auth:funnel:v1:`;
 const authFunnelCounterPrefix = `auth:funnel-counter:v1:`;
 const authFunnelListLimit = 80;
+const adminInstallationListLimit = 80;
+const adminAuthCounterListLimit = 80;
 const sharedQuotaCooldownFallbackSeconds = 30 * 60;
 const sharedQuotaMinimumRemaining: Record<string, number> = {
   core: 500,
@@ -743,15 +745,53 @@ async function listStoredInstallations(env: Env): Promise<AuthInstallationRecord
       limit: 1000,
       ...(cursor ? { cursor } : {}),
     });
-    for (const key of page.keys) {
-      const raw = await env.DASHBOARD_CACHE.get(key.name);
-      if (!raw) continue;
+    const pageRecords = await mapConcurrent(page.keys, 16, async (key) => {
+      const raw = await env.DASHBOARD_CACHE?.get(key.name);
+      if (!raw) return null;
       const parsed = safeJsonParse(storedInstallationSchema, raw, `app installation ${key.name}`);
-      if (parsed) records.push(storedInstallationRecord(parsed));
-    }
+      return parsed ? storedInstallationRecord(parsed) : null;
+    });
+    records.push(
+      ...pageRecords.filter((record): record is AuthInstallationRecord => record !== null),
+    );
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
   return records.sort((a, b) => safeIso(b.updatedAt) - safeIso(a.updatedAt));
+}
+
+async function storedInstallationInventory(
+  env: Env,
+): Promise<{ total: number; installations: AuthInstallationRecord[] }> {
+  if (!env.DASHBOARD_CACHE?.list) return { total: 0, installations: [] };
+  const sampleKeys: string[] = [];
+  let total = 0;
+  let cursor: string | undefined;
+  do {
+    const page = await env.DASHBOARD_CACHE.list({
+      prefix: `auth:installation:v1:`,
+      limit: 1000,
+      ...(cursor ? { cursor } : {}),
+    });
+    for (const key of page.keys) {
+      total += 1;
+      if (sampleKeys.length < adminInstallationListLimit) {
+        sampleKeys.push(key.name);
+      }
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  const installations = await mapConcurrent(sampleKeys, 16, async (key) => {
+    const raw = await env.DASHBOARD_CACHE?.get(key);
+    if (!raw) return null;
+    const parsed = safeJsonParse(storedInstallationSchema, raw, `app installation ${key}`);
+    return parsed ? storedInstallationRecord(parsed) : null;
+  });
+  return {
+    total,
+    installations: installations
+      .filter((record): record is AuthInstallationRecord => record !== null)
+      .sort((a, b) => safeIso(b.updatedAt) - safeIso(a.updatedAt)),
+  };
 }
 
 async function listAuthFunnelEvents(env: Env): Promise<AuthFunnelEvent[]> {
@@ -776,9 +816,12 @@ async function listAuthFunnelEvents(env: Env): Promise<AuthFunnelEvent[]> {
   return events.sort((a, b) => safeIso(b.at) - safeIso(a.at));
 }
 
-async function listAuthFunnelCounts(env: Env): Promise<Array<{ key: string; count: number }>> {
-  if (!env.DASHBOARD_CACHE?.list) return [];
-  const counts: Array<{ key: string; count: number }> = [];
+async function authFunnelCountInventory(
+  env: Env,
+): Promise<{ total: number; counts: Array<{ key: string; count: number }> }> {
+  if (!env.DASHBOARD_CACHE?.list) return { total: 0, counts: [] };
+  const sampleKeys: string[] = [];
+  let total = 0;
   let cursor: string | undefined;
   do {
     const page = await env.DASHBOARD_CACHE.list({
@@ -787,27 +830,39 @@ async function listAuthFunnelCounts(env: Env): Promise<Array<{ key: string; coun
       ...(cursor ? { cursor } : {}),
     });
     for (const key of page.keys) {
-      const count = Number.parseInt((await env.DASHBOARD_CACHE.get(key.name)) ?? "0", 10);
-      if (Number.isFinite(count) && count > 0) {
-        counts.push({ key: key.name.slice(authFunnelCounterPrefix.length), count });
-      }
+      total += 1;
+      sampleKeys.push(key.name);
+      if (sampleKeys.length > adminAuthCounterListLimit) sampleKeys.shift();
     }
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
-  return counts.sort((a, b) => b.count - a.count || a.key.localeCompare(b.key)).slice(0, 80);
+  const counts = await mapConcurrent(sampleKeys, 16, async (key) => {
+    const count = Number.parseInt((await env.DASHBOARD_CACHE?.get(key)) ?? "0", 10);
+    return Number.isFinite(count) && count > 0
+      ? { key: key.slice(authFunnelCounterPrefix.length), count }
+      : null;
+  });
+  return {
+    total,
+    counts: counts
+      .filter((count): count is { key: string; count: number } => count !== null)
+      .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key)),
+  };
 }
 
 async function authFunnelSummary(env: Env): Promise<AuthFunnelSummary> {
-  const [installations, events, counts] = await Promise.all([
-    listStoredInstallations(env),
+  const [installationInventory, events, countInventory] = await Promise.all([
+    storedInstallationInventory(env),
     listAuthFunnelEvents(env),
-    listAuthFunnelCounts(env),
+    authFunnelCountInventory(env),
   ]);
   return {
     generatedAt: new Date().toISOString(),
-    installations,
+    installationCount: installationInventory.total,
+    installations: installationInventory.installations,
     events,
-    counts,
+    counterCount: countInventory.total,
+    counts: countInventory.counts,
   };
 }
 
@@ -7073,13 +7128,11 @@ async function processRefreshJobFallback(input: RefreshJob, env: Env): Promise<R
 }
 
 async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
-  const [inventory, jobs, events, stateRaw, access, auth, dueOptions] = await Promise.all([
+  const [inventory, jobs, events, stateRaw, dueOptions] = await Promise.all([
     refreshTargetInventory(env),
     listRefreshJobs(env),
     listAuditEvents(env),
     env.DASHBOARD_CACHE?.get(refreshStateKey),
-    githubAccessSummary(env),
-    authFunnelSummary(env),
     schedulerDueOptions(env),
   ]);
   const state = stateRaw
@@ -7134,8 +7187,6 @@ async function schedulerAdminPayload(env: Env): Promise<SchedulerAdminPayload> {
     targets: targets.sort((a, b) => safeIso(a.nextDueAt) - safeIso(b.nextDueAt)).slice(0, 120),
     jobs,
     events,
-    githubAccess: access,
-    auth,
   };
 }
 

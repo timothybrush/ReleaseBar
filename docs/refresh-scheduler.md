@@ -82,7 +82,7 @@ This means popular or installed accounts can refresh without burning the shared 
 - sharded GitHub token-use counters from the last 24 hours, also available at `/api/admin/github-access`
 - recent targets, jobs, and audit events
 
-The target total comes from lightweight key listings. Due counts describe the most recent bounded scheduler scan rather than forcing the admin request to read every target and dashboard cache.
+Scheduler state, GitHub access, and installation/auth summaries load through separate admin requests so a slow optional section cannot take down the console. Target and installation totals come from lightweight key listings; their detail rows and auth counters are bounded samples. Due counts describe the most recent bounded scheduler scan rather than forcing the admin request to read every target and dashboard cache.
 
 Audit events are stored in KV and logged to Worker logs with `area: "scheduler"`. Keep audit detail short and structured so production logs remain searchable.
 

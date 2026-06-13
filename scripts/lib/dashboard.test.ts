@@ -18,6 +18,8 @@ import {
 } from "./dashboard.js";
 import {
   dashboardRoute,
+  ownerActivityFromPath,
+  ownerActivityPath,
   ownerDashboardPath,
   optionsFromSearch,
   ownerFromPath,
@@ -474,6 +476,25 @@ test("owner route parsing keeps root hot board and owners API-backed", () => {
   assert.equal(repoFromPath("/openclaw"), null);
   assert.equal(repoDetailPath("OpenClaw/Peekaboo"), "/openclaw/peekaboo");
   assert.equal(repoDetailPath("OpenClaw/react.dev"), "/-/openclaw/react.dev");
+  assert.equal(repoFromPath("/acme/activity"), null);
+  assert.equal(repoDetailPath("acme/activity"), "/-/acme/activity");
+  assert.deepEqual(ownerActivityFromPath("/Steipete/activity"), {
+    owner: "steipete",
+    apiPath: `${workerApiOrigin}/api/steipete/activity`,
+    fallbackApiPath: `${workersDevApiOrigin}/api/steipete/activity`,
+  });
+  assert.equal(ownerActivityFromPath("/api/activity"), null);
+  assert.deepEqual(ownerActivityFromPath("/-/owners/api/activity"), {
+    owner: "api",
+    apiPath: `${workerApiOrigin}/api/api/activity`,
+    fallbackApiPath: `${workersDevApiOrigin}/api/api/activity`,
+  });
+  assert.equal(ownerActivityFromPath("/steipete/activity/extra"), null);
+  assert.equal(ownerActivityPath("@Steipete"), "/steipete/activity");
+  assert.equal(ownerActivityPath("@Steipete", "day"), "/steipete/activity?range=day");
+  assert.equal(ownerActivityPath("@Steipete", "month"), "/steipete/activity?range=month");
+  assert.equal(ownerActivityPath("@api"), "/-/owners/api/activity");
+  assert.equal(ownerActivityPath("@og", "month"), "/-/owners/og/activity?range=month");
   assert.deepEqual(repoFromPath("/-/og/foo"), {
     owner: "og",
     repo: "foo",
@@ -1248,6 +1269,114 @@ test("worker serves escaped dotted repository detail paths as app shell", async 
     html,
     /name="twitter:image" content="https:\/\/release\.bar\/og\/openclaw%2Freact\.dev\.png"/,
   );
+});
+
+test("worker reserves owner activity pages while escaped activity repositories remain available", async () => {
+  const response = await worker.fetch(
+    new Request("https://release.bar/acme/activity"),
+    {
+      ASSETS: {
+        fetch: async (request: Request) => {
+          assert.equal(new URL(request.url).pathname, "/index.html");
+          return new Response(
+            '<title>ReleaseBar</title><meta property="og:title" content="ReleaseBar" /><meta property="og:url" content="https://release.bar/" /><meta property="og:image" content="https://release.bar/og/ReleaseBar.svg" /><meta name="twitter:title" content="ReleaseBar" /><meta name="twitter:image" content="https://release.bar/og/ReleaseBar.svg" /><script type="module" src="/assets/index.js"></script>',
+            { headers: { "content-type": "text/html" } },
+          );
+        },
+      },
+      DASHBOARD_CACHE: kvStore(),
+    },
+    { waitUntil: () => undefined },
+  );
+
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /@acme activity/);
+  assert.doesNotMatch(html, /id="releasebar-initial-data"/);
+
+  const escaped = await worker.fetch(
+    new Request("https://release.bar/-/acme/activity"),
+    {
+      ASSETS: {
+        fetch: async () =>
+          new Response(
+            '<title>ReleaseBar</title><meta property="og:title" content="ReleaseBar" /><meta property="og:url" content="https://release.bar/" /><meta property="og:image" content="https://release.bar/og/ReleaseBar.svg" /><meta name="twitter:title" content="ReleaseBar" /><meta name="twitter:image" content="https://release.bar/og/ReleaseBar.svg" />',
+            { headers: { "content-type": "text/html" } },
+          ),
+      },
+      DASHBOARD_CACHE: kvStore(),
+    },
+    { waitUntil: () => undefined },
+  );
+  assert.equal(escaped.status, 200);
+  assert.match(await escaped.text(), /acme\/activity/);
+
+  for (const owner of ["api", "og"]) {
+    const reserved = await worker.fetch(
+      new Request(`https://release.bar/-/owners/${owner}/activity`),
+      {
+        ASSETS: {
+          fetch: async (request: Request) => {
+            assert.equal(new URL(request.url).pathname, "/index.html");
+            return new Response(
+              '<title>ReleaseBar</title><meta property="og:title" content="ReleaseBar" /><meta property="og:url" content="https://release.bar/" /><meta property="og:image" content="https://release.bar/og/ReleaseBar.svg" /><meta name="twitter:title" content="ReleaseBar" /><meta name="twitter:image" content="https://release.bar/og/ReleaseBar.svg" />',
+              { headers: { "content-type": "text/html" } },
+            );
+          },
+        },
+        DASHBOARD_CACHE: kvStore(),
+      },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(reserved.status, 200);
+    assert.match(await reserved.text(), new RegExp(`@${owner} activity`));
+  }
+});
+
+test("worker preserves API and social namespaces beside escaped reserved-owner activity pages", async () => {
+  const generatedAt = new Date().toISOString();
+  const dashboard = testDashboard("activity", []);
+  dashboard.generatedAt = generatedAt;
+  if (dashboard.cache && dashboard.options) {
+    dashboard.cache.generatedAt = generatedAt;
+    dashboard.options.includeUnreleased = true;
+  }
+  const key = dashboardCacheKey({
+    owner: "activity",
+    includeUnreleased: true,
+    includeReleaseData: true,
+    schemaVersion: 6,
+  });
+  const apiResponse = await worker.fetch(
+    new Request("https://release.bar/api/activity"),
+    {
+      ASSETS: {
+        fetch: async () => {
+          throw new Error("API namespace must not reach app assets");
+        },
+      },
+      DASHBOARD_CACHE: kvStore({ [key]: JSON.stringify(dashboard) }),
+    },
+    { waitUntil: () => undefined },
+  );
+  assert.equal(apiResponse.status, 200);
+  assert.match(apiResponse.headers.get("content-type") ?? "", /^application\/json/);
+  assert.equal(((await apiResponse.json()) as DashboardPayload).owners[0]?.login, "activity");
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(null, { status: 404 });
+  try {
+    const socialResponse = await worker.fetch(
+      new Request("https://release.bar/og/activity"),
+      { DASHBOARD_CACHE: kvStore() },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(socialResponse.status, 200);
+    assert.match(socialResponse.headers.get("content-type") ?? "", /^image\/svg\+xml/);
+    assert.match(await socialResponse.text(), /@activity/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("worker embeds cached public dashboard data in the app shell", async () => {
@@ -3948,7 +4077,7 @@ test("worker summarizes recent repository activity in the background", async () 
     assert.equal(cached.summary?.state, "ready", cached.summary?.message ?? "");
     assert.equal(cached.summary?.model, "chat-latest");
     assert.match(cached.summary?.text ?? "", /recent-work panel/);
-    assert.equal(cached.summary?.promptVersion, 2);
+    assert.equal(cached.summary?.promptVersion, 3);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -4046,14 +4175,24 @@ test("worker summarizes public owner activity in the background", async () => {
       const body = JSON.parse(String(init?.body ?? "{}"));
       assert.equal(body.model, "chat-latest");
       assert.equal(body.reasoning, undefined);
+      assert.equal(body.text?.format?.type, "json_schema");
+      assert.equal(body.text?.format?.schema?.properties?.repositories?.minItems, 1);
       assert.match(body.instructions, /do not restate those facts/i);
       assert.doesNotMatch(body.instructions, /Say this is public activity/i);
       assert.match(JSON.stringify(body.input), /Top repositories: acme\/releasebar/);
       assert.match(JSON.stringify(body.input), /Add owner activity panel/);
-      assert.match(JSON.stringify(body.input), /Events included: 120/);
+      assert.match(JSON.stringify(body.input), /Events included: 124/);
       return Response.json({
-        output_text:
-          "ReleaseBar activity summaries, cache behavior, and dashboard copy moved forward together.",
+        output_text: JSON.stringify({
+          summary:
+            "ReleaseBar activity summaries, cache behavior, and dashboard copy moved forward together.",
+          repositories: [
+            {
+              fullName: "acme/releasebar",
+              summary: "ReleaseBar gained grouped activity summaries and refined dashboard copy.",
+            },
+          ],
+        }),
       });
     }
     throw new Error(`unexpected fetch ${url.toString()}`);
@@ -4071,6 +4210,10 @@ test("worker summarizes public owner activity in the background", async () => {
     assert.equal(body.totals.commits, 4);
     assert.equal(body.totals.pullRequests, 1);
     assert.equal(body.totals.repositories, 1);
+    assert.equal(body.repositories[0]?.events, body.totals.events);
+    assert.equal(body.repositories[0]?.commits, 4);
+    assert.equal(body.repositories[0]?.pullRequests, 1);
+    assert.equal(body.repositories[0]?.comments, 122);
     const commitEvent = body.events.find((event) => event.kind === "commit");
     assert.match(commitEvent?.title ?? "", /\+3 commits/);
     assert.equal(
@@ -4084,13 +4227,171 @@ test("worker summarizes public owner activity in the background", async () => {
     ) as OwnerActivityPayload;
     assert.equal(cached.summary?.state, "ready", cached.summary?.message ?? "");
     assert.match(cached.summary?.text ?? "", /activity summaries/);
+    assert.match(cached.summary?.repositories?.[0]?.text ?? "", /grouped activity summaries/);
     assert.doesNotMatch(cached.summary?.text ?? "", /GitHub activity|public activity/i);
     assert.notEqual(cached.summary?.inputHash, null);
-    assert.equal(cached.summary?.eventsUsed, 120);
-    assert.equal(cached.summary?.promptVersion, 2);
+    assert.equal(cached.summary?.eventsUsed, 124);
+    assert.equal(cached.summary?.promptVersion, 3);
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("worker trims expired events from cached owner activity", async () => {
+  const generatedAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+  const payload: OwnerActivityPayload = {
+    owner: {
+      type: "user",
+      login: "acme",
+      avatarUrl: "https://github.com/acme.png",
+      url: "https://github.com/acme",
+    },
+    range: "week",
+    generatedAt,
+    cache: {
+      state: "fresh",
+      stale: false,
+      generatedAt,
+    },
+    totals: {
+      events: 1,
+      commits: 1,
+      pullRequests: 0,
+      issues: 0,
+      comments: 0,
+      releases: 0,
+      repositories: 1,
+    },
+    repositories: [
+      {
+        fullName: "acme/releasebar",
+        url: "https://github.com/acme/releasebar",
+        events: 1,
+        commits: 1,
+        pullRequests: 0,
+        issues: 0,
+        comments: 0,
+        releases: 0,
+        lastActiveAt: generatedAt,
+      },
+    ],
+    events: [
+      {
+        id: "expired",
+        kind: "commit",
+        title: "Old cached work",
+        repo: "acme/releasebar",
+        url: "https://github.com/acme/releasebar",
+        createdAt: generatedAt,
+        count: 1,
+      },
+    ],
+    summary: {
+      state: "ready",
+      text: "Acme worked on an old cached change.",
+      generatedAt,
+      model: "chat-latest",
+      inputHash: "expired-hash",
+      eventsUsed: 1,
+      promptVersion: 3,
+    },
+  };
+  const cache = kvStore({
+    "owner-activity:v1:acme:week": JSON.stringify(payload),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/acme/activity?range=week", {
+      headers: { "user-agent": "Googlebot" },
+    }),
+    { DASHBOARD_CACHE: cache },
+    { waitUntil: () => undefined },
+  );
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as OwnerActivityPayload;
+  assert.equal(body.cache.state, "stale");
+  assert.equal(body.totals.events, 0);
+  assert.equal(body.totals.repositories, 0);
+  assert.deepEqual(body.repositories, []);
+  assert.deepEqual(body.events, []);
+  assert.equal(body.summary?.state, "unavailable");
+  assert.equal(body.summary?.text, null);
+});
+
+test("worker trims expired events from cached repository activity", async () => {
+  const generatedAt = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+  const payload: RepoDetailActivityPayload = {
+    fullName: "acme/releasebar",
+    range: "day",
+    generatedAt,
+    cache: {
+      state: "fresh",
+      stale: false,
+      generatedAt,
+    },
+    totals: {
+      events: 1,
+      commits: 1,
+      pullRequests: 0,
+      issues: 0,
+      comments: 0,
+      releases: 0,
+      repositories: 1,
+    },
+    repositories: [
+      {
+        fullName: "acme/releasebar",
+        url: "https://github.com/acme/releasebar",
+        events: 1,
+        commits: 1,
+        pullRequests: 0,
+        issues: 0,
+        comments: 0,
+        releases: 0,
+        lastActiveAt: generatedAt,
+      },
+    ],
+    events: [
+      {
+        id: "expired",
+        kind: "commit",
+        title: "Old cached work",
+        repo: "acme/releasebar",
+        url: "https://github.com/acme/releasebar",
+        createdAt: generatedAt,
+        count: 1,
+      },
+    ],
+    summary: {
+      state: "ready",
+      text: "ReleaseBar had an old cached change.",
+      generatedAt,
+      model: "chat-latest",
+      inputHash: "expired-hash",
+      eventsUsed: 1,
+      promptVersion: 3,
+    },
+  };
+  const cache = kvStore({
+    "repo-activity:v1:acme/releasebar:day": JSON.stringify(payload),
+  });
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/repos/acme/releasebar/activity?range=day", {
+      headers: { "user-agent": "Googlebot" },
+    }),
+    { DASHBOARD_CACHE: cache },
+    { waitUntil: () => undefined },
+  );
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as RepoDetailActivityPayload;
+  assert.equal(body.cache.state, "stale");
+  assert.equal(body.totals.events, 0);
+  assert.equal(body.totals.repositories, 0);
+  assert.deepEqual(body.repositories, []);
+  assert.deepEqual(body.events, []);
+  assert.equal(body.summary?.state, "unavailable");
+  assert.equal(body.summary?.text, null);
 });
 
 test("worker skips stale public owner activity summaries when events changed", async () => {
@@ -4124,6 +4425,10 @@ test("worker skips stale public owner activity summaries when events changed", a
         url: "https://github.com/acme/releasebar",
         events: 1,
         commits: 1,
+        pullRequests: 0,
+        issues: 0,
+        comments: 0,
+        releases: 0,
         lastActiveAt: generatedAt,
       },
     ],
@@ -4235,6 +4540,10 @@ test("worker refreshes cached owner activity summaries from older prompt version
         url: "https://github.com/acme/releasebar",
         events: 1,
         commits: 1,
+        pullRequests: 0,
+        issues: 0,
+        comments: 0,
+        releases: 0,
         lastActiveAt: generatedAt,
       },
     ],
@@ -4267,7 +4576,15 @@ test("worker refreshes cached owner activity summaries from older prompt version
     const url = new URL(String(input));
     if (url.hostname === "api.openai.com" && url.pathname === "/v1/responses") {
       return Response.json({
-        output_text: "@acme's public GitHub activity refined working-on summaries.",
+        output_text: JSON.stringify({
+          summary: "@acme's public GitHub activity refined working-on summaries.",
+          repositories: [
+            {
+              fullName: "acme/releasebar",
+              summary: "ReleaseBar refined its working-on summaries.",
+            },
+          ],
+        }),
       });
     }
     throw new Error(`unexpected fetch ${url.toString()}`);
@@ -4278,13 +4595,16 @@ test("worker refreshes cached owner activity summaries from older prompt version
       { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token", OPENAI_API_KEY: "openai-token" },
       { waitUntil: (promise) => queued.push(promise) },
     );
-    assert.equal(response.status, 200);
+    assert.equal(response.status, 202);
+    const responseBody = (await response.json()) as OwnerActivityPayload;
+    assert.equal(responseBody.summary?.state, "warming");
+    assert.equal(responseBody.summary?.text, null);
     await Promise.all(queued);
     const cached = JSON.parse(
       (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
     ) as OwnerActivityPayload;
     assert.equal(cached.summary?.state, "ready");
-    assert.equal(cached.summary?.promptVersion, 2);
+    assert.equal(cached.summary?.promptVersion, 3);
     assert.equal(cached.summary?.model, "chat-latest");
     assert.notEqual(cached.summary?.inputHash, "old-prompt-hash");
     assert.equal(cached.summary?.text, "@acme's work refined working-on summaries.");
@@ -4355,7 +4675,7 @@ test("worker does not summarize empty owner activity", async () => {
   }
 });
 
-test("worker persists public owner activity summary failures", async () => {
+test("worker rejects incomplete structured owner activity summaries", async () => {
   const generatedAt = new Date().toISOString();
   const payload: OwnerActivityPayload = {
     owner: {
@@ -4386,6 +4706,10 @@ test("worker persists public owner activity summary failures", async () => {
         url: "https://github.com/acme/releasebar",
         events: 1,
         commits: 1,
+        pullRequests: 0,
+        issues: 0,
+        comments: 0,
+        releases: 0,
         lastActiveAt: generatedAt,
       },
     ],
@@ -4417,7 +4741,12 @@ test("worker persists public owner activity summary failures", async () => {
   globalThis.fetch = async (input) => {
     const url = new URL(String(input));
     if (url.hostname === "api.openai.com" && url.pathname === "/v1/responses") {
-      return Response.json({ error: { message: "summary unavailable" } }, { status: 500 });
+      return Response.json({
+        output_text: JSON.stringify({
+          summary: "ReleaseBar added activity summaries.",
+          repositories: [],
+        }),
+      });
     }
     throw new Error(`unexpected fetch ${url.toString()}`);
   };
@@ -4434,9 +4763,9 @@ test("worker persists public owner activity summary failures", async () => {
     ) as OwnerActivityPayload;
     assert.equal(cached.summary?.state, "unavailable");
     assert.equal(cached.summary?.model, "chat-latest");
-    assert.match(cached.summary?.message ?? "", /summary unavailable/);
+    assert.match(cached.summary?.message ?? "", /complete structured activity summaries/);
     assert.notEqual(cached.summary?.inputHash, "activity-hash");
-    assert.equal(cached.summary?.promptVersion, 2);
+    assert.equal(cached.summary?.promptVersion, 3);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -18585,13 +18914,13 @@ test("signed GitHub webhooks coalesce bursts and enqueue authoritative refreshes
       "repo-activity:v1:owner/repo:day",
       "repo-audience:v5:owner/repo:week",
       "owner-activity:v1:owner:day",
-      "owner-activity-summary:v2:owner:week:chat-latest:hash",
-      "repo-activity-summary:v2:owner/repo:day:chat-latest:hash",
+      "owner-activity-summary:v3:owner:week:chat-latest:hash",
+      "repo-activity-summary:v3:owner/repo:day:chat-latest:hash",
       "release-summary:v1:owner/repo:v1.0.0:abcdef1:chat-latest",
       "discover:v4:week:all",
       "repo-audience:v5:other/repo:week",
       "owner-activity:v1:contributor:week",
-      "owner-activity-summary:v2:contributor:week:chat-latest:hash",
+      "owner-activity-summary:v3:contributor:week:chat-latest:hash",
       "trust-profile:v4:owner",
       "audience-user-repos:v2:owner",
     ];
@@ -18664,6 +18993,10 @@ test("signed GitHub webhooks coalesce bursts and enqueue authoritative refreshes
             url: "https://github.com/owner/repo",
             events: 1,
             commits: 1,
+            pullRequests: 0,
+            issues: 0,
+            comments: 0,
+            releases: 0,
             lastActiveAt: leakedAt,
           },
         ],

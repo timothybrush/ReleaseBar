@@ -53,6 +53,57 @@ Agents should:
 - avoid retry loops on `429`; respect `Retry-After` when present
 - treat `error` payloads as "no ReleaseBar signal", not as negative user evidence
 
+## Owner Activity
+
+`GET /api/:owner/activity?range=day|week|month`
+
+Returns recent public GitHub work grouped and ranked by repository. Repository activity counts include commit items inside push events, so a multi-commit push contributes its full count instead of one event envelope. The matching page route is `/:owner/activity`; reserved owners `api` and `og` use `/-/owners/:owner/activity`, while repositories literally named `activity` use `/-/:owner/activity`.
+
+When AI summaries are configured, one bounded background request produces both the overall summary and concise summaries for up to 30 ranked repositories.
+
+```ts
+type OwnerActivityPayload = {
+  owner: { type: "user" | "org"; login: string; avatarUrl?: string; url?: string };
+  range: "day" | "week" | "month";
+  generatedAt: string;
+  cache: CacheState;
+  totals: {
+    events: number;
+    commits: number;
+    pullRequests: number;
+    issues: number;
+    comments: number;
+    releases: number;
+    repositories: number;
+  };
+  repositories: Array<{
+    fullName: string;
+    url: string;
+    events: number;
+    commits: number;
+    pullRequests: number;
+    issues: number;
+    comments: number;
+    releases: number;
+    lastActiveAt: string;
+  }>;
+  events: Array<{
+    id: string;
+    kind: "commit" | "pull_request" | "issue" | "comment" | "release" | "repository" | "other";
+    title: string;
+    repo: string;
+    url: string | null;
+    createdAt: string;
+    count: number;
+  }>;
+  summary?: {
+    state: "ready" | "warming" | "unavailable";
+    text: string | null;
+    repositories?: Array<{ fullName: string; text: string }>;
+  };
+};
+```
+
 ## User Trust Or Org Signal Profile
 
 `GET /api/users/:login/trust`

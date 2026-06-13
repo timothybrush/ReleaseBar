@@ -31,6 +31,8 @@
   } from "./dashboard-view.js";
   import {
     dashboardRoute,
+    ownerActivityFromPath,
+    ownerActivityPath,
     ownerDashboardPath,
     repoDetailPath,
     repoFromPath,
@@ -61,7 +63,8 @@
   } from "./types.js";
 
   const adminRoute = location.pathname === "/_admin";
-  const repoRoute = repoFromPath(location.pathname);
+  const activityPageRoute = ownerActivityFromPath(location.pathname);
+  const repoRoute = activityPageRoute ? null : repoFromPath(location.pathname);
   const initialRoute = dashboardRoute(location.pathname, location.search);
   type InitialPageData =
     | { route: "dashboard"; payload: DashboardPayload }
@@ -94,7 +97,9 @@
   const hiddenReposKey = `releasedeck:${routeScope}:hidden-repos`;
 
   let data: DashboardPayload | null =
-    !adminRoute && !repoRoute && embedded?.route === "dashboard" ? embedded.payload : null;
+    !adminRoute && !repoRoute && !activityPageRoute && embedded?.route === "dashboard"
+      ? embedded.payload
+      : null;
   let repoDetail: RepoDetailPayload | null =
     repoRoute && embedded?.route === "repo" ? embedded.payload : null;
   let auth: AuthPayload | null = null;
@@ -125,7 +130,10 @@
   let repoActivityRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let dashboardEventSource: EventSource | null = null;
   let dashboardStreamTimingSent = false;
-  let activityRange: ActivityRange = "week";
+  let activityRange: ActivityRange = (() => {
+    const value = new URLSearchParams(location.search).get("range");
+    return value === "day" || value === "month" ? value : "week";
+  })();
   let activity: OwnerActivityPayload | null = null;
   let activityLoading = false;
   let activityError = "";
@@ -181,9 +189,9 @@
   ];
   const discoverLanguages = ["TypeScript", "Python", "Rust", "Go", "Swift"];
   const activityRanges: Array<{ value: ActivityRange; label: string }> = [
-    { value: "day", label: "day" },
-    { value: "week", label: "week" },
-    { value: "month", label: "month" },
+    { value: "day", label: "last day" },
+    { value: "week", label: "last week" },
+    { value: "month", label: "last month" },
   ];
   const audienceRanges: Array<{ value: AudienceRange; label: string }> = [
     { value: "week", label: "week" },
@@ -196,6 +204,8 @@
   $: isAdminUser = auth?.user?.login.toLowerCase() === "steipete";
   $: label = adminRoute
     ? "ReleaseBar Admin"
+    : activityPageRoute
+      ? `@${activityPageRoute.owner} activity`
     : repoRoute
       ? (repoDetail?.fullName ?? repoRoute.fullName)
       : data
@@ -205,6 +215,8 @@
   $: heroExtraCount = initialRoute.extraOwners.length + initialRoute.repos.length;
   $: subtitle = adminRoute
     ? "Scheduler, refresh jobs, and cache health."
+    : activityPageRoute
+      ? "A ranked, repository-by-repository record of recent public work."
     : repoRoute
     ? (repoDetail?.project.description ?? "Repository release and activity detail.")
     : data?.subtitle ?? "Release debt across recently requested public dashboards.";
@@ -215,6 +227,7 @@
     (data?.profile?.includeOwners.length ?? 0) + (data?.profile?.includeRepos.length ?? 0);
   $: subtitleOwner =
     !repoRoute &&
+    !activityPageRoute &&
     !initialRoute.isDefault &&
     initialRoute.owner &&
     initialRoute.extraOwners.length === 0 &&
@@ -237,7 +250,8 @@
     (!data && !errorMessage) ||
     (data?.cache?.state === "rebuilding" && data.projects.length === 0);
   $: dashboardUpdating = data?.cache?.state === "partial";
-  $: manualRefreshAvailable = !adminRoute && !repoRoute && !initialRoute.isDefault;
+  $: manualRefreshAvailable =
+    !adminRoute && !repoRoute && !activityPageRoute && !initialRoute.isDefault;
   $: ownerToggles = data
     ? [...new Set(data.projects.map((project) => project.owner.toLowerCase()))].sort()
     : [];
@@ -306,9 +320,11 @@
   $: releaseCadence = cadenceSummary(repoDetail?.releases ?? []);
   $: workTrend = repoDetail?.workTrend ?? null;
   $: showOwnerActivity =
-    !repoRoute && !initialRoute.isDefault && Boolean(initialRoute.owner) && heroExtraCount === 0;
-  $: showTrustProfile = showOwnerActivity;
+    Boolean(activityPageRoute) ||
+    (!repoRoute && !initialRoute.isDefault && Boolean(initialRoute.owner) && heroExtraCount === 0);
+  $: showTrustProfile = showOwnerActivity && !activityPageRoute;
   $: filteredAudienceUsers = audience ? audienceUsersMatching(audience, audienceQuery) : [];
+  $: activityMaxRepoEvents = maxNumber(activity?.repositories.map((repo) => repo.events) ?? []);
 
   function ownerLabel(payload: DashboardPayload): string {
     if (initialRoute.isDefault) {
@@ -428,7 +444,7 @@
 
   function postClientTiming(fields: Record<string, string | number | boolean | null | undefined>): void {
     const body = JSON.stringify({
-      route: repoRoute ? "repo" : "dashboard",
+      route: activityPageRoute ? "activity" : repoRoute ? "repo" : "dashboard",
       path: location.pathname,
       ...fields,
     });
@@ -492,7 +508,11 @@
   function repoActivityMeta(payload: RepoDetailActivityPayload): string {
     const eventText = `${numberFormat.format(payload.totals.events)} public event${payload.totals.events === 1 ? "" : "s"}`;
     const rangeText =
-      payload.range === "day" ? "today" : payload.range === "week" ? "this week" : "this month";
+      payload.range === "day"
+        ? "in the last day"
+        : payload.range === "week"
+          ? "in the last week"
+          : "in the last month";
     return `${eventText} ${rangeText} · updated ${relativeDate(payload.generatedAt)}`;
   }
 
@@ -860,7 +880,7 @@
     devEnabled: boolean,
   ): void {
     if (!mounted) return;
-    if (repoRoute) return;
+    if (repoRoute || activityPageRoute) return;
     const nextSearch = viewStateSearch(
       location.search,
       {
@@ -1055,12 +1075,13 @@
   }
 
   function activityApiPaths(): string[] {
-    if (!initialRoute.owner) return [];
-    const path = `/api/${encodeURIComponent(initialRoute.owner)}/activity`;
+    const owner = activityPageRoute?.owner ?? initialRoute.owner;
+    if (!owner) return [];
+    const path = `/api/${encodeURIComponent(owner)}/activity`;
     const url = new URL(path, location.origin);
     url.searchParams.set("range", activityRange);
     const urls = [url.toString()];
-    if (initialRoute.fallbackApiPath) {
+    if (activityPageRoute?.fallbackApiPath || initialRoute.fallbackApiPath) {
       const fallback = new URL(path, fallbackApiOrigin());
       fallback.searchParams.set("range", activityRange);
       urls.push(fallback.toString());
@@ -1144,6 +1165,7 @@
     const paths = activityApiPaths();
     if (paths.length === 0) return;
     const requestedRange = activityRange;
+    let lastError = "";
     activityLoading = attempt === 0 && !activity;
     activityError = "";
     try {
@@ -1158,18 +1180,34 @@
         if (body && "events" in body) {
           if (requestedRange !== activityRange) return;
           activity = body;
+          if (activityPageRoute) {
+            updateActivityStatus(body);
+          }
           if (body.summary?.state === "warming" || body.cache.state === "stale") {
             scheduleActivityRefresh(attempt);
           }
           return;
         }
-        activityError =
+        lastError =
           body && "error" in body ? (body.error ?? "") : `activity fetch failed: ${response.status}`;
       }
+      if (requestedRange !== activityRange) return;
+      activityError = lastError;
+      if (activityPageRoute && !activity) {
+        generatedLabel = "activity unavailable";
+        generatedDetail = lastError;
+      }
     } catch (error) {
+      if (requestedRange !== activityRange) return;
       activityError = error instanceof Error ? error.message : String(error);
+      if (activityPageRoute && !activity) {
+        generatedLabel = "activity unavailable";
+        generatedDetail = activityError;
+      }
     } finally {
-      activityLoading = false;
+      if (requestedRange === activityRange) {
+        activityLoading = false;
+      }
     }
   }
 
@@ -1276,9 +1314,22 @@
     activityRange = range;
     activity = null;
     activityError = "";
+    if (activityPageRoute) {
+      generatedLabel = "loading activity";
+      generatedDetail = `${range} range`;
+    }
     if (activityRefreshTimer !== null) {
       globalThis.clearTimeout(activityRefreshTimer);
       activityRefreshTimer = null;
+    }
+    if (activityPageRoute) {
+      const url = new URL(location.href);
+      if (range === "week") {
+        url.searchParams.delete("range");
+      } else {
+        url.searchParams.set("range", range);
+      }
+      history.replaceState(history.state, "", `${url.pathname}${url.search}${url.hash}`);
     }
     void loadOwnerActivity();
   }
@@ -1349,6 +1400,55 @@
     const repoText = `${numberFormat.format(payload.totals.repositories)} repo${payload.totals.repositories === 1 ? "" : "s"}`;
     const eventText = `${numberFormat.format(payload.totals.events)} public event${payload.totals.events === 1 ? "" : "s"}`;
     return `${eventText} · ${repoText} · updated ${relativeDate(payload.generatedAt)}`;
+  }
+
+  function updateActivityStatus(payload: OwnerActivityPayload): void {
+    generatedLabel =
+      payload.cache.state === "stale"
+        ? `refreshing · cached ${relativeDate(payload.generatedAt)}`
+        : `updated ${relativeDate(payload.generatedAt)}`;
+    generatedDetail = [
+      payload.cache.state,
+      quotaLabel(payload.cache.quota),
+      payload.cache.message ?? "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  }
+
+  function activityPageHref(range: ActivityRange): string {
+    if (!activityPageRoute) return "#";
+    return ownerActivityPath(activityPageRoute.owner, range);
+  }
+
+  function activityRepositoryEvents(fullName: string): OwnerActivityPayload["events"] {
+    return (activity?.events ?? []).filter((event) => event.repo === fullName);
+  }
+
+  function activityRepositorySummary(fullName: string): string | null {
+    return (
+      activity?.summary?.repositories?.find(
+        (summary) => summary.fullName.toLowerCase() === fullName.toLowerCase(),
+      )?.text ?? null
+    );
+  }
+
+  function activityBreakdown(
+    repo: OwnerActivityPayload["repositories"][number],
+  ): Array<{ label: string; value: number }> {
+    return [
+      { label: "commits", value: repo.commits },
+      { label: "PRs", value: repo.pullRequests },
+      { label: "issues", value: repo.issues },
+      { label: "comments", value: repo.comments },
+      { label: "releases", value: repo.releases },
+    ].filter((item) => item.value > 0);
+  }
+
+  function activityKindLabel(kind: OwnerActivityPayload["events"][number]["kind"]): string {
+    if (kind === "pull_request") return "PR";
+    if (kind === "repository") return "repo";
+    return kind;
   }
 
   function audienceMeta(payload: RepoAudiencePayload): string {
@@ -2197,6 +2297,9 @@
       if (adminRoute) {
         return loadAdmin();
       }
+      if (activityPageRoute) {
+        return Promise.resolve();
+      }
       if (repoRoute && repoDetail) {
         if (!repoDetail.project.releaseDate && repoSummaryRange === "release") {
           repoSummaryRange = "month";
@@ -2279,6 +2382,12 @@
             <span aria-hidden="true">←</span>
             @{repoRoute.owner}
           </a>
+        {:else if activityPageRoute}
+          <span aria-hidden="true">/</span>
+          <a class="eyebrow eyebrow-back" href={ownerDashboardPath(activityPageRoute.owner)}>
+            <span aria-hidden="true">←</span>
+            dashboard
+          </a>
         {/if}
       </nav>
       <h1>
@@ -2297,6 +2406,9 @@
             </a>
             {#if heroExtraCount > 0}
               <span>+{heroExtraCount}</span>
+            {/if}
+            {#if activityPageRoute}
+              <span class="hero-section-label">activity</span>
             {/if}
           </span>
         {:else if repoRoute && repoDetail}
@@ -2403,7 +2515,7 @@
             <DropdownMenu.Item class="menu-action" onSelect={openSignedInUserDashboard}>
               My Dashboard
             </DropdownMenu.Item>
-            {#if !repoRoute}
+            {#if !repoRoute && !activityPageRoute}
               <DropdownMenu.Item class="menu-action" onSelect={() => (settingsOpen = !settingsOpen)}>
                 Settings
               </DropdownMenu.Item>
@@ -2470,7 +2582,7 @@
     </nav>
   {/if}
 
-  {#if settingsOpen && !repoRoute}
+  {#if settingsOpen && !repoRoute && !activityPageRoute}
     <div class="settings-panel" aria-label="Dashboard settings" data-open>
       <button
         class="settings-close"
@@ -2803,6 +2915,154 @@
               {/if}
             </div>
           </section>
+        </div>
+      {/if}
+    </section>
+  {:else if activityPageRoute}
+    <section class="activity-page" aria-label={`Recent activity for @${activityPageRoute.owner}`}>
+      <section class="activity-page-summary">
+        <div class="activity-page-heading">
+          <div>
+            <span class="panel-kicker">working log</span>
+            <h2>{activityRange === "day" ? "last day" : activityRange === "week" ? "last week" : "last month"}</h2>
+          </div>
+          <nav class="range-toggle" aria-label="Activity range">
+            {#each activityRanges as range}
+              <a
+                class:active={activityRange === range.value}
+                href={activityPageHref(range.value)}
+                aria-current={activityRange === range.value ? "page" : undefined}
+                onclick={(event) => {
+                  event.preventDefault();
+                  setActivityRange(range.value);
+                }}
+              >
+                {range.label}
+              </a>
+            {/each}
+          </nav>
+        </div>
+
+        {#if activityLoading}
+          <div class="activity-page-loading">
+            <span class="loading-kicker">collecting public work</span>
+            <strong>grouping repositories</strong>
+            <div class="loading-bars" aria-hidden="true"><span></span><span></span><span></span></div>
+          </div>
+        {:else if activityError && !activity}
+          <div class="error-state">
+            <span class="loading-kicker">activity unavailable</span>
+            <strong>{activityError}</strong>
+          </div>
+        {:else if activity}
+          <div class="activity-overview-copy">
+            <span class="activity-overview-index">00</span>
+            <div>
+              <span class="panel-kicker">AI overview</span>
+              {#if activity.summary?.state === "ready" && activity.summary.text}
+                <p>{activity.summary.text}</p>
+              {:else if activity.summary?.state === "warming"}
+                <p class="muted">Summarizing work across repositories.</p>
+              {:else}
+                <p class="muted">{activity.summary?.message ?? "Not enough recent work to summarize."}</p>
+              {/if}
+            </div>
+          </div>
+
+          <div class="activity-overview-metrics" aria-label="Activity totals">
+            <div><strong>{numberFormat.format(activity.totals.repositories)}</strong><span>repositories</span></div>
+            <div><strong>{numberFormat.format(activity.totals.commits)}</strong><span>commits</span></div>
+            <div><strong>{numberFormat.format(activity.totals.pullRequests)}</strong><span>pull requests</span></div>
+            <div><strong>{numberFormat.format(activity.totals.issues)}</strong><span>issues</span></div>
+            <div><strong>{numberFormat.format(activity.totals.comments)}</strong><span>comments</span></div>
+            <div><strong>{numberFormat.format(activity.totals.releases)}</strong><span>releases</span></div>
+          </div>
+          <small class="activity-meta">{activityMeta(activity)}</small>
+          {#if activityError}
+            <small class="activity-meta">Refresh failed: {activityError}</small>
+          {/if}
+        {/if}
+      </section>
+
+      {#if activity && activity.repositories.length > 0}
+        <div class="activity-repository-list">
+          {#each activity.repositories as repo, index (repo.fullName)}
+            <article class="activity-repository-card">
+              <div class="activity-rank" aria-label={`Rank ${index + 1}`}>
+                {String(index + 1).padStart(2, "0")}
+              </div>
+              <div class="activity-repository-main">
+                <header>
+                  <div>
+                    <a class="activity-repository-name" href={repoDetailPath(repo.fullName)}>
+                      {repo.fullName}
+                    </a>
+                    <span
+                      >{numberFormat.format(repo.events)} activity {repo.events === 1
+                        ? "item"
+                        : "items"} · last active {relativeDate(repo.lastActiveAt)}</span
+                    >
+                  </div>
+                  <a class="activity-repository-open" href={repo.url} target="_blank" rel="noreferrer">
+                    GitHub ↗
+                  </a>
+                </header>
+
+                <div class="activity-weight" aria-hidden="true">
+                  <i style={`width: ${percent(repo.events, activityMaxRepoEvents)}%`}></i>
+                </div>
+
+                <div class="activity-repository-breakdown">
+                  {#each activityBreakdown(repo) as item}
+                    <span><strong>{numberFormat.format(item.value)}</strong> {item.label}</span>
+                  {/each}
+                </div>
+
+                <div class="activity-repository-summary">
+                  <span class="panel-kicker">AI summary</span>
+                  {#if activityRepositorySummary(repo.fullName)}
+                    <p>{activityRepositorySummary(repo.fullName)}</p>
+                  {:else if activity.summary?.state === "warming"}
+                    <p class="muted">Summarizing this repository.</p>
+                  {:else}
+                    <p class="muted">No repository summary available.</p>
+                  {/if}
+                </div>
+
+                <details class="activity-event-details" open={index < 3}>
+                  <summary>
+                    <span>event log</span>
+                    <small>{activityRepositoryEvents(repo.fullName).length} grouped entries</small>
+                  </summary>
+                  <div class="activity-event-list">
+                    {#each activityRepositoryEvents(repo.fullName) as event (event.id)}
+                      {#if event.url}
+                        <a href={event.url} target="_blank" rel="noreferrer">
+                          <span class={`activity-kind kind-${event.kind}`}>{activityKindLabel(event.kind)}</span>
+                          <strong>{event.title}</strong>
+                          {#if event.count > 1}<small>×{event.count}</small>{/if}
+                          <time datetime={event.createdAt}>{relativeDate(event.createdAt)}</time>
+                        </a>
+                      {:else}
+                        <div>
+                          <span class={`activity-kind kind-${event.kind}`}>{activityKindLabel(event.kind)}</span>
+                          <strong>{event.title}</strong>
+                          {#if event.count > 1}<small>×{event.count}</small>{/if}
+                          <time datetime={event.createdAt}>{relativeDate(event.createdAt)}</time>
+                        </div>
+                      {/if}
+                    {/each}
+                  </div>
+                </details>
+              </div>
+            </article>
+          {/each}
+        </div>
+      {:else if activity && !activityLoading}
+        <div class="loading-state empty-state">
+          <span class="loading-kicker">quiet range</span>
+          <strong>no public work found</strong>
+          <small>Try a longer time range.</small>
         </div>
       {/if}
     </section>
@@ -3415,6 +3675,11 @@
             · refreshing
           {/if}
         </small>
+        {#if initialRoute.owner}
+          <a class="activity-drilldown" href={ownerActivityPath(initialRoute.owner, activityRange)}>
+            view grouped activity <span aria-hidden="true">→</span>
+          </a>
+        {/if}
       {/if}
     </section>
   {/if}

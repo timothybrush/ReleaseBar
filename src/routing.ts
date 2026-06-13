@@ -20,6 +20,12 @@ export type RepoRoute = {
   fallbackApiPath: string | null;
 };
 
+export type OwnerActivityRoute = {
+  owner: string;
+  apiPath: string;
+  fallbackApiPath: string | null;
+};
+
 export type RouteOptions = {
   includeForks: boolean;
   includeArchived: boolean;
@@ -33,6 +39,8 @@ const ownerListKey = "owners";
 const repoListKey = "repos";
 const discoverLanguageKey = "hotLang";
 const reservedRepoRouteOwners = new Set(["api", "og"]);
+const reservedOwnerActivityOwners = new Set(["api", "og"]);
+const reservedOwnerRouteRepos = new Set(["activity"]);
 const discoverPeriodValues = new Set<DiscoverPeriod>([
   "day",
   "week",
@@ -112,6 +120,7 @@ export function repoFromPath(pathname: string, apiOrigin = workerApiOrigin): Rep
   const repo = repoPart?.trim().toLowerCase() ?? "";
   const fullName = `${owner}/${repo}`;
   if (!validRepoSlug(fullName)) return null;
+  if (!escaped && reservedOwnerRouteRepos.has(repo)) return null;
   const apiPath = `/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
   return {
     owner,
@@ -122,14 +131,51 @@ export function repoFromPath(pathname: string, apiOrigin = workerApiOrigin): Rep
   };
 }
 
+export function ownerActivityFromPath(
+  pathname: string,
+  apiOrigin = workerApiOrigin,
+): OwnerActivityRoute | null {
+  const parts = pathname
+    .split("/")
+    .filter(Boolean)
+    .map((part) => decodeURIComponent(part));
+  const escaped = parts[0] === "-" && parts[1]?.toLowerCase() === "owners";
+  if (
+    (!escaped && (parts.length !== 2 || parts[1]?.toLowerCase() !== "activity")) ||
+    (escaped && (parts.length !== 4 || parts[3]?.toLowerCase() !== "activity"))
+  ) {
+    return null;
+  }
+  const owner = (escaped ? parts[2] : parts[0])?.trim().replace(/^@/, "").toLowerCase() ?? "";
+  if (!/^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?$/i.test(owner)) return null;
+  if (!escaped && reservedOwnerActivityOwners.has(owner)) return null;
+  const apiPath = `/api/${encodeURIComponent(owner)}/activity`;
+  return {
+    owner,
+    apiPath: `${apiOrigin}${apiPath}`,
+    fallbackApiPath: apiOrigin === "" ? `${fallbackApiOrigin()}${apiPath}` : null,
+  };
+}
+
 export function ownerDashboardPath(owner: string): string {
   return `/${encodeURIComponent(owner.trim().replace(/^@/, "").toLowerCase())}`;
+}
+
+export function ownerActivityPath(owner: string, range: "day" | "week" | "month" = "week"): string {
+  const normalizedOwner = owner.trim().replace(/^@/, "").toLowerCase();
+  const path = reservedOwnerActivityOwners.has(normalizedOwner)
+    ? `/-/owners/${encodeURIComponent(normalizedOwner)}/activity`
+    : `${ownerDashboardPath(normalizedOwner)}/activity`;
+  return range === "week" ? path : `${path}?range=${range}`;
 }
 
 export function repoDetailPath(fullName: string): string {
   const [owner, repo] = fullName.trim().replace(/^@/, "").toLowerCase().split("/");
   if (!owner || !repo) return "/";
-  const prefix = reservedRepoRouteOwners.has(owner) || repo.includes(".") ? "/-" : "";
+  const prefix =
+    reservedRepoRouteOwners.has(owner) || reservedOwnerRouteRepos.has(repo) || repo.includes(".")
+      ? "/-"
+      : "";
   return `${prefix}/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
 }
 

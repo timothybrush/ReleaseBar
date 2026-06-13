@@ -70,6 +70,7 @@ import type {
   OwnerActivityEvent,
   OwnerActivityPayload,
   OwnerActivityRepository,
+  OwnerActivityRepositorySummary,
   OwnerActivitySummary,
   Project,
   RepoAudiencePayload,
@@ -269,9 +270,10 @@ const repoAudienceRanges: AudienceRange[] = ["week", "month"];
 const repoAudienceUserRepoLimit = 8;
 const releaseSummaryPromptVersion = 1;
 const releaseSummaryCommitLimit = 500;
-const activitySummaryPromptVersion = 2;
+const activitySummaryPromptVersion = 3;
 const activityEventPageLimit = 3;
-const activitySummaryInputLimit = 120;
+const activitySummaryInputLimit = 180;
+const activityRepositorySummaryLimit = 30;
 const maxCustomSources = 8;
 const dashboardSchemaVersion = 6;
 const auxiliaryCacheSchemaVersion = 3;
@@ -1581,10 +1583,26 @@ function repoFullNameFromPath(pathname: string): string | null {
   const owner = slugOwner(escaped ? (parts[1] ?? "") : (parts[0] ?? ""));
   const repo = (escaped ? (parts[2] ?? "") : (parts[1] ?? "")).trim().toLowerCase();
   const fullName = `${owner}/${repo}`;
+  if (!escaped && repo === "activity") return null;
   return validRepoSlug(fullName) ? fullName : null;
 }
 
+function ownerActivityPageOwner(pathname: string): string | null {
+  const parts = pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  const escaped = parts[0] === "-" && parts[1]?.toLowerCase() === "owners";
+  if (
+    (!escaped && (parts.length !== 2 || parts[1]?.toLowerCase() !== "activity")) ||
+    (escaped && (parts.length !== 4 || parts[3]?.toLowerCase() !== "activity"))
+  ) {
+    return null;
+  }
+  const owner = slugOwner((escaped ? parts[2] : parts[0]) ?? "");
+  if (!escaped && (owner === "api" || owner === "og")) return null;
+  return validOwnerSlug(owner) ? owner : null;
+}
+
 function ownerFromPagePath(pathname: string): string | null {
+  if (ownerActivityPageOwner(pathname)) return null;
   if (repoFullNameFromPath(pathname)) return null;
   const owner = slugOwner(pathname.split("/").filter(Boolean)[0] ?? "");
   return validOwnerSlug(owner) ? owner : null;
@@ -1645,6 +1663,7 @@ async function initialPageData(
   env: Env,
 ): Promise<InitialPageData | null> {
   if (url.pathname === "/_admin") return null;
+  if (ownerActivityPageOwner(url.pathname)) return null;
   const repo = repoFullNameFromPath(url.pathname);
   if (repo) return cachedRepoInitialData(env, repo);
 
@@ -1726,6 +1745,8 @@ async function assetResponse(request: Request, env: Env): Promise<Response> {
 
 function socialLabel(url: URL): string {
   if (url.pathname === "/_admin") return "ReleaseBar Admin";
+  const activityOwner = ownerActivityPageOwner(url.pathname);
+  if (activityOwner) return `@${activityOwner} activity`;
   const repo = repoFullNameFromPath(url.pathname);
   if (repo) return repo;
   const owner = slugOwner(url.pathname.split("/").filter(Boolean)[0] ?? "");
@@ -8436,10 +8457,18 @@ function activityRepositories(events: OwnerActivityEvent[]): OwnerActivityReposi
       url: activityRepoUrl(event.repo),
       events: 0,
       commits: 0,
+      pullRequests: 0,
+      issues: 0,
+      comments: 0,
+      releases: 0,
       lastActiveAt: event.createdAt,
     };
-    existing.events += 1;
+    existing.events += event.count;
     existing.commits += event.kind === "commit" ? event.count : 0;
+    existing.pullRequests += event.kind === "pull_request" ? event.count : 0;
+    existing.issues += event.kind === "issue" ? event.count : 0;
+    existing.comments += event.kind === "comment" ? event.count : 0;
+    existing.releases += event.kind === "release" ? event.count : 0;
     if (Date.parse(event.createdAt) > Date.parse(existing.lastActiveAt)) {
       existing.lastActiveAt = event.createdAt;
     }
@@ -8467,6 +8496,17 @@ function activityTotals(events: OwnerActivityEvent[]): OwnerActivityPayload["tot
   };
 }
 
+function activityEventsForCurrentRange(
+  events: OwnerActivityEvent[],
+  range: ActivityRange,
+): OwnerActivityEvent[] {
+  const since = Date.now() - activityRangeMs(range);
+  return events.filter((event) => {
+    const createdAt = Date.parse(event.createdAt);
+    return Number.isFinite(createdAt) && createdAt >= since;
+  });
+}
+
 async function publicOwnerActivity(
   env: Env,
   payload: OwnerActivityPayload,
@@ -8476,18 +8516,19 @@ async function publicOwnerActivity(
     payload.events.map((event) => event.repo),
   );
   if (!privateNames) return null;
-  if (privateNames.size === 0) return payload;
-  const events = payload.events.filter((event) => !privateNames.has(event.repo.toLowerCase()));
-  return {
+  const events = activityEventsForCurrentRange(payload.events, payload.range).filter(
+    (event) => !privateNames.has(event.repo.toLowerCase()),
+  );
+  const current = {
     ...payload,
     totals: activityTotals(events),
     repositories: activityRepositories(events),
     events,
-    summary: unavailableActivitySummary(
-      activitySummaryModel(env),
-      null,
-      "Private repository activity was removed.",
-    ),
+  };
+  if (events.length === payload.events.length) return current;
+  return {
+    ...current,
+    summary: await activitySummaryState(current, env),
   };
 }
 
@@ -8498,15 +8539,34 @@ function activitySummaryModel(env: Env): string {
 type ActivitySummaryPayload = Pick<OwnerActivityPayload, "events" | "repositories">;
 
 function activitySummaryEvents(payload: ActivitySummaryPayload): OwnerActivityEvent[] {
-  return payload.events.slice(0, activitySummaryInputLimit);
+  const selected: OwnerActivityEvent[] = [];
+  const selectedIds = new Set<string>();
+  for (const repo of payload.repositories.slice(0, activityRepositorySummaryLimit)) {
+    for (const event of payload.events
+      .filter((event) => event.repo === repo.fullName)
+      .slice(0, 3)) {
+      selected.push(event);
+      selectedIds.add(event.id);
+    }
+  }
+  for (const event of payload.events) {
+    if (selected.length >= activitySummaryInputLimit) break;
+    if (selectedIds.has(event.id)) continue;
+    selected.push(event);
+    selectedIds.add(event.id);
+  }
+  return selected.slice(0, activitySummaryInputLimit);
 }
 
 function activitySummaryInput(payload: ActivitySummaryPayload): string {
   const summaryEvents = activitySummaryEvents(payload);
   if (summaryEvents.length === 0) return "";
   const topRepos = payload.repositories
-    .slice(0, 8)
-    .map((repo) => `${repo.fullName} (${repo.events} events, ${repo.commits} commits)`)
+    .slice(0, activityRepositorySummaryLimit)
+    .map(
+      (repo) =>
+        `${repo.fullName} (${repo.events} items, ${repo.commits} commits, ${repo.pullRequests} PRs, ${repo.issues} issues, ${repo.comments} comments, ${repo.releases} releases)`,
+    )
     .join(", ");
   const events = summaryEvents
     .map((event, index) =>
@@ -8579,7 +8639,7 @@ async function activitySummaryState(
   };
 }
 
-function activitySummaryInstructions(): string {
+function activitySummaryInstructions(structured = false): string {
   return [
     "You write the working-on paragraph for ReleaseBar owner dashboards.",
     "The UI already says this is a GitHub dashboard, shows the selected time range, and lists commit/PR/issue totals, so do not restate those facts.",
@@ -8587,6 +8647,12 @@ function activitySummaryInstructions(): string {
     "Start with concrete work: systems, fixes, releases, docs, integrations, repo names, and themes that are directly supported by the event titles.",
     "Write 2-3 useful sentences, no bullets, no markdown, no hype.",
     "Do not infer private work, intentions, employers, or impact beyond the event titles.",
+    ...(structured
+      ? [
+          'Return only JSON in this shape: {"summary":"overall summary","repositories":[{"fullName":"owner/repo","summary":"one concise sentence"}]}.',
+          `Include one repository entry for every repository listed in Top repositories, up to ${activityRepositorySummaryLimit}. Keep each repository summary concrete and under 32 words.`,
+        ]
+      : []),
   ].join(" ");
 }
 
@@ -8599,6 +8665,48 @@ function polishActivitySummaryText(text: string): string {
     .replace(/\bActivity also touched\b/g, "Also touched")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function parseOwnerActivitySummaryText(
+  text: string,
+  repositories: OwnerActivityRepository[],
+): Pick<OwnerActivitySummary, "text" | "repositories"> | null {
+  const cleaned = text
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const record = parsed as { summary?: unknown; repositories?: unknown };
+  if (typeof record.summary !== "string" || !record.summary.trim()) return null;
+  const expected = new Map(
+    repositories
+      .slice(0, activityRepositorySummaryLimit)
+      .map((repository) => [repository.fullName.toLowerCase(), repository.fullName]),
+  );
+  if (!Array.isArray(record.repositories) || record.repositories.length !== expected.size)
+    return null;
+  const summaries = new Map<string, OwnerActivityRepositorySummary>();
+  for (const candidate of record.repositories) {
+    if (!candidate || typeof candidate !== "object") return null;
+    const value = candidate as { fullName?: unknown; summary?: unknown };
+    const key = typeof value.fullName === "string" ? value.fullName.trim().toLowerCase() : "";
+    const fullName = expected.get(key);
+    const summary =
+      typeof value.summary === "string" ? polishActivitySummaryText(value.summary) : "";
+    if (!fullName || !summary || summaries.has(key)) return null;
+    summaries.set(key, { fullName, text: summary });
+  }
+  if ([...expected.keys()].some((key) => !summaries.has(key))) return null;
+  return {
+    text: polishActivitySummaryText(record.summary),
+    repositories: [...expected.keys()].map((key) => summaries.get(key)!),
+  };
 }
 
 async function summarizeOwnerActivity(
@@ -8627,8 +8735,42 @@ async function summarizeOwnerActivity(
     },
     body: JSON.stringify({
       model,
-      max_output_tokens: 420,
-      instructions: activitySummaryInstructions(),
+      max_output_tokens: 2200,
+      instructions: activitySummaryInstructions(true),
+      text: {
+        format: {
+          type: "json_schema",
+          name: "owner_activity_summary",
+          strict: true,
+          schema: {
+            type: "object",
+            properties: {
+              summary: { type: "string", minLength: 1 },
+              repositories: {
+                type: "array",
+                minItems: Math.min(payload.repositories.length, activityRepositorySummaryLimit),
+                maxItems: Math.min(payload.repositories.length, activityRepositorySummaryLimit),
+                items: {
+                  type: "object",
+                  properties: {
+                    fullName: {
+                      type: "string",
+                      enum: payload.repositories
+                        .slice(0, activityRepositorySummaryLimit)
+                        .map((repository) => repository.fullName),
+                    },
+                    summary: { type: "string", minLength: 1 },
+                  },
+                  required: ["fullName", "summary"],
+                  additionalProperties: false,
+                },
+              },
+            },
+            required: ["summary", "repositories"],
+            additionalProperties: false,
+          },
+        },
+      },
       input: [
         {
           role: "user",
@@ -8659,14 +8801,19 @@ async function summarizeOwnerActivity(
   }
   const text = openAIOutputText(body);
   if (!text) throw new Error("OpenAI response did not include activity summary text");
+  const parsed = parseOwnerActivitySummaryText(text, payload.repositories);
+  if (!parsed) {
+    throw new Error("OpenAI response did not include complete structured activity summaries");
+  }
   const summary = {
     state: "ready",
-    text: polishActivitySummaryText(text),
+    text: parsed.text,
     generatedAt: new Date().toISOString(),
     model,
     inputHash,
     eventsUsed,
     promptVersion: activitySummaryPromptVersion,
+    repositories: parsed.repositories,
   } satisfies OwnerActivitySummary;
   await writeOwnerActivitySummary(
     env,
@@ -8841,6 +8988,24 @@ async function summarizeRepoActivity(
   return summary;
 }
 
+async function currentRepoActivity(
+  payload: RepoDetailActivityPayload,
+  env: Env,
+): Promise<RepoDetailActivityPayload> {
+  const events = activityEventsForCurrentRange(payload.events, payload.range);
+  const current = {
+    ...payload,
+    totals: activityTotals(events),
+    repositories: activityRepositories(events),
+    events,
+  };
+  if (events.length === payload.events.length) return current;
+  return {
+    ...current,
+    summary: await repoActivitySummaryState(current, env),
+  };
+}
+
 async function buildRepoActivity(
   owner: string,
   repoName: string,
@@ -8930,6 +9095,26 @@ function ownerActivitySummaryNeedsRefresh(payload: OwnerActivityPayload | null, 
     (!!payload?.summary && payload.summary.promptVersion !== activitySummaryPromptVersion) ||
     (!!payload?.summary && payload.summary.model !== activitySummaryModel(env))
   );
+}
+
+function withPendingOwnerActivitySummary(
+  payload: OwnerActivityPayload,
+  env: Env,
+): OwnerActivityPayload {
+  const inputHash = payload.summary?.inputHash ?? null;
+  return {
+    ...payload,
+    summary: {
+      state: "warming",
+      text: null,
+      generatedAt: null,
+      model: activitySummaryModel(env),
+      inputHash,
+      eventsUsed: activitySummaryEvents(payload).length,
+      promptVersion: activitySummaryPromptVersion,
+      message: "Summarizing recent work.",
+    },
+  };
 }
 
 async function refreshOwnerActivitySummary(
@@ -9029,10 +9214,14 @@ async function ownerActivityResponse(
   const age = ownerActivityAgeMs(cached);
   const allowRefresh = allowRequestRefresh(request);
   if (cached && age < activityCacheTtlMs(range)) {
-    if (allowRefresh && ownerActivitySummaryNeedsRefresh(cached, env)) {
+    const summaryNeedsRefresh = allowRefresh && ownerActivitySummaryNeedsRefresh(cached, env);
+    if (summaryNeedsRefresh) {
       context.waitUntil(refreshOwnerActivitySummary(key, cached, env).catch(() => undefined));
     }
-    return jsonResponse(cached, cached.summary?.state === "warming" ? 202 : 200, {
+    const responsePayload = summaryNeedsRefresh
+      ? withPendingOwnerActivitySummary(cached, env)
+      : cached;
+    return jsonResponse(responsePayload, responsePayload.summary?.state === "warming" ? 202 : 200, {
       "cache-control": "public, max-age=60, stale-while-revalidate=600",
     });
   }
@@ -9131,7 +9320,7 @@ async function refreshRepoActivitySummary(
   if (!lock) return;
   try {
     const summary = await summarizeRepoActivity(payload, env);
-    const latest = (await readRepoActivity(env, key)) ?? payload;
+    const latest = await currentRepoActivity((await readRepoActivity(env, key)) ?? payload, env);
     const latestInputHash = (await sha256Base64Url(activitySummaryInput(latest))).slice(0, 32);
     if (
       latest.fullName.toLowerCase() !== payload.fullName.toLowerCase() ||
@@ -9146,7 +9335,7 @@ async function refreshRepoActivitySummary(
       summary,
     });
   } catch (error) {
-    const latest = (await readRepoActivity(env, key)) ?? payload;
+    const latest = await currentRepoActivity((await readRepoActivity(env, key)) ?? payload, env);
     const latestInputHash = (await sha256Base64Url(activitySummaryInput(latest))).slice(0, 32);
     if (
       latest.fullName.toLowerCase() !== payload.fullName.toLowerCase() ||
@@ -9216,7 +9405,8 @@ async function repoActivityResponse(
   }
   const range = activityRangeFromUrl(url);
   const key = repoActivityCacheKey(owner, repo, range);
-  const cached = barrier === "clear" ? await readRepoActivity(env, key) : null;
+  const rawCached = barrier === "clear" ? await readRepoActivity(env, key) : null;
+  const cached = rawCached ? await currentRepoActivity(rawCached, env) : null;
   const age = repoActivityAgeMs(cached);
   const allowRefresh = allowRequestRefresh(request);
   if (cached && age < activityCacheTtlMs(range)) {
@@ -15832,6 +16022,12 @@ async function routeRequest(
   context: ExecutionContext,
   url: URL,
 ): Promise<Response> {
+  if (
+    (request.method === "GET" || request.method === "HEAD") &&
+    ownerActivityPageOwner(url.pathname)
+  ) {
+    return assetResponse(request, env);
+  }
   if (url.pathname.startsWith("/og/")) {
     const { label, extension } = socialRouteLabel(url.pathname);
     const title =

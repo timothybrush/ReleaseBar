@@ -29,6 +29,7 @@ Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token
 
 - `/` loads `ReleaseBar Hot`, a cached board built from recently requested public dashboards
 - `/:owner` loads the Worker API for that owner
+- `/:owner/activity` groups day, week, or month public work by repository, ranked by activity volume, with one overall AI summary and concise per-repository AI summaries
 - query options: `forks=true`, `archived=true`, `unreleased=false`
 - add public sources with `owners=openclaw,steipete` or `repos=owner/name`
 - the settings panel can add public users, orgs, or explicit repos to the current URL
@@ -52,6 +53,7 @@ The Worker in `worker/index.ts` serves both the static app shell and the generic
 
 - `GET /api/:owner` returns a cached dashboard for a public GitHub user or org
 - `GET /api/:owner/events` streams cache updates for progressive rebuilds
+- `GET /api/:owner/activity?range=day|week|month` returns ranked, grouped public activity and cached AI summaries
 - `GET /api/users/:login/trust` returns cached public people trust or organization signal scoring, account age, score dimensions, and weighted score factors for one GitHub profile
 - `GET /api/repos/:owner/:repo` returns repository detail stats
 - `GET /api/repos/:owner/:repo/audience?range=week|month` returns cached recent stargazer scoring from public GitHub profile fields

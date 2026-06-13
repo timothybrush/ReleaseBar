@@ -2,6 +2,7 @@
 
 ## 0.1.1 - Unreleased
 
+- Added `/owner/activity` drill-down pages with day, week, and month views, repository ranking by actual activity volume, grouped event logs, overall AI summaries, and bounded per-repository AI summaries while preserving repositories named `activity` under escaped detail routes.
 - Added shared per-owner metadata snapshots with lean 15-minute issue/PR count refreshes, fresh-cache responses before GitHub App token discovery, four-repository release hydration concurrency, independent count/release/CI timestamps, signed GitHub webhooks for issue, pull request, push, release, and archive updates, and stricter archived-repository removal from status views.
 - Prioritized webhook-triggered push and release refreshes by recent dashboard activity and skipped eager deep hydration for variants not viewed in the last day, reducing stale archived and fork variant queue and GitHub quota pressure.
 - Coalesced per-owner webhook bursts so issue and pull request events for the same repository share one authoritative count refresh, push and release bursts share one release refresh, and follower deliveries stop contending and requeueing behind active processing.

@@ -203,7 +203,16 @@ export type OwnerActivityRepository = {
   url: string;
   events: number;
   commits: number;
+  pullRequests: number;
+  issues: number;
+  comments: number;
+  releases: number;
   lastActiveAt: string;
+};
+
+export type OwnerActivityRepositorySummary = {
+  fullName: string;
+  text: string;
 };
 
 export type OwnerActivitySummary = {
@@ -215,6 +224,7 @@ export type OwnerActivitySummary = {
   eventsUsed: number;
   promptVersion?: number;
   message?: string;
+  repositories?: OwnerActivityRepositorySummary[];
 };
 
 export type OwnerActivityPayload = {

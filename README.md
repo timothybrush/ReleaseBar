@@ -92,7 +92,7 @@ Configure `OPENAI_API_KEY` as a Worker secret to summarize recent public activit
 wrangler secret put OPENAI_API_KEY
 ```
 
-Summaries are generated server-side through the OpenAI Responses API without an explicit reasoning option. Release summaries are cached by repository, release tag, default-branch head SHA, model, and prompt version; activity summaries also refresh when the configured model changes.
+Summaries are generated server-side through the OpenAI Responses API without an explicit reasoning option. Owner activity uses one compact structured request for the overall summary and up to 30 repository summaries, with a repository-aware output ceiling and a compatibility floor for configurable reasoning models. Release summaries are cached by repository, release tag, default-branch head SHA, model, and prompt version; activity summaries also refresh when the configured model changes.
 
 ## Local Real-Data Testing
 

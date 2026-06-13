@@ -3,6 +3,7 @@
 ## 0.1.1 - Unreleased
 
 - Collapsed repository event logs by default on owner activity pages so the ranked summaries stay compact until expanded.
+- Expanded high-signal repository activity summaries to one or two short sentences while compacting the single batched AI request and using a repository-aware output ceiling with a reasoning-model compatibility floor.
 - Added `/owner/activity` drill-down pages with day, week, and month views, repository ranking by actual activity volume, grouped event logs, overall AI summaries, and bounded per-repository AI summaries while preserving repositories named `activity` under escaped detail routes.
 - Added shared per-owner metadata snapshots with lean 15-minute issue/PR count refreshes, fresh-cache responses before GitHub App token discovery, four-repository release hydration concurrency, independent count/release/CI timestamps, signed GitHub webhooks for issue, pull request, push, release, and archive updates, and stricter archived-repository removal from status views.
 - Prioritized webhook-triggered push and release refreshes by recent dashboard activity and skipped eager deep hydration for variants not viewed in the last day, reducing stale archived and fork variant queue and GitHub quota pressure.

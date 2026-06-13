@@ -4083,7 +4083,7 @@ test("worker summarizes recent repository activity in the background", async () 
     assert.equal(cached.summary?.state, "ready", cached.summary?.message ?? "");
     assert.equal(cached.summary?.model, "chat-latest");
     assert.match(cached.summary?.text ?? "", /recent-work panel/);
-    assert.equal(cached.summary?.promptVersion, 3);
+    assert.equal(cached.summary?.promptVersion, 4);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -4094,6 +4094,7 @@ test("worker summarizes public owner activity in the background", async () => {
   const queued: Promise<unknown>[] = [];
   const originalFetch = globalThis.fetch;
   const generatedAt = new Date().toISOString();
+  let openAICalls = 0;
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
     if (url.hostname === "api.github.com" && url.pathname === "/users/acme") {
@@ -4139,6 +4140,20 @@ test("worker summarizes public owner activity in the background", async () => {
           },
         },
         {
+          id: "other-repo",
+          type: "IssuesEvent",
+          public: true,
+          created_at: generatedAt,
+          repo: { name: "acme/other" },
+          payload: {
+            action: "closed",
+            issue: {
+              title: "Remove a redundant refresh path",
+              html_url: "https://github.com/acme/other/issues/1",
+            },
+          },
+        },
+        {
           id: "repo-missing",
           type: "PushEvent",
           public: true,
@@ -4176,26 +4191,40 @@ test("worker summarizes public owner activity in the background", async () => {
       return Response.json(events);
     }
     if (url.hostname === "api.openai.com" && url.pathname === "/v1/responses") {
+      openAICalls += 1;
       const headers = init?.headers as Record<string, string> | undefined;
       assert.equal(headers?.authorization, "Bearer openai-token");
       const body = JSON.parse(String(init?.body ?? "{}"));
       assert.equal(body.model, "chat-latest");
       assert.equal(body.reasoning, undefined);
+      assert.equal(body.max_output_tokens, 2200);
       assert.equal(body.text?.format?.type, "json_schema");
-      assert.equal(body.text?.format?.schema?.properties?.repositories?.minItems, 1);
+      assert.equal(body.text?.format?.schema?.properties?.repositories?.minItems, 2);
       assert.match(body.instructions, /do not restate those facts/i);
+      assert.match(body.instructions, /one or two short sentences/i);
       assert.doesNotMatch(body.instructions, /Say this is public activity/i);
-      assert.match(JSON.stringify(body.input), /Top repositories: acme\/releasebar/);
-      assert.match(JSON.stringify(body.input), /Add owner activity panel/);
-      assert.match(JSON.stringify(body.input), /Events included: 124/);
+      const inputText = JSON.stringify(body.input);
+      assert.match(inputText, /Repository: acme\/releasebar/);
+      assert.match(inputText, /Summary target: yes/);
+      assert.match(inputText, /Totals: 127 items; 4 commits; 1 PR; 122 comments/);
+      assert.match(inputText, /Repository: acme\/other/);
+      assert.match(inputText, /Remove a redundant refresh path/);
+      assert.match(inputText, /Add owner activity panel/);
+      assert.match(inputText, /Events included: 125/);
+      assert.equal(inputText.match(/Repository: acme\/releasebar/g)?.length, 1);
       return Response.json({
         output_text: JSON.stringify({
           summary:
-            "ReleaseBar activity summaries, cache behavior, and dashboard copy moved forward together.",
+            "ReleaseBar activity summaries, cache behavior, and dashboard copy moved forward together. A second repository removed a redundant refresh path.",
           repositories: [
             {
               fullName: "acme/releasebar",
-              summary: "ReleaseBar gained grouped activity summaries and refined dashboard copy.",
+              summary:
+                "ReleaseBar gained grouped activity summaries and refined dashboard copy. The cache path now keeps that generated work reusable.",
+            },
+            {
+              fullName: "acme/other",
+              summary: "Closed an issue after removing a redundant refresh path.",
             },
           ],
         }),
@@ -4215,8 +4244,9 @@ test("worker summarizes public owner activity in the background", async () => {
     assert.equal(body.range, "week");
     assert.equal(body.totals.commits, 4);
     assert.equal(body.totals.pullRequests, 1);
-    assert.equal(body.totals.repositories, 1);
-    assert.equal(body.repositories[0]?.events, body.totals.events);
+    assert.equal(body.totals.issues, 1);
+    assert.equal(body.totals.repositories, 2);
+    assert.equal(body.repositories[0]?.events, 127);
     assert.equal(body.repositories[0]?.commits, 4);
     assert.equal(body.repositories[0]?.pullRequests, 1);
     assert.equal(body.repositories[0]?.comments, 122);
@@ -4228,16 +4258,133 @@ test("worker summarizes public owner activity in the background", async () => {
     );
     assert.equal(body.summary?.state, "warming");
     await Promise.all(queued);
+    assert.equal(openAICalls, 1);
     const cached = JSON.parse(
       (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
     ) as OwnerActivityPayload;
     assert.equal(cached.summary?.state, "ready", cached.summary?.message ?? "");
     assert.match(cached.summary?.text ?? "", /activity summaries/);
     assert.match(cached.summary?.repositories?.[0]?.text ?? "", /grouped activity summaries/);
+    assert.match(cached.summary?.repositories?.[0]?.text ?? "", /cache path/);
+    assert.match(cached.summary?.repositories?.[1]?.text ?? "", /redundant refresh path/);
     assert.doesNotMatch(cached.summary?.text ?? "", /GitHub activity|public activity/i);
     assert.notEqual(cached.summary?.inputHash, null);
-    assert.equal(cached.summary?.eventsUsed, 124);
-    assert.equal(cached.summary?.promptVersion, 3);
+    assert.equal(cached.summary?.eventsUsed, 125);
+    assert.equal(cached.summary?.promptVersion, 4);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker includes lower-ranked repositories in the overall activity summary batch", async () => {
+  const generatedAt = new Date().toISOString();
+  const repositories = Array.from({ length: 31 }, (_, index) => {
+    const suffix = String(index + 1).padStart(2, "0");
+    return {
+      fullName: `acme/repo-${suffix}`,
+      url: `https://github.com/acme/repo-${suffix}`,
+      events: 1,
+      commits: 1,
+      pullRequests: 0,
+      issues: 0,
+      comments: 0,
+      releases: 0,
+      lastActiveAt: generatedAt,
+    };
+  });
+  const events = repositories.map((repository, index) => ({
+    id: `event-${index + 1}`,
+    kind: "commit" as const,
+    title: `Improve repository ${index + 1}`,
+    repo: repository.fullName,
+    url: repository.url,
+    createdAt: generatedAt,
+    count: 1,
+  }));
+  const payload = {
+    owner: {
+      type: "user" as const,
+      login: "acme",
+      avatarUrl: "https://github.com/acme.png",
+      url: "https://github.com/acme",
+    },
+    range: "week" as const,
+    generatedAt,
+    cache: {
+      state: "fresh" as const,
+      stale: false,
+      generatedAt,
+    },
+    totals: {
+      events: 31,
+      commits: 31,
+      pullRequests: 0,
+      issues: 0,
+      comments: 0,
+      releases: 0,
+      repositories: 31,
+    },
+    repositories,
+    events,
+    summary: {
+      state: "ready" as const,
+      text: "Old summary.",
+      generatedAt,
+      model: "chat-latest",
+      inputHash: "old-hash",
+      eventsUsed: 31,
+      promptVersion: 3,
+    },
+  } satisfies OwnerActivityPayload;
+  const cache = kvStore({
+    "owner-activity:v1:acme:week": JSON.stringify(payload),
+  });
+  const queued: Promise<unknown>[] = [];
+  const originalFetch = globalThis.fetch;
+  let openAICalls = 0;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.hostname === "api.openai.com" && url.pathname === "/v1/responses") {
+      openAICalls += 1;
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      const inputText = JSON.stringify(body.input);
+      assert.equal(body.max_output_tokens, 3050);
+      assert.match(inputText, /Repository: acme\/repo-31\\nSummary target: no \(overall only\)/);
+      assert.equal(inputText.match(/Summary target: yes/g)?.length, 30);
+      assert.equal(inputText.match(/Summary target: no \(overall only\)/g)?.length, 1);
+      const targetNames = body.text.format.schema.properties.repositories.items.properties.fullName
+        .enum as string[];
+      assert.equal(targetNames.length, 30);
+      assert.equal(targetNames.includes("acme/repo-31"), false);
+      return Response.json({
+        output_text: JSON.stringify({
+          summary:
+            "Work spanned all 31 repositories, including the lower-ranked improvements in acme/repo-31.",
+          repositories: targetNames.map((fullName) => ({
+            fullName,
+            summary: `Improved ${fullName}.`,
+          })),
+        }),
+      });
+    }
+    throw new Error(`unexpected fetch ${url.toString()}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/acme/activity?range=week"),
+      { DASHBOARD_CACHE: cache, OPENAI_API_KEY: "openai-token" },
+      { waitUntil: (promise) => queued.push(promise) },
+    );
+    assert.equal(response.status, 202);
+    await Promise.all(queued);
+    assert.equal(openAICalls, 1);
+    const cached = JSON.parse(
+      (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
+    ) as OwnerActivityPayload;
+    assert.equal(cached.summary?.state, "ready", cached.summary?.message ?? "");
+    assert.equal(cached.summary?.eventsUsed, 31);
+    assert.equal(cached.summary?.repositories?.length, 30);
+    assert.match(cached.summary?.text ?? "", /repo-31/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -4299,7 +4446,7 @@ test("worker trims expired events from cached owner activity", async () => {
       model: "chat-latest",
       inputHash: "expired-hash",
       eventsUsed: 1,
-      promptVersion: 3,
+      promptVersion: 4,
     },
   };
   const cache = kvStore({
@@ -4375,7 +4522,7 @@ test("worker trims expired events from cached repository activity", async () => 
       model: "chat-latest",
       inputHash: "expired-hash",
       eventsUsed: 1,
-      promptVersion: 3,
+      promptVersion: 4,
     },
   };
   const cache = kvStore({
@@ -4610,7 +4757,7 @@ test("worker refreshes cached owner activity summaries from older prompt version
       (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
     ) as OwnerActivityPayload;
     assert.equal(cached.summary?.state, "ready");
-    assert.equal(cached.summary?.promptVersion, 3);
+    assert.equal(cached.summary?.promptVersion, 4);
     assert.equal(cached.summary?.model, "chat-latest");
     assert.notEqual(cached.summary?.inputHash, "old-prompt-hash");
     assert.equal(cached.summary?.text, "@acme's work refined working-on summaries.");
@@ -4771,7 +4918,7 @@ test("worker rejects incomplete structured owner activity summaries", async () =
     assert.equal(cached.summary?.model, "chat-latest");
     assert.match(cached.summary?.message ?? "", /complete structured activity summaries/);
     assert.notEqual(cached.summary?.inputHash, "activity-hash");
-    assert.equal(cached.summary?.promptVersion, 3);
+    assert.equal(cached.summary?.promptVersion, 4);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -18920,13 +19067,13 @@ test("signed GitHub webhooks coalesce bursts and enqueue authoritative refreshes
       "repo-activity:v1:owner/repo:day",
       "repo-audience:v5:owner/repo:week",
       "owner-activity:v1:owner:day",
-      "owner-activity-summary:v3:owner:week:chat-latest:hash",
-      "repo-activity-summary:v3:owner/repo:day:chat-latest:hash",
+      "owner-activity-summary:v4:owner:week:chat-latest:hash",
+      "repo-activity-summary:v4:owner/repo:day:chat-latest:hash",
       "release-summary:v1:owner/repo:v1.0.0:abcdef1:chat-latest",
       "discover:v4:week:all",
       "repo-audience:v5:other/repo:week",
       "owner-activity:v1:contributor:week",
-      "owner-activity-summary:v3:contributor:week:chat-latest:hash",
+      "owner-activity-summary:v4:contributor:week:chat-latest:hash",
       "trust-profile:v4:owner",
       "audience-user-repos:v2:owner",
     ];

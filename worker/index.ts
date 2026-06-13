@@ -270,10 +270,11 @@ const repoAudienceRanges: AudienceRange[] = ["week", "month"];
 const repoAudienceUserRepoLimit = 8;
 const releaseSummaryPromptVersion = 1;
 const releaseSummaryCommitLimit = 500;
-const activitySummaryPromptVersion = 3;
+const activitySummaryPromptVersion = 4;
 const activityEventPageLimit = 3;
 const activitySummaryInputLimit = 180;
 const activityRepositorySummaryLimit = 30;
+const activitySummaryRepositoryEventLimit = 4;
 const maxCustomSources = 8;
 const dashboardSchemaVersion = 6;
 const auxiliaryCacheSchemaVersion = 3;
@@ -8541,10 +8542,17 @@ type ActivitySummaryPayload = Pick<OwnerActivityPayload, "events" | "repositorie
 function activitySummaryEvents(payload: ActivitySummaryPayload): OwnerActivityEvent[] {
   const selected: OwnerActivityEvent[] = [];
   const selectedIds = new Set<string>();
+  const eventsByRepository = new Map<string, OwnerActivityEvent[]>();
+  for (const event of payload.events) {
+    const events = eventsByRepository.get(event.repo) ?? [];
+    events.push(event);
+    eventsByRepository.set(event.repo, events);
+  }
   for (const repo of payload.repositories.slice(0, activityRepositorySummaryLimit)) {
-    for (const event of payload.events
-      .filter((event) => event.repo === repo.fullName)
-      .slice(0, 3)) {
+    for (const event of (eventsByRepository.get(repo.fullName) ?? []).slice(
+      0,
+      activitySummaryRepositoryEventLimit,
+    )) {
       selected.push(event);
       selectedIds.add(event.id);
     }
@@ -8561,25 +8569,44 @@ function activitySummaryEvents(payload: ActivitySummaryPayload): OwnerActivityEv
 function activitySummaryInput(payload: ActivitySummaryPayload): string {
   const summaryEvents = activitySummaryEvents(payload);
   if (summaryEvents.length === 0) return "";
-  const topRepos = payload.repositories
-    .slice(0, activityRepositorySummaryLimit)
-    .map(
-      (repo) =>
-        `${repo.fullName} (${repo.events} items, ${repo.commits} commits, ${repo.pullRequests} PRs, ${repo.issues} issues, ${repo.comments} comments, ${repo.releases} releases)`,
-    )
-    .join(", ");
-  const events = summaryEvents
-    .map((event, index) =>
-      [
-        `${index + 1}. ${event.kind}`,
-        event.repo,
-        event.createdAt,
-        event.count > 1 ? `${event.count} items` : "1 item",
-        event.title,
-      ].join(" · "),
-    )
-    .join("\n");
-  return [`Top repositories: ${topRepos || "none"}`, "", events].join("\n");
+  const targetRepositories = payload.repositories.slice(0, activityRepositorySummaryLimit);
+  const targetNames = new Set(targetRepositories.map((repo) => repo.fullName));
+  const repositoryByName = new Map(payload.repositories.map((repo) => [repo.fullName, repo]));
+  const eventsByRepository = new Map<string, OwnerActivityEvent[]>();
+  for (const event of summaryEvents) {
+    const events = eventsByRepository.get(event.repo) ?? [];
+    events.push(event);
+    eventsByRepository.set(event.repo, events);
+  }
+  const orderedRepositories = [
+    ...targetRepositories,
+    ...[...eventsByRepository.keys()]
+      .filter((fullName) => !targetNames.has(fullName))
+      .map((fullName) => repositoryByName.get(fullName))
+      .filter((repo): repo is OwnerActivityRepository => repo !== undefined),
+  ];
+  return orderedRepositories
+    .map((repo) => {
+      const totals = [
+        `${repo.events} items`,
+        repo.commits > 0 ? `${repo.commits} commits` : "",
+        repo.pullRequests > 0 ? `${repo.pullRequests} PR${repo.pullRequests === 1 ? "" : "s"}` : "",
+        repo.issues > 0 ? `${repo.issues} issue${repo.issues === 1 ? "" : "s"}` : "",
+        repo.comments > 0 ? `${repo.comments} comment${repo.comments === 1 ? "" : "s"}` : "",
+        repo.releases > 0 ? `${repo.releases} release${repo.releases === 1 ? "" : "s"}` : "",
+      ].filter(Boolean);
+      const events = (eventsByRepository.get(repo.fullName) ?? []).map(
+        (event) => `- ${event.kind}${event.count > 1 ? ` x${event.count}` : ""}: ${event.title}`,
+      );
+      return [
+        `Repository: ${repo.fullName}`,
+        `Summary target: ${targetNames.has(repo.fullName) ? "yes" : "no (overall only)"}`,
+        `Totals: ${totals.join("; ")}`,
+        "Work:",
+        ...events,
+      ].join("\n");
+    })
+    .join("\n\n");
 }
 
 function unavailableActivitySummary(
@@ -8645,15 +8672,23 @@ function activitySummaryInstructions(structured = false): string {
     "The UI already says this is a GitHub dashboard, shows the selected time range, and lists commit/PR/issue totals, so do not restate those facts.",
     "Do not use filler like public GitHub activity, recent activity, events, commits, PRs, has been working on, centered on, or touched repositories.",
     "Start with concrete work: systems, fixes, releases, docs, integrations, repo names, and themes that are directly supported by the event titles.",
-    "Write 2-3 useful sentences, no bullets, no markdown, no hype.",
+    "For the overall or single-repository summary, write 2-3 useful sentences, no bullets, no markdown, no hype.",
     "Do not infer private work, intentions, employers, or impact beyond the event titles.",
     ...(structured
       ? [
           'Return only JSON in this shape: {"summary":"overall summary","repositories":[{"fullName":"owner/repo","summary":"one concise sentence"}]}.',
-          `Include one repository entry for every repository listed in Top repositories, up to ${activityRepositorySummaryLimit}. Keep each repository summary concrete and under 32 words.`,
+          `Include one repository entry for every block marked Summary target: yes, up to ${activityRepositorySummaryLimit}, in the same order.`,
+          "Use blocks marked Summary target: no only in the overall summary; do not return repository entries for them.",
+          "Each repository summary may use one or two short sentences. When several concrete work items are available, connect the main themes in roughly 28-50 words; when the input is sparse or generic, stay brief and factual instead of padding.",
+          "Do not write a counting-only summary such as commits were added or ongoing updates when any concrete work title is available.",
         ]
       : []),
   ].join(" ");
+}
+
+function ownerActivitySummaryOutputTokens(repositoryCount: number): number {
+  const boundedCount = Math.min(repositoryCount, activityRepositorySummaryLimit);
+  return Math.max(2_200, Math.min(3_050, 500 + boundedCount * 85));
 }
 
 function polishActivitySummaryText(text: string): string {
@@ -8735,7 +8770,7 @@ async function summarizeOwnerActivity(
     },
     body: JSON.stringify({
       model,
-      max_output_tokens: 2200,
+      max_output_tokens: ownerActivitySummaryOutputTokens(payload.repositories.length),
       instructions: activitySummaryInstructions(true),
       text: {
         format: {

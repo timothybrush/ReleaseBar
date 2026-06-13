@@ -3655,31 +3655,40 @@
       {/if}
 
       {#if activity}
-        <div class="activity-stats" aria-label="Activity totals">
-          <span>{numberFormat.format(activity.totals.commits)} commits</span>
-          <span>{numberFormat.format(activity.totals.pullRequests)} PRs</span>
-          <span>{numberFormat.format(activity.totals.issues)} issues</span>
-          <span>{numberFormat.format(activity.totals.comments)} comments</span>
-        </div>
-        <div class="activity-repos" aria-label="Touched repositories">
-          {#each activity.repositories.slice(0, 5) as repo}
-            <a href={repoDetailPath(repo.fullName)}>
-              {repo.fullName}
-              <small>{numberFormat.format(repo.events)}</small>
-            </a>
-          {/each}
-        </div>
-        <small class="activity-meta">
-          {activityMeta(activity)}
-          {#if activity.cache.state === "stale"}
-            · refreshing
+        <div class="activity-digest">
+          <div class="activity-stats" aria-label="Activity totals">
+            <span><strong>{numberFormat.format(activity.totals.commits)}</strong><small>commits</small></span>
+            <span><strong>{numberFormat.format(activity.totals.pullRequests)}</strong><small>PRs</small></span>
+            <span><strong>{numberFormat.format(activity.totals.issues)}</strong><small>issues</small></span>
+            <span><strong>{numberFormat.format(activity.totals.comments)}</strong><small>comments</small></span>
+          </div>
+          {#if activity.repositories.length > 0}
+            <div class="activity-repos" aria-label="Most active repositories">
+              {#each activity.repositories.slice(0, 5) as repo, index}
+                <a href={repoDetailPath(repo.fullName)}>
+                  <span>{repo.fullName}</span>
+                  <small aria-label={`${numberFormat.format(repo.events)} activity items`}>
+                    {numberFormat.format(repo.events)}
+                  </small>
+                  <span class="activity-repo-rank" aria-hidden="true">{index + 1}</span>
+                </a>
+              {/each}
+            </div>
           {/if}
-        </small>
-        {#if initialRoute.owner}
-          <a class="activity-drilldown" href={ownerActivityPath(initialRoute.owner, activityRange)}>
-            view grouped activity <span aria-hidden="true">→</span>
-          </a>
-        {/if}
+        </div>
+        <div class="activity-footer">
+          <small class="activity-meta">
+            {activityMeta(activity)}
+            {#if activity.cache.state === "stale"}
+              · refreshing
+            {/if}
+          </small>
+          {#if initialRoute.owner}
+            <a class="activity-drilldown" href={ownerActivityPath(initialRoute.owner, activityRange)}>
+              view grouped activity <span aria-hidden="true">→</span>
+            </a>
+          {/if}
+        </div>
       {/if}
     </section>
   {/if}

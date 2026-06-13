@@ -4094,6 +4094,117 @@ test("worker summarizes recent repository activity in the background", async () 
   }
 });
 
+test("worker hides activity from forks of repositories owned by the profile", async () => {
+  const cache = kvStore();
+  const originalFetch = globalThis.fetch;
+  const generatedAt = new Date().toISOString();
+  let graphqlCalls = 0;
+  const externalRepoCount = 101;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.hostname === "api.github.com" && url.pathname === "/users/acme") {
+      return Response.json({
+        login: "acme",
+        type: "User",
+        avatar_url: "https://github.com/acme.png",
+        html_url: "https://github.com/acme",
+      });
+    }
+    if (url.hostname === "api.github.com" && url.pathname === "/users/acme/events/public") {
+      const externalEvents = Array.from({ length: externalRepoCount }, (_, index) => ({
+        id: `external-${index}`,
+        type: "PushEvent",
+        public: true,
+        created_at: generatedAt,
+        repo: { name: `upstream/other-${index}` },
+        payload: { size: 1, commits: [{ message: `Update unrelated project ${index}` }] },
+      }));
+      if (url.searchParams.get("page") === "1") {
+        return Response.json([
+          {
+            id: "own",
+            type: "PushEvent",
+            public: true,
+            created_at: generatedAt,
+            repo: { name: "acme/tool" },
+            payload: { size: 1, commits: [{ message: "Update owned project" }] },
+          },
+          ...externalEvents.slice(0, 99),
+        ]);
+      }
+      if (url.searchParams.get("page") === "2") {
+        return Response.json([
+          ...externalEvents.slice(99),
+          {
+            id: "fork",
+            type: "PushEvent",
+            public: true,
+            created_at: generatedAt,
+            repo: { name: "contributor/tool" },
+            payload: { size: 1, commits: [{ message: "Update contributor fork" }] },
+          },
+        ]);
+      }
+      return Response.json([]);
+    }
+    if (url.hostname === "api.github.com" && url.pathname === "/graphql") {
+      graphqlCalls += 1;
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        query?: string;
+        variables?: Record<string, string>;
+      };
+      assert.match(body.query ?? "", /query ReleaseBarActivityForkOrigins/);
+      const data: Record<string, unknown> = {};
+      for (let index = 0; body.variables?.[`owner${index}`]; index += 1) {
+        data[`repo${index}`] =
+          body.variables[`owner${index}`] === "contributor"
+            ? {
+                isFork: true,
+                parent: { owner: { login: "acme" } },
+              }
+            : index === 0 && graphqlCalls === 1
+              ? null
+              : {
+                  isFork: false,
+                  parent: null,
+                };
+      }
+      return Response.json({
+        data,
+        ...(graphqlCalls === 1
+          ? { errors: [{ message: "Could not resolve repository upstream/other-0" }] }
+          : {}),
+      });
+    }
+    throw new Error(`unexpected fetch ${url.toString()}`);
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://release.bar/api/acme/activity?range=week"),
+      { DASHBOARD_CACHE: cache, GITHUB_TOKEN: "shared-token" },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as OwnerActivityPayload;
+    assert.equal(graphqlCalls, 3);
+    assert.equal(
+      body.events.some((event) => event.repo === "contributor/tool"),
+      false,
+    );
+    assert.equal(
+      body.events.some((event) => event.repo === "upstream/other-100"),
+      true,
+    );
+    assert.equal(body.totals.events, externalRepoCount + 1);
+    assert.equal(body.totals.commits, externalRepoCount + 1);
+    assert.equal(body.totals.repositories, externalRepoCount + 1);
+    assert.equal(await cache.get("owner-activity:v1:acme:week"), null);
+    assert.notEqual(await cache.get("owner-activity:v2:acme:week"), null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("worker summarizes public owner activity in the background", async () => {
   const cache = kvStore();
   const queued: Promise<unknown>[] = [];
@@ -4265,7 +4376,7 @@ test("worker summarizes public owner activity in the background", async () => {
     await Promise.all(queued);
     assert.equal(openAICalls, 1);
     const cached = JSON.parse(
-      (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
+      (await cache.get("owner-activity:v2:acme:week")) ?? "{}",
     ) as OwnerActivityPayload;
     assert.equal(cached.summary?.state, "ready", cached.summary?.message ?? "");
     assert.match(cached.summary?.text ?? "", /activity summaries/);
@@ -4342,7 +4453,7 @@ test("worker includes lower-ranked repositories in the overall activity summary 
     },
   } satisfies OwnerActivityPayload;
   const cache = kvStore({
-    "owner-activity:v1:acme:week": JSON.stringify(payload),
+    "owner-activity:v2:acme:week": JSON.stringify(payload),
   });
   const queued: Promise<unknown>[] = [];
   const originalFetch = globalThis.fetch;
@@ -4384,7 +4495,7 @@ test("worker includes lower-ranked repositories in the overall activity summary 
     await Promise.all(queued);
     assert.equal(openAICalls, 1);
     const cached = JSON.parse(
-      (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
+      (await cache.get("owner-activity:v2:acme:week")) ?? "{}",
     ) as OwnerActivityPayload;
     assert.equal(cached.summary?.state, "ready", cached.summary?.message ?? "");
     assert.equal(cached.summary?.eventsUsed, 31);
@@ -4455,7 +4566,7 @@ test("worker trims expired events from cached owner activity", async () => {
     },
   };
   const cache = kvStore({
-    "owner-activity:v1:acme:week": JSON.stringify(payload),
+    "owner-activity:v2:acme:week": JSON.stringify(payload),
   });
 
   const response = await worker.fetch(
@@ -4633,14 +4744,14 @@ test("worker skips stale public owner activity summaries when events changed", a
     },
   };
   const cache = kvStore({
-    "owner-activity:v1:acme:week": JSON.stringify(oldPayload),
+    "owner-activity:v2:acme:week": JSON.stringify(oldPayload),
   });
   const queued: Promise<unknown>[] = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input) => {
     const url = new URL(String(input));
     if (url.hostname === "api.openai.com" && url.pathname === "/v1/responses") {
-      await cache.put("owner-activity:v1:acme:week", JSON.stringify(newPayload));
+      await cache.put("owner-activity:v2:acme:week", JSON.stringify(newPayload));
       return Response.json({
         output_text: "Acme worked on old activity.",
       });
@@ -4656,7 +4767,7 @@ test("worker skips stale public owner activity summaries when events changed", a
     assert.equal(response.status, 202);
     await Promise.all(queued);
     const cached = JSON.parse(
-      (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
+      (await cache.get("owner-activity:v2:acme:week")) ?? "{}",
     ) as OwnerActivityPayload;
     assert.equal(cached.events[0]?.id, "new");
     assert.equal(cached.summary?.state, "warming");
@@ -4726,7 +4837,7 @@ test("worker refreshes cached owner activity summaries from older prompt version
     },
   };
   const cache = kvStore({
-    "owner-activity:v1:acme:week": JSON.stringify(payload),
+    "owner-activity:v2:acme:week": JSON.stringify(payload),
   });
   const queued: Promise<unknown>[] = [];
   const originalFetch = globalThis.fetch;
@@ -4759,7 +4870,7 @@ test("worker refreshes cached owner activity summaries from older prompt version
     assert.equal(responseBody.summary?.text, null);
     await Promise.all(queued);
     const cached = JSON.parse(
-      (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
+      (await cache.get("owner-activity:v2:acme:week")) ?? "{}",
     ) as OwnerActivityPayload;
     assert.equal(cached.summary?.state, "ready");
     assert.equal(cached.summary?.promptVersion, 4);
@@ -4808,7 +4919,7 @@ test("worker does not summarize empty owner activity", async () => {
     },
   };
   const cache = kvStore({
-    "owner-activity:v1:acme:week": JSON.stringify(payload),
+    "owner-activity:v2:acme:week": JSON.stringify(payload),
   });
   const queued: Promise<unknown>[] = [];
   const originalFetch = globalThis.fetch;
@@ -4824,7 +4935,7 @@ test("worker does not summarize empty owner activity", async () => {
     assert.equal(response.status, 202);
     await Promise.all(queued);
     const cached = JSON.parse(
-      (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
+      (await cache.get("owner-activity:v2:acme:week")) ?? "{}",
     ) as OwnerActivityPayload;
     assert.equal(cached.summary?.state, "unavailable");
     assert.equal(cached.summary?.message, "Not enough recent work to summarize.");
@@ -4892,7 +5003,7 @@ test("worker rejects incomplete structured owner activity summaries", async () =
     },
   };
   const cache = kvStore({
-    "owner-activity:v1:acme:week": JSON.stringify(payload),
+    "owner-activity:v2:acme:week": JSON.stringify(payload),
   });
   const queued: Promise<unknown>[] = [];
   const originalFetch = globalThis.fetch;
@@ -4917,7 +5028,7 @@ test("worker rejects incomplete structured owner activity summaries", async () =
     assert.equal(response.status, 202);
     await Promise.all(queued);
     const cached = JSON.parse(
-      (await cache.get("owner-activity:v1:acme:week")) ?? "{}",
+      (await cache.get("owner-activity:v2:acme:week")) ?? "{}",
     ) as OwnerActivityPayload;
     assert.equal(cached.summary?.state, "unavailable");
     assert.equal(cached.summary?.model, "chat-latest");
@@ -19071,13 +19182,13 @@ test("signed GitHub webhooks coalesce bursts and enqueue authoritative refreshes
       "social-repo:v3:owner/repo",
       "repo-activity:v1:owner/repo:day",
       "repo-audience:v5:owner/repo:week",
-      "owner-activity:v1:owner:day",
+      "owner-activity:v2:owner:day",
       "owner-activity-summary:v4:owner:week:chat-latest:hash",
       "repo-activity-summary:v4:owner/repo:day:chat-latest:hash",
       "release-summary:v1:owner/repo:v1.0.0:abcdef1:chat-latest",
       "discover:v4:week:all",
       "repo-audience:v5:other/repo:week",
-      "owner-activity:v1:contributor:week",
+      "owner-activity:v2:contributor:week",
       "owner-activity-summary:v4:contributor:week:chat-latest:hash",
       "trust-profile:v4:owner",
       "audience-user-repos:v2:owner",
@@ -19121,7 +19232,7 @@ test("signed GitHub webhooks coalesce bursts and enqueue authoritative refreshes
 
     const leakedAt = new Date(Date.parse(now) + 10_000).toISOString();
     await cache.put(
-      "owner-activity:v1:contributor:week",
+      "owner-activity:v2:contributor:week",
       JSON.stringify({
         owner: {
           type: "user",

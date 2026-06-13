@@ -275,6 +275,8 @@ const activityEventPageLimit = 3;
 const activitySummaryInputLimit = 180;
 const activityRepositorySummaryLimit = 30;
 const activitySummaryRepositoryEventLimit = 4;
+const activityForkLookupBatchSize = 50;
+const ownerActivityCacheVersion = 2;
 const maxCustomSources = 8;
 const dashboardSchemaVersion = 6;
 const auxiliaryCacheSchemaVersion = 3;
@@ -8260,7 +8262,7 @@ function activityCacheTtlMs(range: ActivityRange): number {
 }
 
 function ownerActivityCacheKey(owner: string, range: ActivityRange): string {
-  return `owner-activity:v1:${slugOwner(owner)}:${range}`;
+  return `owner-activity:v${ownerActivityCacheVersion}:${slugOwner(owner)}:${range}`;
 }
 
 function ownerActivitySummaryCacheKey(
@@ -8545,6 +8547,99 @@ async function fetchOwnerActivityEvents(
     if (oldest !== undefined && oldest < since) break;
   }
   return events.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+}
+
+type ActivityForkNode = {
+  isFork?: boolean;
+  parent?: {
+    owner?: {
+      login?: string | null;
+    } | null;
+  } | null;
+};
+
+type ActivityForkResponse = {
+  data?: Record<string, ActivityForkNode | null>;
+  errors?: Array<{ message?: string; type?: string }>;
+};
+
+async function filterForksOfOwner(
+  owner: Owner,
+  events: OwnerActivityEvent[],
+  token: string | null,
+  quotaSource: ApiQuota["source"],
+  quotaAccount: string | null,
+  onQuota: (quota: ApiQuota) => void,
+  env: Env,
+): Promise<OwnerActivityEvent[]> {
+  if (!token || events.length === 0) return events;
+  const ownerLogin = owner.login.toLowerCase();
+  const repositories = [
+    ...new Set(
+      events
+        .map((event) => event.repo)
+        .filter((fullName) => {
+          const [repoOwner, repo] = fullName.split("/");
+          return Boolean(repoOwner && repo && repoOwner.toLowerCase() !== ownerLogin);
+        }),
+    ),
+  ];
+  if (repositories.length === 0) return events;
+
+  const forksOfOwner = new Set<string>();
+  const githubFetch = auditGitHubFetch("owner-activity", quotaSource, quotaAccount, env);
+  try {
+    for (let offset = 0; offset < repositories.length; offset += activityForkLookupBatchSize) {
+      const batch = repositories.slice(offset, offset + activityForkLookupBatchSize);
+      const definitions: string[] = [];
+      const fields: string[] = [];
+      const variables: Record<string, string> = {};
+      batch.forEach((fullName, index) => {
+        const [repoOwner, repo] = fullName.split("/");
+        definitions.push(`$owner${index}: String!`, `$name${index}: String!`);
+        variables[`owner${index}`] = repoOwner ?? "";
+        variables[`name${index}`] = repo ?? "";
+        fields.push(`
+          repo${index}: repository(owner: $owner${index}, name: $name${index}) {
+            isFork
+            parent {
+              owner {
+                login
+              }
+            }
+          }
+        `);
+      });
+      const query = `
+        query ReleaseBarActivityForkOrigins(${definitions.join(", ")}) {
+          ${fields.join("\n")}
+        }
+      `;
+      const response = await githubFetch("https://api.github.com/graphql", {
+        method: "POST",
+        headers: {
+          accept: "application/vnd.github+json",
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          "user-agent": "ReleaseBar",
+          "x-github-api-version": "2022-11-28",
+        },
+        body: JSON.stringify({ query, variables }),
+      });
+      onQuota(quotaFromGitHubResponse(response, quotaSource, quotaAccount));
+      const body = (await response.json().catch(() => null)) as ActivityForkResponse | null;
+      if (!response.ok || !body?.data) break;
+      batch.forEach((fullName, index) => {
+        const repository = body.data?.[`repo${index}`];
+        if (repository?.isFork && repository.parent?.owner?.login?.toLowerCase() === ownerLogin) {
+          forksOfOwner.add(fullName.toLowerCase());
+        }
+      });
+    }
+  } catch {
+    // Keep successfully resolved fork matches if a later batch fails.
+  }
+  return events.filter((event) => !forksOfOwner.has(event.repo.toLowerCase()));
 }
 
 async function fetchRepoActivityEvents(
@@ -9020,9 +9115,18 @@ async function buildOwnerActivity(
     throw new Error(`owner not found: ${ownerSlug}`);
   }
   const since = Date.now() - activityRangeMs(range);
-  const events = await fetchOwnerActivityEvents(
+  const fetchedEvents = await fetchOwnerActivityEvents(
     owner,
     since,
+    token,
+    quotaSource,
+    quotaAccount,
+    onQuota,
+    env,
+  );
+  const events = await filterForksOfOwner(
+    owner,
+    fetchedEvents,
     token,
     quotaSource,
     quotaAccount,
@@ -15486,7 +15590,7 @@ async function invalidatePublicRepoCaches(env: Env, fullName: string): Promise<v
       env.DASHBOARD_CACHE?.delete?.(ownerActivityCacheKey(owner, range)),
     ),
     deleteCachePrefix(env, "repo-audience:v5:"),
-    deleteCachePrefix(env, "owner-activity:v1:"),
+    deleteCachePrefix(env, "owner-activity:v"),
     deleteCachePrefix(env, "owner-activity-summary:"),
     deleteCachePrefix(
       env,

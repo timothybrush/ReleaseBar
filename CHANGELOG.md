@@ -2,6 +2,9 @@
 
 ## 0.2.1 - Unreleased
 
+- Updated CI and local tooling to Node.js 24 LTS and refreshed the Worker compatibility date.
+- Hid contributor-fork activity when the upstream repository belongs to the activity profile, while preserving unrelated external project work.
+
 ## 0.2.0 - 2026-06-13
 
 - Condensed owner dashboard activity totals, ranked repositories, metadata, and drill-down navigation into a responsive two-row digest.

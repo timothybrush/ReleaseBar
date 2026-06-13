@@ -57,7 +57,7 @@ Agents should:
 
 `GET /api/:owner/activity?range=day|week|month`
 
-Returns recent public GitHub work grouped and ranked by repository. Repository activity counts include commit items inside push events, so a multi-commit push contributes its full count instead of one event envelope. The matching page route is `/:owner/activity`; reserved owners `api` and `og` use `/-/owners/:owner/activity`, while repositories literally named `activity` use `/-/:owner/activity`.
+Returns recent public GitHub work grouped and ranked by repository. When GitHub fork metadata is available, activity in contributor forks whose upstream repository belongs to the profile is omitted; work in unrelated external repositories remains visible. Repository activity counts include commit items inside push events, so a multi-commit push contributes its full count instead of one event envelope. The matching page route is `/:owner/activity`; reserved owners `api` and `og` use `/-/owners/:owner/activity`, while repositories literally named `activity` use `/-/:owner/activity`.
 
 When AI summaries are configured, one bounded background request sends compact repository-grouped work and produces both the overall summary and one- or two-sentence summaries for up to 30 ranked repositories. Sparse repositories remain brief rather than being padded.
 

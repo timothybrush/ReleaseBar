@@ -29,7 +29,7 @@ Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token
 
 - `/` loads `ReleaseBar Hot`, a cached board built from recently requested public dashboards
 - `/:owner` loads the Worker API for that owner
-- `/:owner/activity` groups day, week, or month public work by repository, ranked by activity volume, with one overall AI summary and concise per-repository AI summaries
+- `/:owner/activity` groups day, week, or month public work by repository, ranked by activity volume, with AI summaries and contributor forks of profile-owned repositories omitted when GitHub identifies them
 - query options: `forks=true`, `archived=true`, `unreleased=false`
 - add public sources with `owners=openclaw,steipete` or `repos=owner/name`
 - the settings panel can add public users, orgs, or explicit repos to the current URL

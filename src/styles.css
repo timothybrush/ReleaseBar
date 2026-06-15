@@ -1537,6 +1537,7 @@ button:focus-visible {
 
 .account-button:not(:has(.account-avatar)) {
   grid-template-columns: minmax(0, 1fr) auto;
+  width: min(216px, var(--account-max-width));
   min-width: 156px;
 }
 
@@ -3400,6 +3401,7 @@ body.dev-mode .table-head .since-heading .label-compact {
   }
 
   .account-button:not(:has(.account-avatar)) {
+    width: 100%;
     min-width: 0;
   }
 

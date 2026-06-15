@@ -40,6 +40,7 @@ import {
   viewStateSearch,
   type DashboardViewState,
 } from "../../src/dashboard-view.js";
+import { isGitHubRateLimit } from "../../src/rate-limit.js";
 import type {
   AuthFunnelSummary,
   DashboardPayload,
@@ -79,6 +80,18 @@ class TestDate extends systemDate {
 }
 
 globalThis.Date = TestDate as DateConstructor;
+
+test("browser rate-limit detection covers HTTP and cached GitHub quota failures", () => {
+  assert.equal(isGitHubRateLimit(429), true);
+  assert.equal(isGitHubRateLimit(403, "API rate limit exceeded"), true);
+  assert.equal(isGitHubRateLimit(200, "shared GitHub quota paused until reset"), true);
+  assert.equal(
+    isGitHubRateLimit(200, "Repository detail is cache-only while shared GitHub quota recovers."),
+    true,
+  );
+  assert.equal(isGitHubRateLimit(500, "dashboard fetch failed"), false);
+  assert.equal(isGitHubRateLimit(200, "shared quota · 4,812 left"), false);
+});
 
 async function socialRenderAsset(request: Request, paths?: string[]): Promise<Response> {
   const pathname = new URL(request.url).pathname;

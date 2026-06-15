@@ -40,6 +40,7 @@
     fallbackApiOrigin,
     type DiscoverPeriod,
   } from "./routing.js";
+  import { isGitHubRateLimit } from "./rate-limit.js";
   import type {
     ApiQuota,
     ActivityRange,
@@ -164,6 +165,7 @@
   let adminError = "";
   let adminActionMessage = "";
   let manualRefreshLoading = false;
+  let rateLimitHit = false;
 
   const numberFormat = new Intl.NumberFormat("en", { notation: "compact" });
 
@@ -949,6 +951,7 @@
     generatedDetail = [cacheState, stale, capped, ...freshness, quota, data.cache?.message ?? ""]
       .filter(Boolean)
       .join(" · ");
+    noteGitHubRateLimit(null, data.cache?.message);
   }
 
   function updateRepoDetailStatus(): void {
@@ -960,14 +963,26 @@
         ? `warming stats · cached ${relativeDate(repoDetail.generatedAt)}`
         : `updated ${relativeDate(repoDetail.generatedAt)}`;
     generatedDetail = [cacheState, quota, repoDetail.cache.message ?? ""].filter(Boolean).join(" · ");
+    noteGitHubRateLimit(null, repoDetail.cache.message);
+  }
+
+  function noteGitHubRateLimit(
+    status: number | null,
+    ...messages: Array<string | null | undefined>
+  ): void {
+    if (isGitHubRateLimit(status, ...messages)) {
+      rateLimitHit = true;
+    }
   }
 
   async function fetchPayload(apiPath: string, bypassCache = false): Promise<Response> {
-    if (!bypassCache) {
-      return fetch(apiPath);
-    }
-    const joiner = apiPath.includes("?") ? "&" : "?";
-    return fetch(`${apiPath}${joiner}v=${Date.now()}`, { cache: "no-store" });
+    const response = !bypassCache
+      ? await fetch(apiPath)
+      : await fetch(`${apiPath}${apiPath.includes("?") ? "&" : "?"}v=${Date.now()}`, {
+          cache: "no-store",
+        });
+    noteGitHubRateLimit(response.status);
+    return response;
   }
 
   function clearDashboardRefreshParam(): void {
@@ -1183,6 +1198,11 @@
           | OwnerActivityPayload
           | { error?: string }
           | null;
+        noteGitHubRateLimit(
+          response.status,
+          body && "error" in body ? body.error : undefined,
+          body && "events" in body ? body.cache.message : undefined,
+        );
         if (body && "events" in body) {
           if (requestedRange !== activityRange) return;
           activity = body;
@@ -1230,6 +1250,11 @@
           | TrustProfilePayload
           | { error?: string; cache?: { message?: string } }
           | null;
+        noteGitHubRateLimit(
+          response.status,
+          body && "error" in body ? body.error : undefined,
+          body && "cache" in body ? body.cache?.message : undefined,
+        );
         if (body && "score" in body) {
           trustProfile = body;
           trustProfileError = "";
@@ -1261,6 +1286,11 @@
           | RepoAudiencePayload
           | { error?: string; cache?: { message?: string } }
           | null;
+        noteGitHubRateLimit(
+          response.status,
+          body && "error" in body ? body.error : undefined,
+          body && "cache" in body ? body.cache?.message : undefined,
+        );
         if (isRepoAudiencePayload(body)) {
           if (requestedRange !== audienceRange) return;
           audience = body;
@@ -1295,6 +1325,11 @@
           | RepoAudienceBackfillPayload
           | { error?: string; message?: string }
           | null;
+        noteGitHubRateLimit(
+          response.status,
+          body && "error" in body ? body.error : undefined,
+          body && "message" in body ? body.message : undefined,
+        );
         if (body && "ranges" in body) {
           audienceBackfillMessage = body.ranges
             .map((range) => `${range.range} ${range.state}`)
@@ -1368,6 +1403,11 @@
           | RepoDetailActivityPayload
           | { error?: string }
           | null;
+        noteGitHubRateLimit(
+          response.status,
+          body && "error" in body ? body.error : undefined,
+          body && "events" in body ? body.cache.message : undefined,
+        );
         if (body && "events" in body) {
           if (requestedRange !== repoSummaryRange) return;
           repoActivity = body;
@@ -1420,6 +1460,7 @@
     ]
       .filter(Boolean)
       .join(" · ");
+    noteGitHubRateLimit(null, payload.cache.message);
   }
 
   function activityPageHref(range: ActivityRange): string {
@@ -1831,6 +1872,11 @@
       let response = await fetchPayload(initialRoute.apiPath, bypassCache);
       const headerAt = nowMs();
       let body = await readDashboardResponse(response);
+      noteGitHubRateLimit(
+        response.status,
+        body && "error" in body ? body.error : undefined,
+        body && "cache" in body ? body.cache?.message : undefined,
+      );
       const bodyAt = nowMs();
       if (response.ok && body && "projects" in body) {
         data = body;
@@ -1864,6 +1910,11 @@
         response = await fetchPayload(initialRoute.fallbackApiPath, bypassCache);
         const fallbackHeaderAt = nowMs();
         body = await readDashboardResponse(response);
+        noteGitHubRateLimit(
+          response.status,
+          body && "error" in body ? body.error : undefined,
+          body && "cache" in body ? body.cache?.message : undefined,
+        );
         const fallbackBodyAt = nowMs();
         if (response.ok && body && "projects" in body) {
           data = body;
@@ -1904,6 +1955,11 @@
     const read = async (apiPath: string) => {
       const response = await fetch(apiPath, { method: "POST", cache: "no-store" });
       const body = await readDashboardResponse(response);
+      noteGitHubRateLimit(
+        response.status,
+        body && "error" in body ? body.error : undefined,
+        body && "cache" in body ? body.cache?.message : undefined,
+      );
       return { response, body };
     };
     try {
@@ -1949,6 +2005,11 @@
         | RepoDetailPayload
         | { error?: string; cache?: { state?: string; message?: string } }
         | null;
+      noteGitHubRateLimit(
+        response.status,
+        body && "error" in body ? body.error : undefined,
+        body && "cache" in body ? body.cache?.message : undefined,
+      );
       return { response, body };
     };
     let { response, body } = await read(repoRoute.apiPath);
@@ -2614,6 +2675,17 @@
     </div>
   </header>
 
+  {#if rateLimitHit && !adminRoute}
+    <aside class="quota-install-callout" role="alert" aria-live="assertive">
+      <div>
+        <span>GitHub rate limit</span>
+        <strong>Switch this dashboard to dedicated GitHub App quota.</strong>
+        <small>Install or update ReleaseBar access for the GitHub account you are viewing.</small>
+      </div>
+      <button type="button" onclick={installApp}>Install GitHub App</button>
+    </aside>
+  {/if}
+
   {#if !repoRoute && initialRoute.isDefault}
     <nav class="discover-nav" aria-label="Discover GitHub repositories">
       <div class="discover-group" aria-label="Time range">
@@ -3145,7 +3217,7 @@
           <span class="loading-kicker">repository unavailable</span>
           <strong>{errorMessage}</strong>
           <small>ReleaseBar only reads public GitHub metadata. Connected GitHub App quota can make public repo refreshes more reliable.</small>
-          {#if (auth?.configured || auth?.quotaConfigured) && !auth.user}
+          {#if !rateLimitHit && (auth?.configured || auth?.quotaConfigured) && !auth.user}
             <button type="button" onclick={primaryAuthAction}>{primaryAuthLabel(auth)}</button>
           {/if}
         </div>
@@ -3875,7 +3947,7 @@
           <span class="loading-kicker">dashboard unavailable</span>
           <strong>{errorMessage}</strong>
           <small>Unknown owners, cold caches, and GitHub rate limits can all land here. Connecting GitHub gives ReleaseBar dedicated App quota for dashboards you can access.</small>
-          {#if (auth?.configured || auth?.quotaConfigured) && !auth.user}
+          {#if !rateLimitHit && (auth?.configured || auth?.quotaConfigured) && !auth.user}
             <button type="button" onclick={primaryAuthAction}>{primaryAuthLabel(auth)}</button>
           {/if}
         </div>

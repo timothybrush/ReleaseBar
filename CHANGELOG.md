@@ -2,6 +2,7 @@
 
 ## 0.2.1 - Unreleased
 
+- Prominently offers GitHub App installation whenever dashboard, repository, activity, trust, or audience requests hit GitHub rate limits, including for already signed-in users and cached quota failures.
 - Widened the logged-out GitHub App action so its full label remains visible on desktop while preserving the compact mobile label.
 - Reduced shared GitHub quota pressure by partitioning mixed-owner dashboards across per-account GitHub App tokens, bundling App-backed repository core data into GraphQL, revalidating stale REST caches with ETags, coalescing concurrent detail builds, extending webhook-invalidated caches, and deferring nonessential enrichment before the shared bucket becomes critical.
 - Updated CI and local tooling to Node.js 24 LTS and refreshed the Worker compatibility date.

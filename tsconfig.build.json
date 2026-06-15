@@ -11,6 +11,7 @@
   "include": [
     "scripts/**/*.ts",
     "src/dashboard-view.ts",
+    "src/rate-limit.ts",
     "src/routing.ts",
     "src/types.ts",
     "src/wasm.d.ts",

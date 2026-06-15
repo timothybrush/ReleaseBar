@@ -2,7 +2,7 @@
 
 ## 0.2.1 - Unreleased
 
-- Served stale Hot dashboards immediately while a durable background refresh rebuilds them with bounded concurrent cache reads, removing periodic multi-second aggregate stalls.
+- Served stale Hot dashboards immediately while a durable background refresh rebuilds them with bounded concurrent cache reads, and retained displayable aggregates across routine webhook invalidations to remove periodic multi-second stalls.
 - Warmed missing, stale, or incomplete public owner caches immediately after GitHub login or App installation so source-owned installation quota can benefit later anonymous viewers.
 - Prominently offers GitHub App installation whenever dashboard, repository, activity, trust, or audience requests hit GitHub rate limits, including for already signed-in users and cached quota failures.
 - Widened the logged-out GitHub App action so its full label remains visible on desktop while preserving the compact mobile label.

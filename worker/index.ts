@@ -6748,7 +6748,7 @@ async function refreshOwnerCounts(
     counts: result.repos,
     complete: result.complete,
   });
-  await env.DASHBOARD_CACHE?.delete?.(hotCacheKey);
+  await markHotCacheStale(env);
   const exact = requiredRepo
     ? result.repos.find((repo) => repo.fullName.toLowerCase() === requiredRepo.toLowerCase())
     : undefined;
@@ -8030,10 +8030,28 @@ async function refreshHotCache(env: Env): Promise<DashboardPayload | null> {
   }
 }
 
+async function markHotCacheStale(env: Env): Promise<void> {
+  const cached = await readCachedRaw(env, hotCacheKey);
+  if (!canDisplayCached(cached)) {
+    await env.DASHBOARD_CACHE?.delete?.(hotCacheKey);
+    return;
+  }
+  await writeCached(
+    env,
+    hotCacheKey,
+    withCacheState(cached, "stale", "Hot dashboard refresh pending"),
+  );
+}
+
 async function hotResponse(env: Env, context: ExecutionContext): Promise<Response> {
   const cached = await readCachedWithOwnerMetadata(env, hotCacheKey);
   const ageMs = cacheAgeMs(cached);
-  if (cached && canDisplayCached(cached) && ageMs < hotCacheTtlMs) {
+  if (
+    cached &&
+    canDisplayCached(cached) &&
+    cached.cache?.state !== "stale" &&
+    ageMs < hotCacheTtlMs
+  ) {
     return jsonResponse(withCacheState(cached, "fresh"));
   }
   if (cached && canDisplayCached(cached)) {
@@ -8053,7 +8071,10 @@ async function cachedHotInitialData(env: Env): Promise<InitialPageData | null> {
   if (!cached || !canDisplayCached(cached) || cached.cache?.state === "error") return null;
   return {
     route: "dashboard",
-    payload: withCacheState(cached, cacheAgeMs(cached) < hotCacheTtlMs ? "fresh" : "stale"),
+    payload: withCacheState(
+      cached,
+      cached.cache?.state !== "stale" && cacheAgeMs(cached) < hotCacheTtlMs ? "fresh" : "stale",
+    ),
   };
 }
 
@@ -16673,7 +16694,7 @@ async function invalidatePublicRepoCaches(env: Env, fullName: string): Promise<v
 }
 
 async function invalidateDashboardTargets(env: Env, targets: RefreshTarget[]): Promise<void> {
-  await env.DASHBOARD_CACHE?.delete?.(hotCacheKey);
+  await markHotCacheStale(env);
   await mapWebhookTargets(targets, async (target) => {
     await Promise.all([env.DASHBOARD_CACHE?.delete?.(target.key), deleteProgress(env, target.key)]);
   });
@@ -16759,7 +16780,7 @@ async function prepareGitHubWebhookEvent(
       restore,
       invalidateRepoProjectCache(env, repo.fullName),
       invalidateRepoDetailCaches(env, repo.fullName),
-      env.DASHBOARD_CACHE?.delete?.(hotCacheKey),
+      markHotCacheStale(env),
     ]);
     return {
       reason: "webhook:repository-publicized",

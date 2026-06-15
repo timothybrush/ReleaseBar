@@ -246,6 +246,7 @@ const hotSourceLimit = 24;
 const hotIndexLimit = 100;
 const hotCacheTtlMs = 5 * 60 * 1000;
 const localBuildLocks = new Map<string, StoredBuildLock>();
+const localRepoDetailBuilds = new Map<string, Promise<RepoDetailPayload | null>>();
 const localRefreshReservationFallbackScope = {};
 const localRefreshJobReservations = new WeakMap<object, Map<string, StoredRefreshJobReservation>>();
 const localRefreshDirtyMarkers = new WeakMap<object, Map<string, StoredRefreshDirty>>();
@@ -253,14 +254,14 @@ const discoverLimit = 40;
 const discoverHydrateLimit = 24;
 const discoverHydrateBatchSize = 8;
 const discoverCacheTtlMs = 60 * 60 * 1000;
-const repoDetailCacheTtlMs = 6 * 60 * 60 * 1000;
+const repoDetailCacheTtlMs = 24 * 60 * 60 * 1000;
 const repoDetailWarmingRefreshMs = 30 * 1000;
-const repoDetailAuxCacheVersion = 1;
-const repoDetailAuxTtlSeconds = 7 * 24 * 60 * 60;
-const repoDetailReleaseCacheTtlMs = 60 * 60 * 1000;
-const repoDetailLiveProbeCacheTtlMs = 10 * 60 * 1000;
+const repoDetailAuxCacheVersion = 2;
+const repoDetailAuxTtlSeconds = 30 * 24 * 60 * 60;
+const repoDetailReleaseCacheTtlMs = 24 * 60 * 60 * 1000;
+const repoDetailLiveProbeCacheTtlMs = 60 * 60 * 1000;
 const repoDetailSearchCountCacheTtlMs = 7 * 24 * 60 * 60 * 1000;
-const repoDetailStatsCacheTtlMs = 12 * 60 * 60 * 1000;
+const repoDetailStatsCacheTtlMs = 24 * 60 * 60 * 1000;
 const repoDetailStatsBackoffTtlSeconds = 10 * 60;
 const repoAudienceCacheTtlMs = 6 * 60 * 60 * 1000;
 const repoAudienceUserTtlSeconds = 7 * 24 * 60 * 60;
@@ -297,6 +298,7 @@ const githubGraphqlBackoffSeconds = 2 * 60;
 const githubGraphqlOwnerCountsOperation = "ReleaseBarOwnerCounts";
 const githubGraphqlOwnerReleaseOperation = "ReleaseBarOwnerRepos.release";
 const githubGraphqlRepoDetailsOperation = "ReleaseBarRepoDetails";
+const githubGraphqlRepoDetailCoreOperation = "ReleaseBarRepoDetailCore";
 const githubGraphqlRepoStargazersOperation = "ReleaseBarRepoStargazers";
 const githubGraphqlRepoWorkTrendOperation = "ReleaseBarRepoWorkTrend";
 const githubAccessAdminHours = 24;
@@ -310,11 +312,18 @@ const adminInstallationListLimit = 80;
 const adminAuthCounterListLimit = 80;
 const sharedQuotaCooldownFallbackSeconds = 30 * 60;
 const sharedQuotaMinimumRemaining: Record<string, number> = {
-  core: 500,
+  core: 1000,
   graphql: 1000,
   search: 3,
   integration_manifest: 20,
   _: 250,
+};
+const sharedQuotaEnrichmentMinimumRemaining: Record<string, number> = {
+  core: 2000,
+  graphql: 2000,
+  search: 10,
+  integration_manifest: 40,
+  _: 1000,
 };
 const refreshTargetPrefix = `refresh:target:v1:`;
 const refreshTargetIndexPrefix = `refresh:target-index:v1:`;
@@ -451,6 +460,10 @@ type DashboardRequest = {
   quotaSource?: ApiQuota["source"];
   quotaAccount?: string | null;
 };
+
+type DashboardOwnerCredentials = NonNullable<
+  Parameters<typeof buildDashboard>[0]["ownerCredentials"]
+>;
 
 type OwnerMetadataSnapshot = {
   owner: string;
@@ -998,6 +1011,7 @@ function githubAccessCounterKey(shard: number): string {
 
 type SharedQuotaCooldown = {
   active: boolean;
+  level?: "conserve" | "critical";
   resource: string | null;
   remaining: number | null;
   limit: number | null;
@@ -1007,6 +1021,13 @@ type SharedQuotaCooldown = {
 
 function sharedQuotaThreshold(resource: string | null): number {
   return sharedQuotaMinimumRemaining[resource ?? "_"] ?? sharedQuotaMinimumRemaining._;
+}
+
+function sharedQuotaEnrichmentThreshold(resource: string | null): number {
+  return (
+    sharedQuotaEnrichmentMinimumRemaining[resource ?? "_"] ??
+    sharedQuotaEnrichmentMinimumRemaining._
+  );
 }
 
 function sharedQuotaBudgetKey(resource: string | null): string {
@@ -1025,12 +1046,14 @@ async function markSharedQuotaCooldown(
   env: Env | undefined,
   quota: ApiQuota,
   reason: string,
+  level: SharedQuotaCooldown["level"] = "critical",
 ): Promise<void> {
   if (!env?.DASHBOARD_CACHE || quota.source !== "shared") return;
   const resetAt =
     quota.resetAt ?? new Date(Date.now() + sharedQuotaCooldownFallbackSeconds * 1000).toISOString();
   const item: SharedQuotaCooldown = {
     active: true,
+    level,
     resource: quota.resource,
     remaining: quota.remaining,
     limit: quota.limit,
@@ -1051,6 +1074,21 @@ async function markSharedQuotaCooldown(
 async function sharedQuotaCooldown(
   env: Env,
   resource: string | null = null,
+): Promise<SharedQuotaCooldown> {
+  return sharedQuotaState(env, resource, false);
+}
+
+async function sharedQuotaConservation(
+  env: Env,
+  resource: string | null = null,
+): Promise<SharedQuotaCooldown> {
+  return sharedQuotaState(env, resource, true);
+}
+
+async function sharedQuotaState(
+  env: Env,
+  resource: string | null,
+  includeConserve: boolean,
 ): Promise<SharedQuotaCooldown> {
   const empty: SharedQuotaCooldown = {
     active: false,
@@ -1084,6 +1122,7 @@ async function sharedQuotaCooldown(
     if (!raw) continue;
     const parsed = tryJsonParse<SharedQuotaCooldown>(raw, `shared quota cooldown ${key}`);
     if (!parsed?.active) continue;
+    if (!includeConserve && parsed.level === "conserve") continue;
     const reset = parsed.resetAt ? Date.parse(parsed.resetAt) : 0;
     if (Number.isFinite(reset) && reset > 0 && reset <= Date.now()) {
       await env.DASHBOARD_CACHE?.delete?.(key).catch(() => undefined);
@@ -1206,9 +1245,6 @@ async function recordGitHubAccessCounter(
     }),
     { expirationTtl: githubAccessTtlSeconds },
   );
-  if (sharedQuotaPressure(status, quota, false)) {
-    await markSharedQuotaCooldown(env, quota, sharedQuotaCooldownReason(status, quota, false));
-  }
 }
 
 function sharedQuotaPressure(status: number, quota: ApiQuota, rateLimited = false): boolean {
@@ -1217,6 +1253,14 @@ function sharedQuotaPressure(status: number, quota: ApiQuota, rateLimited = fals
     ((quota.remaining !== null && quota.remaining <= sharedQuotaThreshold(quota.resource)) ||
       status === 429 ||
       rateLimited)
+  );
+}
+
+function sharedQuotaConservationPressure(quota: ApiQuota): boolean {
+  return (
+    quota.source === "shared" &&
+    quota.remaining !== null &&
+    quota.remaining <= sharedQuotaEnrichmentThreshold(quota.resource)
   );
 }
 
@@ -1241,15 +1285,25 @@ async function recordAuditedGitHubAccess(
   auditGitHubTokenUse(area, path, status, quota);
   const write = () =>
     recordGitHubAccessCounter(env, area, path, status, quota)
-      .then(() =>
-        sharedQuotaPressure(status, quota, rateLimited)
-          ? markSharedQuotaCooldown(
-              env,
-              quota,
-              sharedQuotaCooldownReason(status, quota, rateLimited),
-            )
-          : undefined,
-      )
+      .then(() => {
+        if (sharedQuotaPressure(status, quota, rateLimited)) {
+          return markSharedQuotaCooldown(
+            env,
+            quota,
+            sharedQuotaCooldownReason(status, quota, rateLimited),
+            "critical",
+          );
+        }
+        if (sharedQuotaConservationPressure(quota)) {
+          return markSharedQuotaCooldown(
+            env,
+            quota,
+            `remaining ${quota.remaining} <= ${sharedQuotaEnrichmentThreshold(quota.resource)}`,
+            "conserve",
+          );
+        }
+        return undefined;
+      })
       .catch(() => undefined);
   const mustWait = forceWait || sharedQuotaPressure(status, quota, rateLimited);
   if (context) {
@@ -3456,9 +3510,16 @@ async function sourceInstallationToken(
 async function sourceInstallationRegistryCovers(env: Env, sources: TokenSources): Promise<boolean> {
   if (!appTokenConfigured(env)) return false;
   const accounts = sourceAccounts(sources);
-  if (accounts.length !== 1) return false;
-  const installation = await readInstallationRegistry(env, accounts[0]!);
-  return Boolean(installation && installationCoversSources(installation, sources));
+  if (accounts.length === 0) return false;
+  const installations = await Promise.all(
+    accounts.map((account) => readInstallationRegistry(env, account)),
+  );
+  return accounts.every((account, index) => {
+    const installation = installations[index];
+    return Boolean(
+      installation && installationCoversSources(installation, sourcesForAccount(sources, account)),
+    );
+  });
 }
 
 async function requestInstallationToken(
@@ -3535,6 +3596,30 @@ function sourceAccounts(sources: TokenSources): string[] {
   ];
 }
 
+function sourcesForAccount(sources: TokenSources, account: string): TokenSources {
+  const login = slugOwner(account);
+  return {
+    owners: sources.owners.filter((owner) => slugOwner(owner) === login),
+    repos: sources.repos.filter((repo) => slugOwner(repo.split("/")[0] ?? "") === login),
+  };
+}
+
+function installationsCoverSources(
+  installations: AuthInstallation[],
+  sources: TokenSources,
+): boolean {
+  const accounts = sourceAccounts(sources);
+  return (
+    accounts.length > 0 &&
+    accounts.every((account) => {
+      const accountSources = sourcesForAccount(sources, account);
+      return installations.some((installation) =>
+        installationCoversSources(installation, accountSources),
+      );
+    })
+  );
+}
+
 function returnToSources(returnTo: string, origin: string): { owners: string[]; repos: string[] } {
   const url = new URL(returnTo, origin);
   const pathRepo = repoFullNameFromPath(url.pathname);
@@ -3572,21 +3657,13 @@ function sourceCoverage(
       reason: "Dedicated app quota is not configured on this deployment.",
     };
   }
-  if (matchingInstallation(installations, sources)) {
+  if (installationsCoverSources(installations, sources)) {
     return { needed: false, reason: null };
   }
   if (sources.owners.length === 0 && sources.repos.length === 0) {
     return installations.length === 0
       ? { needed: true, reason: "Install the GitHub App for dedicated API quota." }
       : { needed: false, reason: null };
-  }
-
-  if (sourceAccounts(sources).length > 1) {
-    return {
-      needed: false,
-      reason:
-        "Mixed-account dashboards use shared API quota; use one installed account per dashboard for dedicated quota.",
-    };
   }
 
   const uncoveredOwners = sources.owners.filter(
@@ -7959,6 +8036,9 @@ async function detailGitHubJson<TSchema extends GenericSchema>(
     auditArea,
     env,
   );
+  if (data === null) {
+    throw new Error(`GitHub returned an unexpected not-modified response for ${path}`);
+  }
   return data;
 }
 
@@ -7973,7 +8053,8 @@ async function detailGitHubJsonWithHeaders<TSchema extends GenericSchema>(
   acceptOrAuditArea = "application/vnd.github+json",
   auditArea: GitHubAuditArea = "repo-detail",
   env?: Env,
-): Promise<{ data: InferOutput<TSchema>; headers: Headers }> {
+  etag?: string | null,
+): Promise<{ data: InferOutput<TSchema> | null; headers: Headers; notModified: boolean }> {
   const requestOptions = githubRequestOptions(acceptOrAuditArea, auditArea);
   const response = await workerFetch(`https://api.github.com${path}`, {
     headers: {
@@ -7981,6 +8062,7 @@ async function detailGitHubJsonWithHeaders<TSchema extends GenericSchema>(
       ...(token ? { authorization: `Bearer ${token}` } : {}),
       "user-agent": "ReleaseBar",
       "x-github-api-version": "2022-11-28",
+      ...(etag ? { "if-none-match": etag } : {}),
     },
   });
   const quota = quotaFromGitHubResponse(response, quotaSource, quotaAccount);
@@ -7994,6 +8076,9 @@ async function detailGitHubJsonWithHeaders<TSchema extends GenericSchema>(
     quota,
     rateLimited,
   );
+  if (response.status === 304 && etag) {
+    return { data: null, headers: response.headers, notModified: true };
+  }
   const body = await response.json().catch(() => null);
   if (!response.ok) {
     const message =
@@ -8005,24 +8090,42 @@ async function detailGitHubJsonWithHeaders<TSchema extends GenericSchema>(
     }
     throw new Error(`GitHub API ${response.status} for ${path}: ${message}`);
   }
-  return { data: parseGitHubResponse(schema, body, context), headers: response.headers };
+  return {
+    data: parseGitHubResponse(schema, body, context),
+    headers: response.headers,
+    notModified: false,
+  };
 }
 
 type RepoDetailAuxCacheRecord<T> = {
   generatedAt: string;
+  etag?: string | null;
   data: T;
 };
 
-function repoDetailAuxCacheKey(kind: string, id: string): string {
-  return `repo-detail:aux:v${repoDetailAuxCacheVersion}:${kind}:${encodeURIComponent(id.toLowerCase())}`;
+function repoDetailAuxCachePrefix(fullName: string): string {
+  return `repo-detail:aux:v${repoDetailAuxCacheVersion}:${encodeURIComponent(fullName.toLowerCase())}:`;
 }
 
-function repoStatsBackoffCacheKeys(path: string): string[] {
+function repoDetailAuxCacheKey(fullName: string, kind: string, id: string): string {
+  return `${repoDetailAuxCachePrefix(fullName)}${kind}:${encodeURIComponent(id.toLowerCase())}`;
+}
+
+function repoStatsBackoffCacheKeys(fullName: string, path: string): string[] {
   const repoPath = path.replace(/\/stats\/[^/?]+(\?.*)?$/, "/stats");
   return [
-    repoDetailAuxCacheKey("stats-backoff", path),
-    repoDetailAuxCacheKey("stats-backoff", repoPath),
+    repoDetailAuxCacheKey(fullName, "stats-backoff", path),
+    repoDetailAuxCacheKey(fullName, "stats-backoff", repoPath),
   ];
+}
+
+async function readRepoDetailAuxRecord<T>(
+  env: Env | undefined,
+  key: string,
+): Promise<RepoDetailAuxCacheRecord<T> | null> {
+  const raw = await env?.DASHBOARD_CACHE?.get(key);
+  if (!raw) return null;
+  return tryJsonParse<RepoDetailAuxCacheRecord<T>>(raw, `repo detail aux ${key}`);
 }
 
 async function readRepoDetailAux<T>(
@@ -8030,9 +8133,7 @@ async function readRepoDetailAux<T>(
   key: string,
   maxAgeMs: number,
 ): Promise<T | null> {
-  const raw = await env?.DASHBOARD_CACHE?.get(key);
-  if (!raw) return null;
-  const record = tryJsonParse<RepoDetailAuxCacheRecord<T>>(raw, `repo detail aux ${key}`);
+  const record = await readRepoDetailAuxRecord<T>(env, key);
   const generatedAt = Date.parse(record?.generatedAt ?? "");
   if (!Number.isFinite(generatedAt) || Date.now() - generatedAt > maxAgeMs) return null;
   return record?.data ?? null;
@@ -8043,15 +8144,17 @@ async function writeRepoDetailAux<T>(
   key: string,
   data: T,
   ttlSeconds = repoDetailAuxTtlSeconds,
+  etag?: string | null,
 ): Promise<void> {
   await env?.DASHBOARD_CACHE?.put(
     key,
-    JSON.stringify({ generatedAt: new Date().toISOString(), data }),
+    JSON.stringify({ generatedAt: new Date().toISOString(), data, ...(etag ? { etag } : {}) }),
     { expirationTtl: ttlSeconds },
   );
 }
 
 async function cachedDetailGitHubJson<TSchema extends GenericSchema>(
+  fullName: string,
   cacheKind: string,
   path: string,
   schema: TSchema,
@@ -8064,11 +8167,16 @@ async function cachedDetailGitHubJson<TSchema extends GenericSchema>(
   auditArea: GitHubAuditArea = "repo-detail",
   env?: Env,
   maxAgeMs = repoDetailAuxTtlSeconds * 1000,
+  validate?: (data: InferOutput<TSchema>) => void,
 ): Promise<InferOutput<TSchema>> {
-  const cacheKey = repoDetailAuxCacheKey(cacheKind, path);
-  const cached = await readRepoDetailAux<InferOutput<TSchema>>(env, cacheKey, maxAgeMs);
-  if (cached !== null) return cached;
-  const data = await detailGitHubJson(
+  const cacheKey = repoDetailAuxCacheKey(fullName, cacheKind, path);
+  const record = await readRepoDetailAuxRecord<InferOutput<TSchema>>(env, cacheKey);
+  const generatedAt = Date.parse(record?.generatedAt ?? "");
+  if (record && Number.isFinite(generatedAt) && Date.now() - generatedAt <= maxAgeMs) {
+    validate?.(record.data);
+    return record.data;
+  }
+  const result = await detailGitHubJsonWithHeaders(
     path,
     schema,
     context,
@@ -8079,12 +8187,25 @@ async function cachedDetailGitHubJson<TSchema extends GenericSchema>(
     acceptOrAuditArea,
     auditArea,
     env,
+    record?.etag,
   );
-  await writeRepoDetailAux(env, cacheKey, data, Math.floor(maxAgeMs / 1000));
+  const data = result.notModified && record ? record.data : result.data;
+  if (data === null) {
+    throw new Error(`GitHub returned no repository detail data for ${path}`);
+  }
+  validate?.(data);
+  await writeRepoDetailAux(
+    env,
+    cacheKey,
+    data,
+    Math.max(repoDetailAuxTtlSeconds, Math.floor(maxAgeMs / 1000)),
+    result.headers.get("etag") ?? record?.etag,
+  );
   return data;
 }
 
 async function cachedDetailGitHubCount(
+  fullName: string,
   cacheKind: string,
   path: string,
   maxAgeMs: number,
@@ -8095,10 +8216,13 @@ async function cachedDetailGitHubCount(
   auditArea: GitHubAuditArea = "repo-detail",
   env?: Env,
 ): Promise<number> {
-  const cacheKey = repoDetailAuxCacheKey(cacheKind, path);
-  const cached = await readRepoDetailAux<number>(env, cacheKey, maxAgeMs);
-  if (cached !== null) return cached;
-  const count = await detailGitHubCount(
+  const cacheKey = repoDetailAuxCacheKey(fullName, cacheKind, path);
+  const record = await readRepoDetailAuxRecord<number>(env, cacheKey);
+  const generatedAt = Date.parse(record?.generatedAt ?? "");
+  if (record && Number.isFinite(generatedAt) && Date.now() - generatedAt <= maxAgeMs) {
+    return record.data;
+  }
+  const result = await detailGitHubCount(
     path,
     token,
     quotaSource,
@@ -8106,12 +8230,21 @@ async function cachedDetailGitHubCount(
     onQuota,
     auditArea,
     env,
+    record?.etag,
   );
-  await writeRepoDetailAux(env, cacheKey, count, Math.floor(maxAgeMs / 1000));
+  const count = result.notModified && record ? record.data : result.count;
+  await writeRepoDetailAux(
+    env,
+    cacheKey,
+    count,
+    Math.max(repoDetailAuxTtlSeconds, Math.floor(maxAgeMs / 1000)),
+    result.etag ?? record?.etag,
+  );
   return count;
 }
 
 async function detailGitHubStats<TSchema extends GenericSchema>(
+  fullName: string,
   path: string,
   schema: TSchema,
   token: string | null,
@@ -8130,14 +8263,14 @@ async function detailGitHubStats<TSchema extends GenericSchema>(
     data: InferOutput<TSchema> | null;
     message?: string;
   };
-  const statsCacheKey = repoDetailAuxCacheKey("stats", path);
+  const statsCacheKey = repoDetailAuxCacheKey(fullName, "stats", path);
   const cached = await readRepoDetailAux<StatsResult>(
     env,
     statsCacheKey,
     repoDetailStatsCacheTtlMs,
   );
   if (cached) return cached;
-  const backoffKeys = repoStatsBackoffCacheKeys(path);
+  const backoffKeys = repoStatsBackoffCacheKeys(fullName, path);
   let backoff: { message?: string } | null = null;
   for (const key of backoffKeys) {
     backoff = await readRepoDetailAux<{ message?: string }>(
@@ -8233,19 +8366,24 @@ async function detailGitHubCount(
   onQuota: (quota: ApiQuota) => void,
   auditArea: GitHubAuditArea = "repo-detail",
   env?: Env,
-): Promise<number> {
+  etag?: string | null,
+): Promise<{ count: number; etag: string | null; notModified: boolean }> {
   const response = await workerFetch(`https://api.github.com${path}`, {
     headers: {
       accept: "application/vnd.github+json",
       ...(token ? { authorization: `Bearer ${token}` } : {}),
       "user-agent": "ReleaseBar",
       "x-github-api-version": "2022-11-28",
+      ...(etag ? { "if-none-match": etag } : {}),
     },
   });
   const quota = quotaFromGitHubResponse(response, quotaSource, quotaAccount);
   onQuota(quota);
   const rateLimited = quota.source === "shared" ? await responseRateLimitSignal(response) : false;
   await recordAuditedGitHubAccess(env, auditArea, path, response.status, quota, rateLimited);
+  if (response.status === 304 && etag) {
+    return { count: 0, etag: response.headers.get("etag") ?? etag, notModified: true };
+  }
   const body = await response.json().catch(() => null);
   if (!response.ok) {
     const message =
@@ -8258,11 +8396,15 @@ async function detailGitHubCount(
     throw new Error(`GitHub API ${response.status} for ${path}: ${message}`);
   }
   const lastPage = lastPageFromLink(response.headers.get("link"));
-  if (lastPage !== null) return lastPage;
-  return Array.isArray(body) ? body.length : 0;
+  return {
+    count: lastPage ?? (Array.isArray(body) ? body.length : 0),
+    etag: response.headers.get("etag"),
+    notModified: false,
+  };
 }
 
 async function detailGitHubSearchCount(
+  fullName: string,
   query: string,
   token: string | null,
   quotaSource: ApiQuota["source"],
@@ -8271,7 +8413,7 @@ async function detailGitHubSearchCount(
   auditArea: GitHubAuditArea = "repo-detail",
   env?: Env,
 ): Promise<number> {
-  const cacheKey = repoDetailAuxCacheKey("search-count", query);
+  const cacheKey = repoDetailAuxCacheKey(fullName, "search-count", query);
   const cached = await readRepoDetailAux<number>(env, cacheKey, repoDetailSearchCountCacheTtlMs);
   if (cached !== null) return cached;
   const result = await detailGitHubJson(
@@ -8427,7 +8569,7 @@ async function buildWorkTrend(
     Object.values(queries).map((query) =>
       readRepoDetailAux<number>(
         env,
-        repoDetailAuxCacheKey("search-count", query),
+        repoDetailAuxCacheKey(fullName, "search-count", query),
         repoDetailSearchCountCacheTtlMs,
       ),
     ),
@@ -8457,7 +8599,7 @@ async function buildWorkTrend(
       Object.entries(queries).map(([key, query]) =>
         writeRepoDetailAux(
           env,
-          repoDetailAuxCacheKey("search-count", query),
+          repoDetailAuxCacheKey(fullName, "search-count", query),
           counts[key as keyof typeof counts],
           Math.floor(repoDetailSearchCountCacheTtlMs / 1000),
         ),
@@ -8468,7 +8610,16 @@ async function buildWorkTrend(
   const [issuesOpened30d, issuesClosed30d, pullRequestsOpened30d, pullRequestsClosed30d] =
     await Promise.all(
       Object.values(queries).map((query) =>
-        detailGitHubSearchCount(query, token, quotaSource, quotaAccount, onQuota, auditArea, env),
+        detailGitHubSearchCount(
+          fullName,
+          query,
+          token,
+          quotaSource,
+          quotaAccount,
+          onQuota,
+          auditArea,
+          env,
+        ),
       ),
     );
   return {
@@ -10194,6 +10345,9 @@ async function recentRepoStargazersRest(
     undefined,
     env,
   );
+  if (!firstPage.data) {
+    throw new Error("GitHub returned no repository stargazer data");
+  }
   const lastPage = lastPageFromLink(firstPage.headers.get("link"));
   if (!lastPage || lastPage <= 1) return firstPage.data;
   const lastPath = `${firstPath}&page=${lastPage}`;
@@ -11773,47 +11927,373 @@ async function cachedContributorTrustSignals(
   return cachedUserTrustSignals(env, logins);
 }
 
-async function buildRepoDetail(
+type RepoDetailCredential = {
+  token: string | null;
+  quotaSource: ApiQuota["source"];
+  quotaAccount: string | null;
+};
+
+type RepoDetailCore = {
+  repo: InferOutput<typeof gitHubRepositorySchema>;
+  releases: Array<InferOutput<typeof gitHubReleaseSchema>>;
+  latestCommit: InferOutput<typeof gitHubCommitSchema> | null;
+  openPullRequests: number;
+  checks: InferOutput<typeof gitHubCheckRunsSchema> | null;
+};
+
+type RepoDetailCoreGraphqlResponse = {
+  data?: {
+    repository?: {
+      owner?: { login?: string };
+      name?: string;
+      nameWithOwner?: string;
+      description?: string | null;
+      url?: string;
+      isPrivate?: boolean;
+      isFork?: boolean;
+      isArchived?: boolean;
+      primaryLanguage?: { name?: string } | null;
+      repositoryTopics?: { nodes?: Array<{ topic?: { name?: string } | null } | null> };
+      stargazerCount?: number;
+      forkCount?: number;
+      issues?: { totalCount?: number };
+      pullRequests?: { totalCount?: number };
+      pushedAt?: string | null;
+      updatedAt?: string | null;
+      defaultBranchRef?: {
+        name?: string;
+        target?: {
+          oid?: string;
+          committedDate?: string | null;
+          statusCheckRollup?: {
+            contexts?: {
+              nodes?: Array<{
+                __typename?: string;
+                name?: string | null;
+                context?: string | null;
+                status?: string | null;
+                conclusion?: string | null;
+                state?: string | null;
+                detailsUrl?: string | null;
+                targetUrl?: string | null;
+                completedAt?: string | null;
+                startedAt?: string | null;
+                createdAt?: string | null;
+              } | null>;
+            };
+          } | null;
+        } | null;
+      } | null;
+      releases?: {
+        nodes?: Array<{
+          tagName?: string;
+          name?: string | null;
+          url?: string;
+          isDraft?: boolean;
+          isPrerelease?: boolean;
+          publishedAt?: string | null;
+        } | null>;
+      };
+    } | null;
+  };
+  errors?: Array<{ message?: string; type?: string }>;
+};
+
+const repoDetailCoreQuery = /* GraphQL */ `
+  query ReleaseBarRepoDetailCore($owner: String!, $name: String!) {
+    repository(owner: $owner, name: $name) {
+      owner {
+        login
+      }
+      name
+      nameWithOwner
+      description
+      url
+      isPrivate
+      isFork
+      isArchived
+      primaryLanguage {
+        name
+      }
+      repositoryTopics(first: 20) {
+        nodes {
+          topic {
+            name
+          }
+        }
+      }
+      stargazerCount
+      forkCount
+      issues(states: OPEN, first: 1) {
+        totalCount
+      }
+      pullRequests(states: OPEN, first: 1) {
+        totalCount
+      }
+      pushedAt
+      updatedAt
+      defaultBranchRef {
+        name
+        target {
+          ... on Commit {
+            oid
+            committedDate
+            statusCheckRollup {
+              contexts(first: 100) {
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    name
+                    status
+                    conclusion
+                    detailsUrl
+                    completedAt
+                    startedAt
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                    targetUrl
+                    createdAt
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      releases(first: 100, orderBy: { field: CREATED_AT, direction: DESC }) {
+        nodes {
+          tagName
+          name
+          url
+          isDraft
+          isPrerelease
+          publishedAt
+        }
+      }
+    }
+  }
+`;
+
+async function repoDetailCredential(
   owner: string,
   repoName: string,
   request: Request,
   env: Env,
-): Promise<RepoDetailPayload> {
+): Promise<RepoDetailCredential> {
   const fullName = `${slugOwner(owner)}/${repoName.toLowerCase()}`;
   const requestToken = await bestInstallationToken(request, env, {
     owners: [],
     repos: [fullName],
   }).catch(() => null);
-  const token = requestToken?.token ?? env.GITHUB_TOKEN ?? null;
-  const quotaSource = requestToken?.quotaSource ?? (env.GITHUB_TOKEN ? "shared" : "anonymous");
-  const quotaAccount = requestToken?.quotaAccount ?? null;
+  return {
+    token: requestToken?.token ?? env.GITHUB_TOKEN ?? null,
+    quotaSource: requestToken?.quotaSource ?? (env.GITHUB_TOKEN ? "shared" : "anonymous"),
+    quotaAccount: requestToken?.quotaAccount ?? null,
+  };
+}
+
+function lowerNullable(value: string | null | undefined): string | null {
+  return typeof value === "string" ? value.toLowerCase() : null;
+}
+
+function statusContextState(value: string | null | undefined): {
+  status: string;
+  conclusion: string | null;
+} {
+  const state = lowerNullable(value);
+  if (state === "pending" || state === "expected") {
+    return { status: "in_progress", conclusion: null };
+  }
+  if (state === "error" || state === "failure") {
+    return { status: "completed", conclusion: "failure" };
+  }
+  return { status: "completed", conclusion: state };
+}
+
+async function repoDetailCoreGraphql(
+  fullName: string,
+  owner: string,
+  repoName: string,
+  credential: RepoDetailCredential,
+  onQuota: (quota: ApiQuota) => void,
+  env: Env,
+): Promise<RepoDetailCore> {
+  const cacheKey = repoDetailAuxCacheKey(fullName, "core-graphql", fullName);
+  const cached = await readRepoDetailAux<RepoDetailCore>(
+    env,
+    cacheKey,
+    repoDetailLiveProbeCacheTtlMs,
+  );
+  if (cached) return cached;
+  if (
+    await graphqlBackoffActive(
+      env,
+      credential.quotaSource,
+      credential.quotaAccount,
+      githubGraphqlRepoDetailCoreOperation,
+    )
+  ) {
+    throw new Error("GitHub GraphQL repository detail backoff active");
+  }
+  const response = await workerFetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${credential.token}`,
+      "content-type": "application/json",
+      "user-agent": "ReleaseBar",
+      "x-github-api-version": "2022-11-28",
+    },
+    body: JSON.stringify({
+      query: repoDetailCoreQuery,
+      variables: { owner, name: repoName },
+    }),
+  });
+  const quota = quotaFromGitHubResponse(response, credential.quotaSource, credential.quotaAccount);
+  onQuota(quota);
+  await recordAuditedGitHubAccess(
+    env,
+    "repo-detail",
+    githubGraphqlAuditPath(githubGraphqlRepoDetailCoreOperation),
+    response.status,
+    quota,
+    false,
+  );
+  if (response.status >= 500 && response.status < 600) {
+    await markGraphqlBackoff(
+      env,
+      quota.source,
+      quota.account,
+      githubGraphqlRepoDetailCoreOperation,
+      response.status,
+    );
+  }
+  const body = (await response.json().catch(() => null)) as RepoDetailCoreGraphqlResponse | null;
+  const message = body?.errors
+    ?.map((error) => error.message ?? error.type)
+    .filter(Boolean)
+    .join("; ");
+  if (!response.ok || body?.errors?.length) {
+    throw new Error(message || `GitHub GraphQL ${response.status}`);
+  }
+  const node = body?.data?.repository;
+  const defaultBranch = node?.defaultBranchRef?.name;
+  if (
+    !node?.owner?.login ||
+    !node.name ||
+    !node.nameWithOwner ||
+    !node.url ||
+    !defaultBranch ||
+    typeof node.stargazerCount !== "number" ||
+    typeof node.forkCount !== "number" ||
+    typeof node.issues?.totalCount !== "number" ||
+    typeof node.pullRequests?.totalCount !== "number"
+  ) {
+    throw new Error("GitHub GraphQL returned incomplete repository detail");
+  }
+  const target = node.defaultBranchRef?.target;
+  const latestCommit = target?.oid
+    ? {
+        sha: target.oid,
+        commit: {
+          committer: {
+            date: target.committedDate ?? null,
+          },
+        },
+      }
+    : null;
+  const checkRuns = (target?.statusCheckRollup?.contexts?.nodes ?? []).flatMap((context) => {
+    if (!context) return [];
+    const legacy =
+      context.__typename === "StatusContext" ? statusContextState(context.state) : null;
+    return [
+      {
+        name: context.name ?? context.context ?? null,
+        html_url: context.detailsUrl ?? context.targetUrl ?? "",
+        status: legacy?.status ?? lowerNullable(context.status),
+        conclusion: legacy?.conclusion ?? lowerNullable(context.conclusion),
+        completed_at: context.completedAt ?? context.createdAt ?? null,
+        started_at: context.startedAt ?? context.createdAt ?? null,
+      },
+    ];
+  });
+  const core: RepoDetailCore = {
+    repo: {
+      owner: { login: node.owner.login },
+      name: node.name,
+      full_name: node.nameWithOwner,
+      private: node.isPrivate ?? false,
+      fork: node.isFork ?? false,
+      archived: node.isArchived ?? false,
+      html_url: node.url,
+      description: node.description ?? null,
+      default_branch: defaultBranch,
+      language: node.primaryLanguage?.name ?? null,
+      topics: (node.repositoryTopics?.nodes ?? []).flatMap((topic) =>
+        topic?.topic?.name ? [topic.topic.name] : [],
+      ),
+      stargazers_count: node.stargazerCount,
+      forks_count: node.forkCount,
+      open_issues_count: node.issues.totalCount + node.pullRequests.totalCount,
+      pushed_at: node.pushedAt ?? null,
+      updated_at: node.updatedAt ?? null,
+    },
+    releases: (node.releases?.nodes ?? []).flatMap((release) =>
+      release?.tagName && release.url
+        ? [
+            {
+              tag_name: release.tagName,
+              name: release.name ?? null,
+              html_url: release.url,
+              draft: release.isDraft ?? false,
+              prerelease: release.isPrerelease ?? false,
+              published_at: release.publishedAt ?? null,
+            },
+          ]
+        : [],
+    ),
+    latestCommit,
+    openPullRequests: node.pullRequests.totalCount,
+    checks: { check_runs: checkRuns },
+  };
+  if (!core.repo.private) {
+    await writeRepoDetailAux(env, cacheKey, core);
+  }
+  return core;
+}
+
+async function buildRepoDetail(
+  owner: string,
+  repoName: string,
+  request: Request,
+  env: Env,
+  options: { credential?: RepoDetailCredential; enrich?: boolean } = {},
+): Promise<RepoDetailPayload> {
+  const fullName = `${slugOwner(owner)}/${repoName.toLowerCase()}`;
+  const credential =
+    options.credential ?? (await repoDetailCredential(owner, repoName, request, env));
+  const { token, quotaSource, quotaAccount } = credential;
   let quota: ApiQuota | undefined;
   const onQuota = (next: ApiQuota) => {
     quota = next;
   };
   const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}`;
-  const repo = await detailGitHubJson(
-    path,
-    gitHubRepositorySchema,
-    "repository detail",
-    token,
-    quotaSource,
-    quotaAccount,
-    onQuota,
-    undefined,
-    undefined,
-    env,
-  );
-  if (repo.private) {
-    throw new Error("private repositories are not visible in public dashboards");
-  }
-
-  const [releases, contributors, languages, latestCommit, openPullRequests] = await Promise.all([
-    cachedDetailGitHubJson(
-      "releases",
-      `${path}/releases?per_page=100`,
-      v.array(gitHubReleaseSchema),
-      "repository releases",
+  const graphqlCore =
+    credential.quotaSource === "app" && credential.token
+      ? await repoDetailCoreGraphql(fullName, owner, repoName, credential, onQuota, env).catch(
+          () => null,
+        )
+      : null;
+  const repo =
+    graphqlCore?.repo ??
+    (await cachedDetailGitHubJson(
+      fullName,
+      "repository",
+      path,
+      gitHubRepositorySchema,
+      "repository detail",
       token,
       quotaSource,
       quotaAccount,
@@ -11822,73 +12302,71 @@ async function buildRepoDetail(
       undefined,
       env,
       repoDetailReleaseCacheTtlMs,
-    ),
-    optionalRepoDetail(
-      cachedDetailGitHubJson(
-        "contributors",
-        `${path}/contributors?per_page=12`,
-        v.array(gitHubContributorSchema),
-        "repository contributors",
-        token,
-        quotaSource,
-        quotaAccount,
-        onQuota,
-        undefined,
-        undefined,
-        env,
-      ),
-      [],
-    ),
-    optionalRepoDetail(
-      cachedDetailGitHubJson(
-        "languages",
-        `${path}/languages`,
-        gitHubLanguageSchema,
-        "repository languages",
-        token,
-        quotaSource,
-        quotaAccount,
-        onQuota,
-        undefined,
-        undefined,
-        env,
-      ),
-      {},
-    ),
-    optionalRepoDetail(
-      cachedDetailGitHubJson(
-        "latest-commit",
-        `${path}/commits/${encodeURIComponent(repo.default_branch)}`,
-        gitHubCommitSchema,
-        "latest commit",
-        token,
-        quotaSource,
-        quotaAccount,
-        onQuota,
-        undefined,
-        undefined,
-        env,
-        repoDetailLiveProbeCacheTtlMs,
-      ),
-      null,
-    ),
-    cachedDetailGitHubCount(
-      "open-pulls",
-      `${path}/pulls?state=open&per_page=1`,
-      repoDetailLiveProbeCacheTtlMs,
-      token,
-      quotaSource,
-      quotaAccount,
-      onQuota,
-      undefined,
-      env,
-    ),
-  ]);
+      (repository) => {
+        if (repository.private) {
+          throw new Error("private repositories are not visible in public dashboards");
+        }
+      },
+    ));
+  if (repo.private) {
+    throw new Error("private repositories are not visible in public dashboards");
+  }
+
+  const [releases, latestCommit, openPullRequests] = graphqlCore
+    ? [graphqlCore.releases, graphqlCore.latestCommit, graphqlCore.openPullRequests]
+    : await Promise.all([
+        cachedDetailGitHubJson(
+          fullName,
+          "releases",
+          `${path}/releases?per_page=100`,
+          v.array(gitHubReleaseSchema),
+          "repository releases",
+          token,
+          quotaSource,
+          quotaAccount,
+          onQuota,
+          undefined,
+          undefined,
+          env,
+          repoDetailReleaseCacheTtlMs,
+        ),
+        optionalRepoDetail(
+          cachedDetailGitHubJson(
+            fullName,
+            "latest-commit",
+            `${path}/commits/${encodeURIComponent(repo.default_branch)}`,
+            gitHubCommitSchema,
+            "latest commit",
+            token,
+            quotaSource,
+            quotaAccount,
+            onQuota,
+            undefined,
+            undefined,
+            env,
+            repoDetailLiveProbeCacheTtlMs,
+          ),
+          null,
+        ),
+        cachedDetailGitHubCount(
+          fullName,
+          "open-pulls",
+          `${path}/pulls?state=open&per_page=1`,
+          repoDetailLiveProbeCacheTtlMs,
+          token,
+          quotaSource,
+          quotaAccount,
+          onQuota,
+          undefined,
+          env,
+        ),
+      ]);
 
   const latestRelease = releases.find((release) => !release.draft) ?? null;
   const compare = latestRelease
     ? await optionalRepoDetail(
         cachedDetailGitHubJson(
+          fullName,
           "compare",
           `${path}/compare/${encodeURIComponent(latestRelease.tag_name)}...${encodeURIComponent(repo.default_branch)}`,
           gitHubCompareSchema,
@@ -11905,49 +12383,116 @@ async function buildRepoDetail(
         null,
       )
     : null;
-  const checks = latestCommit?.sha
-    ? await optionalRepoDetail(
-        cachedDetailGitHubJson(
-          "check-runs",
-          `${path}/commits/${encodeURIComponent(latestCommit.sha)}/check-runs?per_page=100`,
-          gitHubCheckRunsSchema,
-          "repository check runs",
+  const checks =
+    graphqlCore?.checks ??
+    (latestCommit?.sha
+      ? await optionalRepoDetail(
+          cachedDetailGitHubJson(
+            fullName,
+            "check-runs",
+            `${path}/commits/${encodeURIComponent(latestCommit.sha)}/check-runs?per_page=100`,
+            gitHubCheckRunsSchema,
+            "repository check runs",
+            token,
+            quotaSource,
+            quotaAccount,
+            onQuota,
+            undefined,
+            undefined,
+            env,
+            repoDetailLiveProbeCacheTtlMs,
+          ),
+          null,
+        )
+      : null);
+
+  const conservation =
+    quotaSource === "shared" ? await sharedQuotaConservation(env).catch(() => null) : null;
+  const enrich = options.enrich !== false && !conservation?.active;
+  const enrichmentMessage = enrich
+    ? null
+    : "Detailed repository statistics are deferred while shared GitHub quota recovers.";
+  const [contributors, languages] = enrich
+    ? await Promise.all([
+        optionalRepoDetail(
+          cachedDetailGitHubJson(
+            fullName,
+            "contributors",
+            `${path}/contributors?per_page=12`,
+            v.array(gitHubContributorSchema),
+            "repository contributors",
+            token,
+            quotaSource,
+            quotaAccount,
+            onQuota,
+            undefined,
+            undefined,
+            env,
+          ),
+          [],
+        ),
+        optionalRepoDetail(
+          cachedDetailGitHubJson(
+            fullName,
+            "languages",
+            `${path}/languages`,
+            gitHubLanguageSchema,
+            "repository languages",
+            token,
+            quotaSource,
+            quotaAccount,
+            onQuota,
+            undefined,
+            undefined,
+            env,
+          ),
+          {},
+        ),
+      ])
+    : [[], {}];
+  const [commitActivity, workTrend] = enrich
+    ? await Promise.all([
+        detailGitHubStats(
+          fullName,
+          `${path}/stats/commit_activity`,
+          gitHubCommitActivitySchema,
           token,
           quotaSource,
           quotaAccount,
           onQuota,
           undefined,
+          env,
+        ),
+        buildWorkTrend(
+          repo.full_name,
+          token,
+          quotaSource,
+          quotaAccount,
+          onQuota,
           undefined,
           env,
-          repoDetailLiveProbeCacheTtlMs,
-        ),
+        ).catch(() => null),
+      ])
+    : [
+        {
+          state: "warming" as const,
+          data: null,
+          message: enrichmentMessage ?? undefined,
+        },
         null,
-      )
-    : null;
-
-  const [commitActivity, workTrend] = await Promise.all([
-    detailGitHubStats(
-      `${path}/stats/commit_activity`,
-      gitHubCommitActivitySchema,
-      token,
-      quotaSource,
-      quotaAccount,
-      onQuota,
-      undefined,
-      env,
-    ),
-    buildWorkTrend(repo.full_name, token, quotaSource, quotaAccount, onQuota, undefined, env).catch(
-      () => null,
-    ),
-  ]);
+      ];
   const codeFrequency =
-    commitActivity.state === "warming"
+    !enrich || commitActivity.state === "warming"
       ? {
           state: "warming" as const,
           data: null,
-          message: commitActivity.message ?? "GitHub is preparing repository statistics.",
+          message:
+            enrichmentMessage ??
+            commitActivity.message ??
+            "GitHub is preparing repository statistics.",
         }
       : await detailGitHubStats(
+          fullName,
           `${path}/stats/code_frequency`,
           gitHubCodeFrequencySchema,
           token,
@@ -11957,7 +12502,8 @@ async function buildRepoDetail(
           undefined,
           env,
         );
-  const statsWarming = [commitActivity, codeFrequency].some((stat) => stat.state === "warming");
+  const statsWarming =
+    !enrich || [commitActivity, codeFrequency].some((stat) => stat.state === "warming");
   const project = releaseProject(repo);
   project.openPullRequests = openPullRequests;
   project.openIssues = Math.max(repo.open_issues_count - openPullRequests, 0);
@@ -11990,7 +12536,15 @@ async function buildRepoDetail(
       state: statsWarming ? "warming" : "fresh",
       stale: statsWarming,
       generatedAt,
-      ...(statsWarming ? { message: "GitHub is preparing repository statistics." } : {}),
+      ...(statsWarming
+        ? {
+            message:
+              enrichmentMessage ??
+              commitActivity.message ??
+              codeFrequency.message ??
+              "GitHub is preparing repository statistics.",
+          }
+        : {}),
       ...(quota ? { quota } : {}),
     },
     stats: {
@@ -12107,14 +12661,46 @@ async function refreshRepoDetail(
   repo: string,
   request: Request,
   env: Env,
+  credential?: RepoDetailCredential,
 ): Promise<void> {
-  const lock = await acquireBuildLock(env, `${key}:refresh`);
-  if (!lock) return;
+  await buildRepoDetailSingleFlight(key, owner, repo, request, env, credential);
+}
+
+async function buildRepoDetailSingleFlight(
+  key: string,
+  owner: string,
+  repo: string,
+  request: Request,
+  env: Env,
+  credential?: RepoDetailCredential,
+): Promise<RepoDetailPayload | null> {
+  const local = localRepoDetailBuilds.get(key);
+  if (local) return local;
+  const build = (async () => {
+    const lock = await acquireBuildLock(env, `${key}:refresh`);
+    if (!lock) {
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        await sleep(250);
+        const cached = await readRepoDetail(env, key);
+        if (cached) return cached;
+      }
+      return null;
+    }
+    try {
+      const payload = await buildRepoDetail(owner, repo, request, env, { credential });
+      await writeRepoDetail(env, key, payload);
+      return payload;
+    } finally {
+      await lock.release();
+    }
+  })();
+  localRepoDetailBuilds.set(key, build);
   try {
-    const payload = await buildRepoDetail(owner, repo, request, env);
-    await writeRepoDetail(env, key, payload);
+    return await build;
   } finally {
-    await lock.release();
+    if (localRepoDetailBuilds.get(key) === build) {
+      localRepoDetailBuilds.delete(key);
+    }
   }
 }
 
@@ -12217,8 +12803,18 @@ async function repoDetailResponse(
   const cached = barrier === "clear" ? await readRepoDetail(env, key) : null;
   const ageMs = repoDetailAgeMs(cached);
   const allowRefresh = allowRequestRefresh(request);
+  const sharedCritical = allowRefresh
+    ? await sharedQuotaCooldown(env, "core").catch(() => null)
+    : null;
+  const appCovered =
+    sharedCritical?.active &&
+    (await sourceInstallationRegistryCovers(env, {
+      owners: [],
+      repos: [fullName],
+    }).catch(() => false));
+  const refreshAllowed = allowRefresh && (!sharedCritical?.active || appCovered);
   if (cached?.cache.state === "warming" && ageMs < repoDetailWarmingRefreshMs) {
-    if (allowRefresh && releaseSummaryNeedsRefresh(cached, env)) {
+    if (refreshAllowed && releaseSummaryNeedsRefresh(cached, env)) {
       context.waitUntil(refreshReleaseSummary(key, owner, repo, cached, request, env));
     }
     return jsonResponse(await withRepoDetailContributorTrustProfiles(cached, env), 202, {
@@ -12226,16 +12822,16 @@ async function repoDetailResponse(
     });
   }
   if (cached && ageMs < repoDetailCacheTtlMs && cached.cache.state !== "warming") {
-    if (allowRefresh && releaseSummaryNeedsRefresh(cached, env)) {
+    if (refreshAllowed && releaseSummaryNeedsRefresh(cached, env)) {
       context.waitUntil(refreshReleaseSummary(key, owner, repo, cached, request, env));
     }
     return jsonResponse(await withRepoDetailContributorTrustProfiles(cached, env));
   }
   if (cached && ageMs <= maxDisplayStaleMs) {
-    if (allowRefresh) {
+    if (refreshAllowed) {
       context.waitUntil(refreshRepoDetail(key, owner, repo, request, env).catch(() => undefined));
     }
-    if (allowRefresh && releaseSummaryNeedsRefresh(cached, env)) {
+    if (refreshAllowed && releaseSummaryNeedsRefresh(cached, env)) {
       context.waitUntil(refreshReleaseSummary(key, owner, repo, cached, request, env));
     }
     return jsonResponse(
@@ -12243,9 +12839,11 @@ async function repoDetailResponse(
         withRepoDetailState(
           cached,
           "stale",
-          allowRefresh
+          refreshAllowed
             ? "refreshing repository statistics"
-            : "showing cached repository statistics",
+            : sharedCritical?.active
+              ? "showing cached repository statistics while shared GitHub quota recovers"
+              : "showing cached repository statistics",
         ),
         env,
       ),
@@ -12256,9 +12854,47 @@ async function repoDetailResponse(
   }
 
   try {
-    const payload = await buildRepoDetail(owner, repo, request, env);
-    await writeRepoDetail(env, key, payload);
-    if (allowRefresh && releaseSummaryNeedsRefresh(payload, env)) {
+    const credential = await repoDetailCredential(owner, repo, request, env);
+    if (credential.quotaSource === "shared" && sharedCritical?.active) {
+      return jsonResponse(
+        {
+          error: "GitHub shared API quota is reserved for essential requests until reset.",
+          cache: {
+            state: "error",
+            stale: true,
+            generatedAt: new Date().toISOString(),
+            message: "Repository detail is cache-only while shared GitHub quota recovers.",
+          },
+        },
+        429,
+        {
+          "cache-control": "no-store",
+          ...(sharedCritical.resetAt
+            ? {
+                "retry-after": String(
+                  Math.max(1, Math.ceil((Date.parse(sharedCritical.resetAt) - Date.now()) / 1000)),
+                ),
+              }
+            : {}),
+        },
+      );
+    }
+    const payload = await buildRepoDetailSingleFlight(key, owner, repo, request, env, credential);
+    if (!payload) {
+      return jsonResponse(
+        {
+          cache: {
+            state: "warming",
+            stale: true,
+            generatedAt: new Date().toISOString(),
+            message: "Repository detail build is already in progress.",
+          },
+        },
+        202,
+        { "cache-control": "no-store", "retry-after": "2" },
+      );
+    }
+    if (refreshAllowed && releaseSummaryNeedsRefresh(payload, env)) {
       context.waitUntil(refreshReleaseSummary(key, owner, repo, payload, request, env));
     }
     return jsonResponse(
@@ -13098,6 +13734,52 @@ async function acquireBuildLock(env: Env, key: string): Promise<BuildLock | null
   }
 }
 
+async function dashboardOwnerCredentials(
+  dashboard: DashboardRequest,
+  env: Env,
+  signal?: AbortSignal,
+): Promise<DashboardOwnerCredentials> {
+  if (!appTokenConfigured(env)) return {};
+  const sources = {
+    owners: dashboard.owners.map((owner) => owner.login),
+    repos: dashboard.includeRepos,
+  };
+  const credentials: DashboardOwnerCredentials = {};
+  await Promise.all(
+    sourceAccounts(sources).map(async (account) => {
+      const requestToken =
+        dashboard.quotaSource === "app" &&
+        dashboard.token &&
+        slugOwner(dashboard.quotaAccount ?? "") === account
+          ? {
+              token: dashboard.token,
+              quotaSource: "app" as const,
+              quotaAccount: dashboard.quotaAccount ?? account,
+            }
+          : await sourceInstallationToken(env, sourcesForAccount(sources, account), {
+              discover: true,
+              maxRegistryAgeMs: installationRegistryFastPathMaxAgeMs,
+              signal,
+            }).catch(() => null);
+      if (!requestToken) return;
+      credentials[account] = {
+        token: requestToken.token,
+        quotaSource: requestToken.quotaSource,
+        quotaAccount: requestToken.quotaAccount,
+        fetch: auditGitHubFetch(
+          "dashboard",
+          requestToken.quotaSource,
+          requestToken.quotaAccount,
+          env,
+          undefined,
+          signal,
+        ),
+      };
+    }),
+  );
+  return credentials;
+}
+
 async function rebuild(
   dashboard: DashboardRequest,
   env: Env,
@@ -13189,6 +13871,7 @@ async function rebuild(
     ]);
   };
   try {
+    const ownerCredentials = await dashboardOwnerCredentials(dashboard, env, signal);
     const payload = await buildDashboard({
       title: "ReleaseBar",
       subtitle: dashboard.subtitle,
@@ -13215,6 +13898,7 @@ async function rebuild(
       quotaSource:
         dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
       quotaAccount: dashboard.quotaAccount ?? null,
+      ownerCredentials,
       previousCountsUpdatedAt:
         existingCached?.cache?.countsUpdatedAt ?? storedProgress?.countsUpdatedAt ?? null,
       previousProjectCountsUpdatedAt:
@@ -13502,6 +14186,7 @@ async function refreshDashboardMetadataFirst(
       status: "running",
       detail: "phase=metadata",
     });
+    const ownerCredentials = await dashboardOwnerCredentials(dashboard, env, signal);
     const payload = await buildDashboard({
       title: "ReleaseBar",
       subtitle: dashboard.subtitle,
@@ -13526,6 +14211,7 @@ async function refreshDashboardMetadataFirst(
       quotaSource:
         dashboard.quotaSource ?? (dashboard.token || env.GITHUB_TOKEN ? "shared" : "anonymous"),
       quotaAccount: dashboard.quotaAccount ?? null,
+      ownerCredentials,
       previousCountsUpdatedAt: existingCached?.cache?.countsUpdatedAt ?? null,
       previousProjectCountsUpdatedAt: existingCached?.cache?.projectCountsUpdatedAt ?? {},
       fetch: auditGitHubFetch(
@@ -15793,6 +16479,15 @@ async function invalidateRepoProjectCache(env: Env, fullName: string): Promise<v
   );
 }
 
+async function invalidateRepoDetailCaches(env: Env, fullName: string): Promise<void> {
+  const [owner, repo] = fullName.split("/");
+  if (!owner || !repo) return;
+  await Promise.all([
+    env.DASHBOARD_CACHE?.delete?.(repoDetailCacheKey(owner, repo)),
+    deleteCachePrefix(env, repoDetailAuxCachePrefix(fullName)),
+  ]);
+}
+
 async function deleteCachePrefix(env: Env, prefix: string): Promise<void> {
   if (!env.DASHBOARD_CACHE?.list || !env.DASHBOARD_CACHE.delete) return;
   let cursor: string | undefined;
@@ -15812,7 +16507,7 @@ async function invalidatePublicRepoCaches(env: Env, fullName: string): Promise<v
   if (!owner || !repo) return;
   await Promise.all([
     invalidateRepoProjectCache(env, fullName),
-    env.DASHBOARD_CACHE?.delete?.(repoDetailCacheKey(owner, repo)),
+    invalidateRepoDetailCaches(env, fullName),
     env.DASHBOARD_CACHE?.delete?.(socialRepoCacheKey(owner, repo)),
     ...(["day", "week", "month"] as ActivityRange[]).map((range) =>
       env.DASHBOARD_CACHE?.delete?.(repoActivityCacheKey(owner, repo, range)),
@@ -15898,6 +16593,7 @@ async function prepareGitHubWebhookEvent(
     if (refresh.status !== "refreshed" || !refresh.exact) {
       throw new Error(`exact owner count refresh ${refresh.status}`);
     }
+    await invalidateRepoDetailCaches(env, repo.fullName);
     return null;
   }
 
@@ -15929,6 +16625,7 @@ async function prepareGitHubWebhookEvent(
     await Promise.all([
       restore,
       invalidateRepoProjectCache(env, repo.fullName),
+      invalidateRepoDetailCaches(env, repo.fullName),
       env.DASHBOARD_CACHE?.delete?.(hotCacheKey),
     ]);
     return {
@@ -15971,6 +16668,10 @@ async function prepareGitHubWebhookEvent(
     }
     const requiresFallback =
       (refresh.status !== "refreshed" || !refresh.exact) && !visibilityApplied;
+    await Promise.all([
+      invalidateRepoProjectCache(env, repo.fullName),
+      invalidateRepoDetailCaches(env, repo.fullName),
+    ]);
     return {
       reason: "webhook:repository",
       includeReleaseDataOnly: false,
@@ -15989,7 +16690,10 @@ async function prepareGitHubWebhookEvent(
   if (event === "release" && !releaseWebhookAffectsDashboard(payload)) {
     return null;
   }
-  await invalidateRepoProjectCache(env, repo.fullName);
+  await Promise.all([
+    invalidateRepoProjectCache(env, repo.fullName),
+    invalidateRepoDetailCaches(env, repo.fullName),
+  ]);
   return {
     reason: `webhook:${event}`,
     includeReleaseDataOnly: true,

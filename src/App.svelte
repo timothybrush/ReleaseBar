@@ -1947,7 +1947,7 @@
       const response = await fetchPayload(apiPath, bypassCache);
       const body = (await response.json().catch(() => null)) as
         | RepoDetailPayload
-        | { error?: string; cache?: { message?: string } }
+        | { error?: string; cache?: { state?: string; message?: string } }
         | null;
       return { response, body };
     };
@@ -1974,6 +1974,12 @@
       if (repoSummaryRange !== "release" && !repoActivity) {
         void loadRepoActivity();
       }
+      return;
+    }
+    if (response.status === 202 && body?.cache?.state === "warming") {
+      generatedLabel = "warming";
+      generatedDetail = body.cache.message ?? "Repository detail is warming.";
+      scheduleRepoDetailRefresh(attempt);
       return;
     }
     const message =

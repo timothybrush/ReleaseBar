@@ -69,7 +69,7 @@ Scheduler jobs use the same quota preference as normal dashboard builds:
 - shared `GITHUB_TOKEN` when configured
 - anonymous GitHub API as the last fallback
 
-This means popular or installed accounts can refresh without burning the shared quota. Mixed-source dashboards use app quota only when a matching source installation is available.
+This means popular or installed accounts can refresh without burning the shared quota. Mixed-source dashboards partition owner and repository work across each covered source account's App installation, with the shared token used only for uncovered sources.
 
 ## Admin And Audit
 
@@ -102,7 +102,7 @@ Push and release deliveries eagerly invalidate and refresh release-enabled dashb
 
 - Missing or invalid cached payloads are due immediately.
 - Partial dashboards are due until completed.
-- Shared quota cooldowns pause shared-token background refreshes until reset while app-token refreshes can continue.
+- Shared quota conservation defers nonessential repository enrichment below 2,000 remaining core or GraphQL requests. Critical cooldowns make cold shared-token repository detail cache-only below 1,000 remaining requests or after rate-limit responses, while App-token refreshes continue.
 - Queue delivery failures mark the job failed.
 - Request-triggered jobs are deduplicated against queued and running work for the same dashboard.
 - Queue messages carry a small immutable-target reference instead of profile settings, keeping messages below the Queue size limit even when filter lists are large.

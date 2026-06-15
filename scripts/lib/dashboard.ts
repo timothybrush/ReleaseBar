@@ -31,6 +31,15 @@ export type DashboardBuildOptions = {
   token?: string;
   quotaSource?: ApiQuota["source"];
   quotaAccount?: string | null;
+  ownerCredentials?: Record<
+    string,
+    {
+      token: string;
+      quotaSource: ApiQuota["source"];
+      quotaAccount: string | null;
+      fetch?: typeof fetch;
+    }
+  >;
   previousCountsUpdatedAt?: string | null;
   previousProjectCountsUpdatedAt?: Record<string, string>;
   previousReleasesUpdatedAt?: string | null;
@@ -1501,14 +1510,30 @@ export async function resolveOwnerType(
 
 export async function buildDashboard(options: DashboardBuildOptions): Promise<DashboardPayload> {
   const includeReleaseData = options.includeReleaseData ?? true;
-  const client = githubClient(
+  const defaultClient = githubClient(
     options.token,
     options.fetch,
     options.quotaSource,
     options.quotaAccount ?? null,
   );
+  const ownerClients = new Map<string, GitHubClient>();
+  const clientForOwner = (owner: string): GitHubClient => {
+    const login = slugOwner(owner);
+    const existing = ownerClients.get(login);
+    if (existing) return existing;
+    const credential = options.ownerCredentials?.[login];
+    const client = credential
+      ? githubClient(
+          credential.token,
+          credential.fetch ?? options.fetch,
+          credential.quotaSource,
+          credential.quotaAccount,
+        )
+      : defaultClient;
+    ownerClients.set(login, client);
+    return client;
+  };
   const projects: Project[] = [...(options.initialProjects ?? [])];
-  const effectiveQuotaSource = client.quota.source;
   const ownerPageSize = Math.max(1, Math.min(100, Math.trunc(options.ownerPageSize ?? 100)));
   let capped = false;
   let scanIncomplete = false;
@@ -1577,6 +1602,38 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
           done: state !== "partial" && !scanIncomplete,
         }
       : undefined;
+    const usedQuotas = [...new Set(ownerClients.values())].map((client) => client.quota);
+    const quota =
+      usedQuotas.length === 0
+        ? defaultClient.quota
+        : usedQuotas.every((item) => item.source === "app")
+          ? {
+              source: "app" as const,
+              account:
+                new Set(usedQuotas.map((item) => item.account).filter(Boolean)).size === 1
+                  ? (usedQuotas.find((item) => item.account)?.account ?? null)
+                  : null,
+              remaining:
+                usedQuotas
+                  .map((item) => item.remaining)
+                  .filter((value): value is number => value !== null)
+                  .sort((left, right) => left - right)[0] ?? null,
+              limit:
+                usedQuotas
+                  .map((item) => item.limit)
+                  .filter((value): value is number => value !== null)
+                  .sort((left, right) => left - right)[0] ?? null,
+              resetAt:
+                usedQuotas
+                  .map((item) => item.resetAt)
+                  .filter((value): value is string => value !== null)
+                  .sort()[0] ?? null,
+              resource:
+                new Set(usedQuotas.map((item) => item.resource).filter(Boolean)).size === 1
+                  ? (usedQuotas.find((item) => item.resource)?.resource ?? null)
+                  : null,
+            }
+          : defaultClient.quota;
     return {
       title: options.title,
       subtitle: options.subtitle,
@@ -1609,7 +1666,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
             ? completedHydrationAt(options.previousCiUpdatedAt)
             : (options.previousCiUpdatedAt ?? null)
           : null,
-        quota: client.quota,
+        quota,
         ...(progress ? { progress } : {}),
         ...(!includeReleaseData
           ? {
@@ -1643,7 +1700,12 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
     return payload("fresh");
   }
 
-  async function addRepo(repo: GitHubRepo, countLabel: string, force = false): Promise<boolean> {
+  async function addRepo(
+    repo: GitHubRepo,
+    countLabel: string,
+    force = false,
+    client = clientForOwner(repo.owner.login),
+  ): Promise<boolean> {
     const existingIndex = projects.findIndex(
       (project) => project.fullName.toLowerCase() === repo.full_name.toLowerCase(),
     );
@@ -1703,6 +1765,8 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
 
   if (options.repoLimit) {
     for (const owner of options.owners) {
+      const client = clientForOwner(owner.login);
+      const effectiveQuotaSource = client.quota.source;
       const ownerExisting = projects.filter(
         (project) => project.owner.toLowerCase() === owner.login.toLowerCase(),
       ).length;
@@ -2098,6 +2162,7 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
   } else {
     const repos: GitHubRepo[] = [];
     for (const owner of options.owners) {
+      const client = clientForOwner(owner.login);
       beginCountQuery();
       const ownerResult = await ownerRepos(client, owner, includeReleaseData);
       observeCounts(ownerResult);
@@ -2111,11 +2176,17 @@ export async function buildDashboard(options: DashboardBuildOptions): Promise<Da
     ];
 
     for (const [index, repo] of uniqueRepos.entries()) {
-      await addRepo(repo, `${index + 1}/${uniqueRepos.length}`);
+      await addRepo(
+        repo,
+        `${index + 1}/${uniqueRepos.length}`,
+        false,
+        clientForOwner(repo.owner.login),
+      );
     }
   }
 
   for (const fullName of options.includeRepos ?? []) {
+    const client = clientForOwner(fullName.split("/")[0] ?? "");
     beginCountQuery();
     let repo = await repoByFullName(client, fullName);
     if (repo && !includeReleaseData && options.includeUnreleased) {

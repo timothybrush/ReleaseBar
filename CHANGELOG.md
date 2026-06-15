@@ -2,6 +2,7 @@
 
 ## 0.2.1 - Unreleased
 
+- Reduced shared GitHub quota pressure by partitioning mixed-owner dashboards across per-account GitHub App tokens, bundling App-backed repository core data into GraphQL, revalidating stale REST caches with ETags, coalescing concurrent detail builds, extending webhook-invalidated caches, and deferring nonessential enrichment before the shared bucket becomes critical.
 - Updated CI and local tooling to Node.js 24 LTS and refreshed the Worker compatibility date.
 - Hid contributor-fork activity when the upstream repository belongs to the activity profile, while preserving unrelated external project work.
 - Kept scheduler and admin scans within Workers KV operation limits by rotating bounded current-schema target pages, and reduced authenticated repository work-trend requests from four REST searches to one GraphQL query.

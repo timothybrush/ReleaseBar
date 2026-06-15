@@ -243,6 +243,7 @@ const repoScanBatchSize = 12;
 const hotLimit = 50;
 const hotOwnerLimit = 3;
 const hotSourceLimit = 24;
+const hotReadConcurrency = 8;
 const hotIndexLimit = 100;
 const hotCacheTtlMs = 5 * 60 * 1000;
 const localBuildLocks = new Map<string, StoredBuildLock>();
@@ -7897,13 +7898,13 @@ async function partialDashboardPayload(
 
 async function readCachedDashboards(env: Env): Promise<DashboardPayload[]> {
   if (!env.DASHBOARD_CACHE) return [];
+  const cache = env.DASHBOARD_CACHE;
 
-  const dashboards: DashboardPayload[] = [];
   let keys = await readHotIndex(env);
-  if (keys.length < hotSourceLimit && env.DASHBOARD_CACHE.list) {
+  if (keys.length < hotSourceLimit && cache.list) {
     for (const prefix of dashboardCachePrefixes) {
       if (keys.length >= hotSourceLimit) break;
-      const page = await env.DASHBOARD_CACHE.list({
+      const page = await cache.list({
         prefix,
         limit: hotSourceLimit,
       });
@@ -7911,23 +7912,27 @@ async function readCachedDashboards(env: Env): Promise<DashboardPayload[]> {
     }
   }
 
-  for (const key of keys.slice(0, hotSourceLimit)) {
-    const raw = await env.DASHBOARD_CACHE.get(key);
-    if (!raw) continue;
-    const rawPayload = tryJsonParse<DashboardPayload>(raw, `dashboard ${key}`);
-    if (!canDisplayCached(rawPayload)) continue;
-    const payload = await mergeOwnerMetadata(env, rawPayload);
-    if (
-      payload.cache?.state === "error" ||
-      payload.options?.includeForks ||
-      payload.projects.length === 0
-    ) {
-      continue;
-    }
-    dashboards.push(payload);
-  }
+  const dashboards = await mapConcurrent(
+    keys.slice(0, hotSourceLimit),
+    hotReadConcurrency,
+    async (key) => {
+      const raw = await cache.get(key);
+      if (!raw) return null;
+      const rawPayload = tryJsonParse<DashboardPayload>(raw, `dashboard ${key}`);
+      if (!canDisplayCached(rawPayload)) return null;
+      const payload = await mergeOwnerMetadata(env, rawPayload);
+      if (
+        payload.cache?.state === "error" ||
+        payload.options?.includeForks ||
+        payload.projects.length === 0
+      ) {
+        return null;
+      }
+      return payload;
+    },
+  );
 
-  return dashboards;
+  return dashboards.filter((payload): payload is DashboardPayload => payload !== null);
 }
 
 async function readHotIndex(env: Env): Promise<string[]> {
@@ -8013,15 +8018,33 @@ function hotDashboardPayload(
   };
 }
 
-async function hotResponse(env: Env): Promise<Response> {
+async function refreshHotCache(env: Env): Promise<DashboardPayload | null> {
+  const lock = await acquireBuildLock(env, `${hotCacheKey}:refresh`);
+  if (!lock) return null;
+  try {
+    const payload = hotDashboardPayload(await readCachedDashboards(env), env);
+    await writeCached(env, hotCacheKey, payload);
+    return payload;
+  } finally {
+    await lock.release();
+  }
+}
+
+async function hotResponse(env: Env, context: ExecutionContext): Promise<Response> {
   const cached = await readCachedWithOwnerMetadata(env, hotCacheKey);
   const ageMs = cacheAgeMs(cached);
   if (cached && canDisplayCached(cached) && ageMs < hotCacheTtlMs) {
     return jsonResponse(withCacheState(cached, "fresh"));
   }
+  if (cached && canDisplayCached(cached)) {
+    context.waitUntil(refreshHotCache(env).catch(() => null));
+    return jsonResponse(
+      withCacheState(cached, "stale", "showing cached Hot dashboard while it refreshes"),
+    );
+  }
 
-  const payload = hotDashboardPayload(await readCachedDashboards(env), env);
-  await writeCached(env, hotCacheKey, payload);
+  const payload =
+    (await refreshHotCache(env)) ?? hotDashboardPayload(await readCachedDashboards(env), env);
   return jsonResponse(payload);
 }
 
@@ -17398,7 +17421,7 @@ async function routeRequest(
     return authResponse(request, env, context);
   }
   if (url.pathname === "/api/_hot") {
-    return hotResponse(env);
+    return hotResponse(env, context);
   }
   if (url.pathname === "/api/_discover") {
     return discoverResponse(request, env, url, context);

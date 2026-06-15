@@ -1248,6 +1248,53 @@ test("worker builds root hot dashboard from cached dashboards", async () => {
   assert.match(cachedBody.cache?.message ?? "", /cached dashboards/);
 });
 
+test("worker serves stale hot dashboards while one background rebuild refreshes the cache", async () => {
+  const alphaKey = dashboardCacheKey({ owner: "alpha", includeUnreleased: true, schemaVersion: 6 });
+  const staleAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  const staleHot: DashboardPayload = {
+    ...testDashboard("stale", [
+      testProject({ owner: "stale", name: "cached", commitsSinceRelease: 5 }),
+    ]),
+    title: "ReleaseBar Hot",
+    generatedAt: staleAt,
+    owners: [],
+    cache: {
+      state: "fresh",
+      stale: false,
+      capped: false,
+      repoLimit: null,
+      generatedAt: staleAt,
+    },
+  };
+  const cache = kvStore({
+    "hot:v3": JSON.stringify(staleHot),
+    "hot:index:v3": JSON.stringify([alphaKey]),
+    [alphaKey]: JSON.stringify(
+      testDashboard("alpha", [
+        testProject({ owner: "alpha", name: "fresh", commitsSinceRelease: 50 }),
+      ]),
+    ),
+  });
+  const waits: Array<Promise<unknown>> = [];
+
+  const response = await worker.fetch(
+    new Request("https://release.bar/api/_hot"),
+    { DASHBOARD_CACHE: cache },
+    { waitUntil: (promise) => waits.push(promise) },
+  );
+  const body = (await response.json()) as DashboardPayload;
+
+  assert.equal(response.status, 200);
+  assert.equal(body.cache?.state, "stale");
+  assert.match(body.cache?.message ?? "", /while it refreshes/);
+  assert.equal(body.projects[0]?.fullName, "stale/cached");
+
+  await Promise.all(waits);
+  const refreshed = JSON.parse((await cache.get("hot:v3")) ?? "{}") as DashboardPayload;
+  assert.equal(refreshed.cache?.state, "fresh");
+  assert.equal(refreshed.projects[0]?.fullName, "alpha/fresh");
+});
+
 test("worker keeps hot owner route distinct from root hot API", async () => {
   const originalFetch = globalThis.fetch;
   const waits: Promise<unknown>[] = [];

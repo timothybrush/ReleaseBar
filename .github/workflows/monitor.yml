@@ -1,0 +1,67 @@
+name: Monitor
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monitor-release-bar
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: Production smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check release.bar
+        env:
+          MONITOR_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          curl_args=(
+            --fail
+            --silent
+            --show-error
+            --location
+            --retry 3
+            --retry-all-errors
+            --connect-timeout 10
+            --max-time 60
+          )
+
+          owner_html="$tmp_dir/owner.html"
+          curl "${curl_args[@]}" \
+            "https://release.bar/steipete?monitor=${MONITOR_NONCE}" \
+            --output "$owner_html"
+
+          live_js="$(grep -Eo '/assets/index-[^"]+\.js' "$owner_html" | head -n 1)"
+          live_css="$(grep -Eo '/assets/index-[^"]+\.css' "$owner_html" | head -n 1)"
+          test -n "$live_js"
+          test -n "$live_css"
+          curl "${curl_args[@]}" "https://release.bar${live_js}" --output /dev/null
+          curl "${curl_args[@]}" "https://release.bar${live_css}" --output /dev/null
+
+          curl "${curl_args[@]}" \
+            "https://release.bar/?monitor=${MONITOR_NONCE}" \
+            --output /dev/null
+          curl "${curl_args[@]}" \
+            "https://release.bar/openclaw/openclaw?monitor=${MONITOR_NONCE}" \
+            --output /dev/null
+
+          discover_json="$tmp_dir/discover.json"
+          curl "${curl_args[@]}" \
+            "https://release.bar/api/_discover?period=week&monitor=${MONITOR_NONCE}" \
+            --output "$discover_json"
+          node - "$discover_json" <<'NODE'
+          const { readFileSync } = require("node:fs");
+          const json = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          if (!Array.isArray(json.projects)) throw new Error("discover projects missing");
+          if (json.cache?.state === "error") throw new Error("discover cache is in error state");
+          NODE

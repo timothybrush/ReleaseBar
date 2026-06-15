@@ -126,4 +126,6 @@ wrangler deploy
 
 `wrangler.toml` binds `dist` as Worker static assets, `DASHBOARD_CACHE` as KV, and `DASHBOARD_LOCKS` as the Durable Object single-flight lock. The Worker runs first so `/api/*` stays dynamic and owner routes like `/openclaw` return the app shell with HTTP 200. Deploy CI smokes the root page, an owner page, a repository detail page, the discovery API, and live JS/CSS asset hashes after Wrangler deploys.
 
+`.github/workflows/monitor.yml` repeats the production route, discovery API, and live asset smoke checks every six hours without redeploying unchanged code.
+
 The deployed Worker service is still named `releasedeck-api` in Cloudflare for continuity. The canonical product, repo, package, and config names are ReleaseBar / `releasebar`.

@@ -3,8 +3,6 @@ name: Deploy
 on:
   push:
     branches: [main]
-  schedule:
-    - cron: "17 */6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -27,7 +25,8 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - run: npm run check:static
+      - name: Check static build
+        run: npm run check:static
       - name: Deploy Worker Assets
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

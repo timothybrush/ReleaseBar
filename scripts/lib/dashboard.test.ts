@@ -9600,6 +9600,125 @@ test("worker binds OAuth callbacks to the initiating browser", async () => {
   }
 });
 
+test("worker queues shared cache warming after login discovers an installation", async () => {
+  const profile = {
+    owner: "openclaw",
+    includeOwners: [],
+    includeRepos: ["outside/releasebar"],
+    hiddenOwners: [],
+    hiddenRepos: [],
+    updatedAt: "2026-06-15T09:00:00.000Z",
+    updatedBy: "openclaw",
+  };
+  const cacheKey = dashboardCacheKey({
+    owner: "openclaw",
+    owners: [],
+    repos: ["outside/releasebar"],
+    salt: profile.updatedAt,
+    includeForks: false,
+    includeArchived: false,
+    includeUnreleased: true,
+    includeReleaseData: false,
+    schemaVersion: 6,
+  });
+  const staleDashboard = testDashboard("openclaw", []);
+  const staleAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  staleDashboard.generatedAt = staleAt;
+  staleDashboard.cache!.generatedAt = staleAt;
+  const cache = kvStore({
+    "profile:v1:openclaw": JSON.stringify(profile),
+    [cacheKey]: JSON.stringify(staleDashboard),
+  });
+  const sentJobs: RefreshJob[] = [];
+  const waits: Promise<unknown>[] = [];
+  const env = {
+    AUTH_COOKIE_SECRET: "test-secret",
+    DASHBOARD_CACHE: cache,
+    GITHUB_APP_CLIENT_ID: "Iv123",
+    GITHUB_APP_CLIENT_SECRET: "client-secret",
+    GITHUB_APP_ID: "123",
+    GITHUB_APP_PRIVATE_KEY: "private-key",
+    REFRESH_QUEUE: {
+      async send(job: RefreshJob) {
+        sentJobs.push(job);
+      },
+    },
+  };
+  const context = { waitUntil: (promise: Promise<unknown>) => waits.push(promise) };
+  const login = await worker.fetch(
+    new Request("https://release.bar/api/auth/login?returnTo=/openclaw"),
+    env,
+    context,
+  );
+  const location = new URL(login.headers.get("location") ?? "");
+  const state = location.searchParams.get("state") ?? "";
+  const stateCookie = (login.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.hostname === "github.com" && url.pathname === "/login/oauth/access_token") {
+      return Response.json({ access_token: "user-token", token_type: "bearer", scope: "" });
+    }
+    if (url.hostname === "api.github.com" && url.pathname === "/user") {
+      return Response.json({
+        id: 2,
+        login: "openclaw",
+        name: "OpenClaw",
+        avatar_url: "https://avatars.githubusercontent.com/u/2",
+        html_url: "https://github.com/openclaw",
+      });
+    }
+    if (url.hostname === "api.github.com" && url.pathname === "/user/installations") {
+      return Response.json({
+        installations: [
+          {
+            id: 77,
+            account: {
+              login: "openclaw",
+              type: "Organization",
+              avatar_url: "https://avatars.githubusercontent.com/u/2",
+              html_url: "https://github.com/openclaw",
+            },
+            html_url: "https://github.com/organizations/openclaw/settings/installations/77",
+            repository_selection: "all",
+            target_type: "Organization",
+          },
+        ],
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  try {
+    const callback = await worker.fetch(
+      new Request(
+        `https://release.bar/api/auth/callback?code=code&state=${encodeURIComponent(state)}`,
+        { headers: { cookie: stateCookie } },
+      ),
+      env,
+      context,
+    );
+    await Promise.all(waits);
+    assert.equal(callback.status, 302);
+    assert.equal(callback.headers.get("location"), "/openclaw");
+    assert.equal(sentJobs.length, 1);
+    assert.equal(sentJobs[0]?.reason, "installation-warm");
+    assert.match(sentJobs[0]?.targetKey ?? "", /openclaw/);
+    const snapshot = JSON.parse(
+      (await cache.get(sentJobs[0]?.targetSnapshotKey ?? "")) ?? "{}",
+    ) as RefreshJob;
+    assert.deepEqual(snapshot.target?.owners, ["openclaw"]);
+    assert.deepEqual(snapshot.target?.repos, ["outside/releasebar"]);
+    assert.equal(snapshot.target?.includeReleaseData, false);
+    assert.equal(
+      snapshot.target?.profileSnapshotKey,
+      `refresh:profile-snapshot:v1:openclaw:${encodeURIComponent(profile.updatedAt)}`,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("worker remembers GitHub App installs without OAuth session", async () => {
   const { privateKey } = generateKeyPairSync("rsa", {
     modulusLength: 2048,
@@ -9612,12 +9731,19 @@ test("worker remembers GitHub App installs without OAuth session", async () => {
     nonce: "install-nonce",
   });
   const cache = kvStore();
+  const sentJobs: RefreshJob[] = [];
+  const waits: Promise<unknown>[] = [];
   const env = {
     AUTH_COOKIE_SECRET: "test-secret",
     DASHBOARD_CACHE: cache,
     GITHUB_APP_ID: "123",
     GITHUB_APP_PRIVATE_KEY: privateKey,
     GITHUB_APP_SLUG: "releasebar-app",
+    REFRESH_QUEUE: {
+      async send(job: RefreshJob) {
+        sentJobs.push(job);
+      },
+    },
   };
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input, init) => {
@@ -9646,14 +9772,18 @@ test("worker remembers GitHub App installs without OAuth session", async () => {
         headers: { cookie: `rd_install_return=${installReturn}` },
       }),
       env,
-      { waitUntil: () => undefined },
+      { waitUntil: (promise) => waits.push(promise) },
     );
+    await Promise.all(waits);
     assert.equal(install.status, 302);
     assert.equal(install.headers.get("location"), "/openclaw");
     const remembered = JSON.parse((await cache.get("auth:installation:v1:openclaw")) ?? "{}");
     assert.equal(remembered.id, 77);
     assert.equal(remembered.accountLogin, "openclaw");
     assert.equal(remembered.repositorySelection, "all");
+    assert.equal(sentJobs.length, 1);
+    assert.equal(sentJobs[0]?.reason, "installation-warm");
+    assert.match(sentJobs[0]?.targetKey ?? "", /openclaw/);
   } finally {
     globalThis.fetch = originalFetch;
   }

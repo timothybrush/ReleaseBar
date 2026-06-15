@@ -903,6 +903,55 @@ function normalizedInstallation(installation: AuthInstallation): StoredInstallat
   };
 }
 
+async function installationRefreshTargetInput(
+  env: Env,
+  accountLogin: string,
+): Promise<
+  | (Pick<
+      RefreshTarget,
+      "key" | "owner" | "owners" | "repos" | "includeReleaseData" | "path" | "priority"
+    > & { profile: DashboardProfile | null })
+  | null
+> {
+  const account = slugOwner(accountLogin);
+  if (!validOwnerSlug(account)) return null;
+  const profile = await readProfile(env, account);
+  const hiddenOwners = new Set(profile?.hiddenOwners ?? []);
+  const hiddenRepos = new Set(profile?.hiddenRepos ?? []);
+  const extraOwners = uniqueSorted(profile?.includeOwners ?? []).filter(
+    (owner) => owner !== account && !hiddenOwners.has(owner),
+  );
+  const repos = uniqueSorted(profile?.includeRepos ?? []).filter(
+    (repo) => !hiddenOwners.has(repo.split("/")[0] ?? "") && !hiddenRepos.has(repo),
+  );
+  if (extraOwners.length + repos.length > maxCustomSources) return null;
+  const owners = hiddenOwners.has(account) ? extraOwners : [account, ...extraOwners];
+  const registryCovered = await sourceInstallationRegistryCovers(env, { owners, repos }).catch(
+    () => false,
+  );
+  const includeReleaseData = !appTokenConfigured(env) || registryCovered;
+  return {
+    key: dashboardCacheKey({
+      owner: account,
+      owners: extraOwners,
+      repos,
+      salt: profile?.updatedAt,
+      includeForks: false,
+      includeArchived: false,
+      includeUnreleased: true,
+      includeReleaseData,
+      schemaVersion: dashboardSchemaVersion,
+    }),
+    owner: account,
+    owners,
+    repos,
+    profile,
+    includeReleaseData,
+    path: `/${account}`,
+    priority: 80,
+  };
+}
+
 async function writeInstallationRegistry(
   env: Env,
   installations: AuthInstallation[],
@@ -921,24 +970,71 @@ async function writeInstallationRegistry(
   await Promise.all(
     normalized
       .filter((installation) => installation.repositorySelection === "all")
-      .map((installation) =>
-        rememberRefreshTarget(env, {
-          key: dashboardCacheKey({
-            owner: installation.accountLogin,
-            includeForks: false,
-            includeArchived: false,
-            includeUnreleased: true,
-            includeReleaseData: true,
-            schemaVersion: dashboardSchemaVersion,
-          }),
-          owner: installation.accountLogin,
-          owners: [installation.accountLogin],
-          repos: [],
-          includeReleaseData: true,
-          path: `/${installation.accountLogin}`,
-          priority: 80,
-        }),
-      ),
+      .map(async (installation) => {
+        const input = await installationRefreshTargetInput(env, installation.accountLogin);
+        return input ? rememberRefreshTarget(env, input) : null;
+      }),
+  );
+}
+
+async function warmInstallationCaches(
+  env: Env,
+  context: ExecutionContext,
+  installations: AuthInstallation[],
+): Promise<void> {
+  const accounts = [
+    ...new Set(
+      installations
+        .filter((installation) => installation.repositorySelection === "all")
+        .map((installation) => slugOwner(installation.accountLogin))
+        .filter(validOwnerSlug),
+    ),
+  ];
+  await Promise.all(
+    accounts.map(async (account) => {
+      const input = await installationRefreshTargetInput(env, account);
+      if (!input) return;
+      const target = await rememberRefreshTarget(env, input);
+      if (!target) return;
+      const cached = await readCached(env, target.key);
+      if (!installationCacheNeedsWarm(target, cached)) return;
+      await enqueueRefreshJob(env, context, target, "installation-warm", 0);
+    }),
+  );
+}
+
+function installationCacheNeedsWarm(
+  target: RefreshTarget,
+  cached: DashboardPayload | null,
+  now = Date.now(),
+): boolean {
+  if (refreshTargetBackoffActive(target, now)) return false;
+  if (target.failureCount > 0 && now < safeIso(target.nextDueAt)) return false;
+  if (!cached || !canDisplayCached(cached)) return true;
+  if (
+    cached.cache?.state === "error" ||
+    cached.cache?.state === "stale" ||
+    cached.cache?.progress?.done === false
+  ) {
+    return true;
+  }
+  return cacheAgeMs(cached) >= fullTtlMs || now >= safeIso(target.nextDueAt);
+}
+
+function scheduleInstallationCacheWarm(
+  env: Env,
+  context: ExecutionContext,
+  installations: AuthInstallation[],
+): void {
+  if (!env.DASHBOARD_CACHE || installations.length === 0) return;
+  context.waitUntil(
+    warmInstallationCaches(env, context, installations).catch((error) =>
+      auditSyncEvent(env, {
+        event: "installation_warm_failed",
+        status: "failed",
+        reason: errorMessage(error),
+      }),
+    ),
   );
 }
 
@@ -3717,7 +3813,11 @@ async function storedSessionCookie(env: Env, session: StoredAuthSession): Promis
   return authCookie(token);
 }
 
-async function callbackResponse(request: Request, env: Env): Promise<Response> {
+async function callbackResponse(
+  request: Request,
+  env: Env,
+  context: ExecutionContext,
+): Promise<Response> {
   if (!authConfigured(env) || !env.AUTH_COOKIE_SECRET) {
     return jsonResponse({ error: "GitHub login is not configured" }, 503, {
       "cache-control": "no-store",
@@ -3778,6 +3878,7 @@ async function callbackResponse(request: Request, env: Env): Promise<Response> {
       status: installations.length > 0 ? "installed" : "no_install",
       detail: `installations=${installations.length}`,
     });
+    scheduleInstallationCacheWarm(env, context, installations);
     if (coverage.needed) {
       const installReturn = await signedJson(env.AUTH_COOKIE_SECRET, {
         returnTo: state.returnTo,
@@ -3829,7 +3930,11 @@ async function logoutResponse(request: Request, env: Env): Promise<Response> {
   });
 }
 
-async function installResponse(request: Request, env: Env): Promise<Response> {
+async function installResponse(
+  request: Request,
+  env: Env,
+  context: ExecutionContext,
+): Promise<Response> {
   const url = new URL(request.url);
   if (!env.AUTH_COOKIE_SECRET) {
     return redirectResponse(`https://github.com/apps/${appSlug(env)}/installations/new`);
@@ -3860,6 +3965,7 @@ async function installResponse(request: Request, env: Env): Promise<Response> {
     }
     if (appInstallation) {
       await writeInstallationRegistry(env, [appInstallation]);
+      scheduleInstallationCacheWarm(env, context, [appInstallation]);
       await recordAuthFunnelEvent(env, {
         event: "install_recorded",
         account: appInstallation.accountLogin,
@@ -3890,13 +3996,17 @@ async function installResponse(request: Request, env: Env): Promise<Response> {
   });
 }
 
-async function authResponse(request: Request, env: Env): Promise<Response> {
+async function authResponse(
+  request: Request,
+  env: Env,
+  context: ExecutionContext,
+): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname === "/api/auth/login") return loginResponse(request, env);
-  if (url.pathname === "/api/auth/callback") return callbackResponse(request, env);
+  if (url.pathname === "/api/auth/callback") return callbackResponse(request, env, context);
   if (url.pathname === "/api/auth/logout") return logoutResponse(request, env);
   if (url.pathname === "/api/auth/install") {
-    return installResponse(request, env);
+    return installResponse(request, env, context);
   }
   return jsonResponse({ error: "not found" }, 404);
 }
@@ -17285,7 +17395,7 @@ async function routeRequest(
     return profileResponse(request, env);
   }
   if (url.pathname.startsWith("/api/auth/")) {
-    return authResponse(request, env);
+    return authResponse(request, env, context);
   }
   if (url.pathname === "/api/_hot") {
     return hotResponse(env);

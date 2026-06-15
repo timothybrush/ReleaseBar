@@ -41,6 +41,7 @@ Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token
 - GitHub App installation gives ReleaseBar dedicated GitHub API quota for the selected account/repositories; public unsynced dashboards stay metadata-only and skip release hydration
 - repository audience backfill is GitHub App-only and warms bounded week/month stargazer trust caches for covered repositories
 - once an account installation is known, public refreshes for that account can use its app quota even for anonymous viewers; mixed-owner dashboards partition work across each source account's installation instead of forcing the whole dashboard onto shared quota
+- successful login or installation immediately queues a bounded public owner-dashboard warm for each all-repository installation when its shared cache is missing, stale, or incomplete
 - private repositories are ignored even when selected in GitHub App installation; ReleaseBar only stores and renders public repository metadata
 - the need-attention metric filters repos with unreleased commits, stale releases, failing/cancelled CI, or issue/PR pressure and rows show the reason inline
 - owner pages show bounded people trust or org signal profiles with GitHub age, reach, footprint, safety dimensions, weighted score factors, and recent repository evidence

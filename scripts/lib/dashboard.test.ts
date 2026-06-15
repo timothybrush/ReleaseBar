@@ -63,6 +63,22 @@ import worker, {
 } from "../../worker/index.js";
 
 const textEncoder = new TextEncoder();
+const systemDate = Date;
+const testClockStartedAt = systemDate.now();
+const testClockEpoch = systemDate.parse("2026-06-13T12:00:00Z");
+
+// Keep calendar-based cache fixtures stable while preserving real elapsed time.
+class TestDate extends systemDate {
+  constructor(value?: string | number) {
+    super(value === undefined ? TestDate.now() : value);
+  }
+
+  static override now(): number {
+    return testClockEpoch + systemDate.now() - testClockStartedAt;
+  }
+}
+
+globalThis.Date = TestDate as DateConstructor;
 
 async function socialRenderAsset(request: Request, paths?: string[]): Promise<Response> {
   const pathname = new URL(request.url).pathname;

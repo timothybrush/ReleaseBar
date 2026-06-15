@@ -1250,7 +1250,7 @@ test("worker builds root hot dashboard from cached dashboards", async () => {
 
 test("worker serves stale hot dashboards while one background rebuild refreshes the cache", async () => {
   const alphaKey = dashboardCacheKey({ owner: "alpha", includeUnreleased: true, schemaVersion: 6 });
-  const staleAt = new Date().toISOString();
+  const staleAt = new Date(Date.now() - 1000).toISOString();
   const staleHot: DashboardPayload = {
     ...testDashboard("stale", [
       testProject({ owner: "stale", name: "cached", commitsSinceRelease: 5 }),
@@ -1259,8 +1259,8 @@ test("worker serves stale hot dashboards while one background rebuild refreshes 
     generatedAt: staleAt,
     owners: [],
     cache: {
-      state: "stale",
-      stale: true,
+      state: "fresh",
+      stale: false,
       capped: false,
       repoLimit: null,
       generatedAt: staleAt,
@@ -1268,6 +1268,7 @@ test("worker serves stale hot dashboards while one background rebuild refreshes 
   };
   const cache = kvStore({
     "hot:v3": JSON.stringify(staleHot),
+    "hot:v3:invalidated-at": staleAt,
     "hot:index:v3": JSON.stringify([alphaKey]),
     [alphaKey]: JSON.stringify(
       testDashboard("alpha", [
@@ -21054,7 +21055,8 @@ test("push webhooks bypass terminal target backoff before invalidating caches", 
 
   assert.equal(await cache.get(key), null);
   const invalidatedHot = JSON.parse((await cache.get("hot:v3")) ?? "{}") as DashboardPayload;
-  assert.equal(invalidatedHot.cache?.state, "stale");
+  assert.equal(invalidatedHot.cache?.state, "fresh");
+  assert.ok(Date.parse((await cache.get("hot:v3:invalidated-at")) ?? "") > 0);
   assert.deepEqual(dashboardCacheAtEnqueue, [null]);
   assert.equal(
     queued.some(

@@ -286,6 +286,7 @@ const discoverCacheSchemaVersion = 4;
 const dashboardCachePrefix = `dashboard:v${dashboardSchemaVersion}:`;
 const dashboardCachePrefixes = [dashboardCachePrefix];
 const hotCacheKey = `hot:v${auxiliaryCacheSchemaVersion}`;
+const hotInvalidatedAtKey = `${hotCacheKey}:invalidated-at`;
 const hotIndexKey = `hot:index:v${auxiliaryCacheSchemaVersion}`;
 const socialRepoCachePrefix = `social-repo:v${auxiliaryCacheSchemaVersion}:`;
 const ownerCachePrefix = `owner:v1:`;
@@ -8031,27 +8032,29 @@ async function refreshHotCache(env: Env): Promise<DashboardPayload | null> {
 }
 
 async function markHotCacheStale(env: Env): Promise<void> {
-  const cached = await readCachedRaw(env, hotCacheKey);
-  if (!canDisplayCached(cached)) {
-    await env.DASHBOARD_CACHE?.delete?.(hotCacheKey);
-    return;
-  }
-  await writeCached(
-    env,
-    hotCacheKey,
-    withCacheState(cached, "stale", "Hot dashboard refresh pending"),
+  await env.DASHBOARD_CACHE?.put(hotInvalidatedAtKey, new Date().toISOString(), {
+    expirationTtl: dashboardStorageTtlSeconds,
+  });
+}
+
+async function hotInvalidatedAt(env: Env): Promise<number> {
+  return safeIso(await env.DASHBOARD_CACHE?.get(hotInvalidatedAtKey));
+}
+
+function hotCacheIsStale(payload: DashboardPayload, invalidatedAt: number): boolean {
+  return (
+    payload.cache?.state === "stale" ||
+    cacheAgeMs(payload) >= hotCacheTtlMs ||
+    invalidatedAt >= safeIso(payload.generatedAt)
   );
 }
 
 async function hotResponse(env: Env, context: ExecutionContext): Promise<Response> {
-  const cached = await readCachedWithOwnerMetadata(env, hotCacheKey);
-  const ageMs = cacheAgeMs(cached);
-  if (
-    cached &&
-    canDisplayCached(cached) &&
-    cached.cache?.state !== "stale" &&
-    ageMs < hotCacheTtlMs
-  ) {
+  const [cached, invalidatedAt] = await Promise.all([
+    readCachedWithOwnerMetadata(env, hotCacheKey),
+    hotInvalidatedAt(env),
+  ]);
+  if (cached && canDisplayCached(cached) && !hotCacheIsStale(cached, invalidatedAt)) {
     return jsonResponse(withCacheState(cached, "fresh"));
   }
   if (cached && canDisplayCached(cached)) {
@@ -8067,14 +8070,14 @@ async function hotResponse(env: Env, context: ExecutionContext): Promise<Respons
 }
 
 async function cachedHotInitialData(env: Env): Promise<InitialPageData | null> {
-  const cached = await readCachedWithOwnerMetadata(env, hotCacheKey);
+  const [cached, invalidatedAt] = await Promise.all([
+    readCachedWithOwnerMetadata(env, hotCacheKey),
+    hotInvalidatedAt(env),
+  ]);
   if (!cached || !canDisplayCached(cached) || cached.cache?.state === "error") return null;
   return {
     route: "dashboard",
-    payload: withCacheState(
-      cached,
-      cached.cache?.state !== "stale" && cacheAgeMs(cached) < hotCacheTtlMs ? "fresh" : "stale",
-    ),
+    payload: withCacheState(cached, hotCacheIsStale(cached, invalidatedAt) ? "stale" : "fresh"),
   };
 }
 

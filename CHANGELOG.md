@@ -2,6 +2,7 @@
 
 ## 0.2.1 - Unreleased
 
+- Split the Worker, frontend, dashboard library, styles, and tests into bounded domain modules and added a CI guard that keeps maintained files below 1,000 lines.
 - Served stale Hot dashboards immediately while a durable background refresh rebuilds them with bounded concurrent cache reads, and replaced deletion-prone webhook invalidation with timestamp markers to remove periodic multi-second stalls.
 - Warmed missing, stale, or incomplete public owner caches immediately after GitHub login or App installation so source-owned installation quota can benefit later anonymous viewers.
 - Prominently offers GitHub App installation whenever dashboard, repository, activity, trust, or audience requests hit GitHub rate limits, including for already signed-in users and cached quota failures.

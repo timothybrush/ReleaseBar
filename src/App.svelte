@@ -1,28 +1,43 @@
 <script lang="ts">
-  import { onDestroy, onMount, tick } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import CommandPalette, {
     defineActions,
     paletteStore,
-    type action as CommandAction,
     type storeParams as PaletteStoreParams,
   } from "svelte-command-palette";
-  import { DropdownMenu } from "bits-ui";
+  import AdminConsole from "./components/AdminConsole.svelte";
+  import AppHeader from "./components/AppHeader.svelte";
+  import DashboardControls from "./components/DashboardControls.svelte";
+  import OwnerActivityPage from "./components/OwnerActivityPage.svelte";
+  import OwnerOverview from "./components/OwnerOverview.svelte";
+  import ProjectTable from "./components/ProjectTable.svelte";
+  import RepoDetail from "./components/RepoDetail.svelte";
+  import {
+    dashboardOwner,
+    dashboardOwnerLabel,
+    githubOwnerAvatar,
+    githubProjectOwnerAvatar,
+    matchesDashboardProject,
+    numberFormat,
+  } from "./app-format.js";
+  import { buildCommands } from "./app-commands.js";
+  import {
+    createActivityController,
+    type ActivityControllerContext,
+  } from "./app-activity-controller.js";
+  import { createRouteController, type RouteState } from "./app-route-controller.js";
+  import { createAdminController, type AdminState } from "./app-admin-controller.js";
+  import {
+    createSettingsController,
+    type SettingsState,
+  } from "./app-settings-controller.js";
+  import type { AdminDashboardPayload } from "./app-types.js";
 
   import {
     defaultSortDirection,
-    devSortOptions,
-    filterLabel,
-    filterOptions,
     isDevSortKey,
     matchesFilter,
-    matchesProjectSearch,
-    attentionReasons,
-    needsAttention,
     parseViewState,
-    releaseDebtText,
-    showCodeChurn,
-    sortLabel,
-    sortOptions,
     sortProjects,
     viewStateSearch,
     type DashboardFilter,
@@ -32,36 +47,21 @@
   import {
     dashboardRoute,
     ownerActivityFromPath,
-    ownerActivityPath,
-    ownerDashboardPath,
-    repoDetailPath,
     repoFromPath,
-    validRepoSlug,
-    fallbackApiOrigin,
     type DiscoverPeriod,
   } from "./routing.js";
   import { isGitHubRateLimit } from "./rate-limit.js";
   import type {
-    ApiQuota,
     ActivityRange,
     AudienceRange,
-    AuthFunnelSummary,
     AuthPayload,
     DashboardPayload,
-    GitHubAccessSummary,
-    Owner,
     OwnerActivityPayload,
     Project,
-    RepoAudienceBackfillPayload,
     RepoAudiencePayload,
     RepoActivityRange,
     RepoDetailActivityPayload,
     RepoDetailPayload,
-    RepoDetailReleaseSummary,
-    RefreshJob,
-    RefreshTarget,
-    SchedulerAdminPayload,
-    SchedulerAuditEvent,
     TrustProfilePayload,
   } from "./types.js";
 
@@ -69,10 +69,6 @@
   const activityPageRoute = ownerActivityFromPath(location.pathname);
   const repoRoute = activityPageRoute ? null : repoFromPath(location.pathname);
   const initialRoute = dashboardRoute(location.pathname, location.search);
-  type AdminDashboardPayload = SchedulerAdminPayload & {
-    githubAccess: GitHubAccessSummary;
-    auth: AuthFunnelSummary;
-  };
   type InitialPageData =
     | { route: "dashboard"; payload: DashboardPayload }
     | { route: "repo"; payload: RepoDetailPayload };
@@ -131,12 +127,6 @@
   let generatedLabel = embedded ? "cached" : "loading";
   let generatedDetail = embedded ? "rendered from cached data" : "";
   let mounted = false;
-  let dashboardRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  let repoDetailRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  let activityRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  let repoActivityRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  let dashboardEventSource: EventSource | null = null;
-  let dashboardStreamTimingSent = false;
   let activityRange: ActivityRange = (() => {
     const value = new URLSearchParams(location.search).get("range");
     return value === "day" || value === "month" ? value : "week";
@@ -158,7 +148,6 @@
   let audienceError = "";
   let audienceBackfillLoading = false;
   let audienceBackfillMessage = "";
-  let audienceRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let ownerTab: "overview" | "trust" = initialOwnerTab;
   let admin: AdminDashboardPayload | null = null;
   let adminLoading = false;
@@ -167,27 +156,6 @@
   let manualRefreshLoading = false;
   let rateLimitHit = false;
 
-  const numberFormat = new Intl.NumberFormat("en", { notation: "compact" });
-
-  function countLabel(value: number | null): string {
-    return value === null ? "—" : numberFormat.format(value);
-  }
-
-  function openWorkCount(project: Project): number | null {
-    return project.openIssues === null || project.openPullRequests === null
-      ? null
-      : project.openIssues + project.openPullRequests;
-  }
-  const dateFormat = new Intl.DateTimeFormat("en", {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  });
-  const timeFormat = new Intl.DateTimeFormat("en", {
-    hour: "numeric",
-    minute: "2-digit",
-  });
-  const relativeFormat = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
   const discoverPeriods: Array<{ value: DiscoverPeriod; label: string }> = [
     { value: "day", label: "today" },
     { value: "week", label: "week" },
@@ -217,9 +185,9 @@
     : repoRoute
       ? (repoDetail?.fullName ?? repoRoute.fullName)
       : data
-        ? ownerLabel(data)
+        ? dashboardOwnerLabel(data, initialRoute)
         : initialRoute.label;
-  $: heroOwner = ownerHero(data);
+  $: heroOwner = dashboardOwner(data, initialRoute, Boolean(repoRoute));
   $: heroExtraCount = initialRoute.extraOwners.length + initialRoute.repos.length;
   $: subtitle = adminRoute
     ? "Scheduler, refresh jobs, and cache health."
@@ -246,7 +214,14 @@
   $: includeArchived = data?.options?.includeArchived === true;
   $: visibleProjects = data
     ? data.projects.filter((project) =>
-        matchesBase(project, query, language, hiddenOwners, hiddenRepos, includeArchived),
+        matchesDashboardProject(
+          project,
+          query,
+          language,
+          hiddenOwners,
+          hiddenRepos,
+          includeArchived,
+        ),
       )
     : [];
   $: filteredProjects = sortProjects(
@@ -270,7 +245,7 @@
         ...new Set(
           data.projects
             .filter((project) =>
-              matchesBase(project, "", "", hiddenOwners, hiddenRepos, includeArchived),
+              matchesDashboardProject(project, "", "", hiddenOwners, hiddenRepos, includeArchived),
             )
             .map((project) => project.language)
             .filter((language): language is string => Boolean(language)),
@@ -292,18 +267,42 @@
     auth?.user?.login.toLowerCase() === initialRoute.owner?.toLowerCase();
   $: commandActions = defineActions(
     buildCommands(
-      filteredProjects,
-      ownerToggles,
-      languageOptions,
-      paletteText,
-      hiddenOwners,
-      hiddenRepos,
-      auth,
-      devMode,
-      sortKey,
-      sortDirection,
-      filter,
-      settingsSummary,
+      {
+        projects: filteredProjects,
+        owners: ownerToggles,
+        languages: languageOptions,
+        language,
+        typedText: paletteText,
+        hiddenOwners,
+        hiddenRepos,
+        auth,
+        devMode,
+        sortKey,
+        sortDirection,
+        filter,
+        settingsSummary,
+        adminRoute,
+        discoverPeriods,
+      },
+      {
+        openOwner,
+        addSource,
+        discoverHref,
+        setSort,
+        setFilter,
+        setLanguage: setLanguageFilter,
+        openUrl,
+        toggleRepo,
+        toggleOwner,
+        setDevMode,
+        focusSearch,
+        copyDashboardUrl,
+        openSettings,
+        resetHidden,
+        primaryAuthAction,
+        installApp,
+        logout,
+      },
     ),
   );
   $: document.body.classList.toggle("dev-mode", devMode);
@@ -311,510 +310,16 @@
   $: activeDiscoverPeriod = initialRoute.discoverPeriod ?? "week";
   $: activeDiscoverLanguage = initialRoute.discoverLanguage;
   $: syncViewState(query, language, filter, sortKey, sortDirection, devMode);
-  $: detailMaxCommits = maxNumber(repoDetail?.commitActivity.map((week) => week.total) ?? []);
-  $: detailMaxContributorCommits = maxNumber(
-    repoDetail?.contributors.map((contributor) => contributor.commits) ?? [],
-  );
-  $: stableReleases = (repoDetail?.releases ?? [])
-    .filter((release) => !release.prerelease)
-    .slice(0, 3);
-  $: preReleases = (repoDetail?.releases ?? [])
-    .filter((release) => release.prerelease)
-    .slice(0, 3);
-  $: detailLanguageTotal = (repoDetail?.languages ?? []).reduce(
-    (sum, language) => sum + language.bytes,
-    0,
-  );
-  $: releaseCadence = cadenceSummary(repoDetail?.releases ?? []);
-  $: workTrend = repoDetail?.workTrend ?? null;
   $: showOwnerActivity =
     Boolean(activityPageRoute) ||
     (!repoRoute && !initialRoute.isDefault && Boolean(initialRoute.owner) && heroExtraCount === 0);
   $: showTrustProfile = showOwnerActivity && !activityPageRoute;
-  $: filteredAudienceUsers = audience ? audienceUsersMatching(audience, audienceQuery) : [];
-  $: activityMaxRepoEvents = maxNumber(activity?.repositories.map((repo) => repo.events) ?? []);
 
-  function ownerLabel(payload: DashboardPayload): string {
-    if (initialRoute.isDefault) {
-      return payload.title || "ReleaseBar Hot";
-    }
-    if (payload.owners.length > 0) {
-      const [first] = payload.owners;
-      const extraCount = initialRoute.extraOwners.length + initialRoute.repos.length;
-      return `${first ? `@${first.login}` : "custom"}${extraCount > 0 ? ` +${extraCount}` : ""}`;
-    }
-    if (initialRoute.repos.length === 1) {
-      return initialRoute.repos[0] ?? "custom deck";
-    }
-    return initialRoute.repos.length > 1
-      ? `custom deck +${initialRoute.repos.length}`
-      : initialRoute.label;
-  }
-
-  function ownerHero(payload: DashboardPayload | null): Owner | null {
-    if (repoRoute || initialRoute.isDefault || !initialRoute.owner) return null;
-    return payload?.owners[0] ?? { type: "user", login: initialRoute.owner };
-  }
-
-  function ownerAvatarUrl(owner: Owner): string {
-    return owner.avatarUrl ?? `https://github.com/${encodeURIComponent(owner.login)}.png?size=160`;
-  }
-
-  function projectOwnerAvatarUrl(project: Project): string {
-    const owner = data?.owners.find(
-      (owner) => owner.login.toLowerCase() === project.owner.toLowerCase(),
-    );
-    return owner?.avatarUrl ?? `https://github.com/${encodeURIComponent(project.owner)}.png?size=80`;
-  }
-
-  function daysAgo(value: string | null): number | null {
-    if (!value) return null;
-    return Math.round((Date.parse(value) - Date.now()) / 86400000);
-  }
-
-  function absoluteDate(value: string | null): string {
-    return value ? dateFormat.format(new Date(value)) : "no release";
-  }
-
-  function relativeDate(value: string | null): string {
-    const days = daysAgo(value);
-    if (days === null) return "never";
-    if (Math.abs(days) < 7) {
-      if (days === 0) return "today";
-      if (days < 0) return `${Math.abs(days)} ${Math.abs(days) === 1 ? "day" : "days"} ago`;
-      return `in ${days} ${days === 1 ? "day" : "days"}`;
-    }
-    if (Math.abs(days) < 45) return relativeFormat.format(days, "day");
-    const months = Math.round(days / 30);
-    if (Math.abs(months) < 18) return relativeFormat.format(months, "month");
-    return relativeFormat.format(Math.round(months / 12), "year");
-  }
-
-  function relativeReset(value: string): string {
-    const time = Date.parse(value);
-    if (Number.isNaN(time)) return "";
-    const diffMs = time - Date.now();
-    if (Math.abs(diffMs) < 90 * 60 * 1000) {
-      return relativeFormat.format(Math.round(diffMs / 60000), "minute");
-    }
-    if (Math.abs(diffMs) < 36 * 60 * 60 * 1000) {
-      return `${relativeFormat.format(Math.round(diffMs / 3600000), "hour")} at ${timeFormat.format(new Date(time))}`;
-    }
-    return `${absoluteDate(value)} at ${timeFormat.format(new Date(time))}`;
-  }
-
-  function maxNumber(values: number[]): number {
-    return values.reduce((max, value) => Math.max(max, value), 0);
-  }
-
-  function percent(value: number, max: number): number {
-    if (value <= 0) return 0;
-    return max <= 0 ? 0 : Math.max(4, Math.round((value / max) * 100));
-  }
-
-  function percentOfTotal(value: number, total: number): number {
-    return total <= 0 ? 0 : Math.round((value / total) * 100);
-  }
-
-  function nowMs(): number {
-    return typeof performance === "undefined" ? Date.now() : performance.now();
-  }
-
-  function roundedMs(value: number | null | undefined): number | undefined {
-    return typeof value === "number" && Number.isFinite(value) && value >= 0
-      ? Math.round(value)
-      : undefined;
-  }
-
-  function navigationTiming(): Record<string, number> {
-    if (typeof performance === "undefined") return {};
-    const [entry] = performance.getEntriesByType("navigation") as PerformanceNavigationTiming[];
-    if (!entry) return {};
-    return {
-      ...(roundedMs(entry.responseStart - entry.startTime) !== undefined
-        ? { navigationTtfbMs: roundedMs(entry.responseStart - entry.startTime) as number }
-        : {}),
-      ...(roundedMs(entry.domInteractive - entry.startTime) !== undefined
-        ? { navigationInteractiveMs: roundedMs(entry.domInteractive - entry.startTime) as number }
-        : {}),
-    };
-  }
-
-  function dashboardTimingFields(payload: DashboardPayload): Record<string, string | number | boolean | null> {
-    return {
-      cacheState: payload.cache?.state ?? "ready",
-      projects: payload.projects.length,
-      scanned: payload.cache?.progress?.scanned ?? null,
-      limit: payload.cache?.progress?.limit ?? null,
-      done: payload.cache?.progress?.done ?? null,
-    };
-  }
-
-  function postClientTiming(fields: Record<string, string | number | boolean | null | undefined>): void {
-    const body = JSON.stringify({
-      route: activityPageRoute ? "activity" : repoRoute ? "repo" : "dashboard",
-      path: location.pathname,
-      ...fields,
-    });
-    const blob = new Blob([body], { type: "application/json" });
-    if (navigator.sendBeacon?.("/api/_client-timing", blob)) return;
-    void fetch("/api/_client-timing", {
-      method: "POST",
-      body,
-      headers: { "content-type": "application/json" },
-      cache: "no-store",
-      keepalive: true,
-    }).catch(() => undefined);
-  }
-
-  async function reportDashboardTiming(
-    payload: DashboardPayload,
-    fields: Record<string, string | number | boolean | null | undefined>,
-  ): Promise<void> {
-    const renderStart = nowMs();
-    await tick();
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-    const renderMs = roundedMs(nowMs() - renderStart);
-    const baseTotalMs = typeof fields.totalMs === "number" ? fields.totalMs : undefined;
-    postClientTiming({
-      event: "dashboard",
-      ...dashboardTimingFields(payload),
-      ...navigationTiming(),
-      ...fields,
-      renderMs: fields.renderMs ?? renderMs,
-      totalMs:
-        baseTotalMs === undefined || renderMs === undefined
-          ? fields.totalMs
-          : roundedMs(baseTotalMs + renderMs),
-    });
-  }
-
-  function shortDate(value: string | null): string {
-    if (!value) return "never";
-    return dateFormat.format(new Date(value));
-  }
-
-  function commitTotal(): number {
-    return (repoDetail?.commitActivity ?? []).reduce((sum, week) => sum + week.total, 0);
-  }
-
-  function codeTotal(kind: "additions" | "deletions"): number {
-    return (repoDetail?.codeFrequency ?? []).reduce((sum, week) => sum + week[kind], 0);
-  }
-
-  function releaseSummaryMeta(summary: RepoDetailReleaseSummary): string {
-    const count =
-      summary.commitCount === null ? "" : `${numberFormat.format(summary.commitCount)} commits`;
-    const used =
-      summary.commitsUsed > 0 && summary.commitCount !== summary.commitsUsed
-        ? `${numberFormat.format(summary.commitsUsed)} summarized`
-        : "";
-    const model = summary.model ?? "";
-    return [count, used, model].filter(Boolean).join(" · ");
-  }
-
-  function repoActivityMeta(payload: RepoDetailActivityPayload): string {
-    const eventText = `${numberFormat.format(payload.totals.events)} public event${payload.totals.events === 1 ? "" : "s"}`;
-    const rangeText =
-      payload.range === "day"
-        ? "in the last day"
-        : payload.range === "week"
-          ? "in the last week"
-          : "in the last month";
-    return `${eventText} ${rangeText} · updated ${relativeDate(payload.generatedAt)}`;
-  }
-
-  function median(values: number[]): number | null {
-    const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
-    if (sorted.length === 0) return null;
-    const middle = Math.floor(sorted.length / 2);
-    return sorted.length % 2 === 0
-      ? Math.round(((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2)
-      : Math.round(sorted[middle] ?? 0);
-  }
-
-  function cadenceSummary(releases: RepoDetailPayload["releases"]): {
-    medianDays: number | null;
-    latestGapDays: number | null;
-    releaseCount: number;
-  } {
-    const dates = releases
-      .map((release) => (release.publishedAt ? Date.parse(release.publishedAt) : Number.NaN))
-      .filter(Number.isFinite)
-      .sort((a, b) => b - a);
-    const gaps = dates
-      .slice(0, -1)
-      .map((date, index) => Math.round((date - (dates[index + 1] ?? date)) / 86400000))
-      .filter((days) => days >= 0);
-    return {
-      medianDays: median(gaps),
-      latestGapDays: gaps[0] ?? null,
-      releaseCount: dates.length,
-    };
-  }
-
-  function formatDays(value: number | null): string {
-    if (value === null) return "n/a";
-    return `${numberFormat.format(value)}d`;
-  }
-
-  function detailValueStyle(value: string | number | null): string {
-    const length = String(value ?? "").length;
-    const size = length > 22 ? 24 : length > 16 ? 30 : length > 12 ? 34 : 42;
-    return `--detail-value-size: ${size}px; --detail-fit-size: ${size}px`;
-  }
-
-  function fitDetailValue(node: HTMLElement, _value: string | number | null) {
-    let frame = 0;
-    const minSize = 20;
-
-    function preferredSize(): number {
-      const parsed = Number.parseFloat(getComputedStyle(node).getPropertyValue("--detail-value-size"));
-      return Number.isFinite(parsed) ? parsed : 42;
-    }
-
-    function fit() {
-      cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => {
-        const preferred = preferredSize();
-        node.style.setProperty("--detail-fit-size", `${preferred}px`);
-        const rendered = Number.parseFloat(getComputedStyle(node).fontSize);
-        const base = Number.isFinite(rendered) ? rendered : preferred;
-        const available = node.clientWidth;
-        const needed = node.scrollWidth;
-        const next =
-          available > 0 && needed > available
-            ? Math.max(minSize, Math.floor(base * (available / needed) * 0.96))
-            : preferred;
-        node.style.setProperty("--detail-fit-size", `${next}px`);
-      });
-    }
-
-    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(fit);
-    observer?.observe(node);
-    fit();
-
-    return {
-      update(_next: string | number | null) {
-        fit();
-      },
-      destroy() {
-        cancelAnimationFrame(frame);
-        observer?.disconnect();
-      },
-    };
-  }
-
-  function attentionText(project: Project): string {
-    const reasons = attentionReasons(project).slice(0, 3);
-    return reasons.length > 0 ? reasons.join(" · ") : "looks okay";
-  }
-
-  function matchesBase(
-    project: Project,
-    searchQuery: string,
-    languageQuery: string,
-    hiddenOwnerSet: Set<string>,
-    hiddenRepoSet: Set<string>,
-    includeArchived: boolean,
-  ): boolean {
-    if (project.archived && !includeArchived) return false;
-    if (hiddenOwnerSet.has(project.owner.toLowerCase())) return false;
-    if (hiddenRepoSet.has(project.fullName.toLowerCase())) return false;
-    if (languageQuery && project.language?.toLowerCase() !== languageQuery.toLowerCase()) return false;
-    return matchesProjectSearch(project, searchQuery);
-  }
-
-  function persistVisibility(nextOwners = hiddenOwners, nextRepos = hiddenRepos): void {
-    localStorage.setItem(hiddenOwnersKey, JSON.stringify([...nextOwners]));
-    localStorage.setItem(hiddenReposKey, JSON.stringify([...nextRepos]));
-  }
-
-  function addSource(value: string): void {
-    const normalized = value.trim().replace(/^@/, "").toLowerCase();
-    if (!normalized) return;
-
-    const url = new URL(location.href);
-    const key = validRepoSlug(normalized) ? "repos" : "owners";
-    if (key === "owners" && !/^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?$/i.test(normalized)) {
-      return;
-    }
-
-    const values = [
-      ...new Set((url.searchParams.get(key) ?? "").split(",").filter(Boolean).concat(normalized)),
-    ].sort();
-    url.searchParams.set(key, values.join(","));
-    localStorage.setItem("releasedeck:custom-sources", url.search);
-    location.assign(url.toString());
-  }
-
-  function mergedProfileSources(): { includeOwners: string[]; includeRepos: string[] } {
-    const includeOwners = [
-      ...(publicProfile?.includeOwners ?? []),
-      ...initialRoute.extraOwners,
-    ].filter((owner) => !hiddenOwners.has(owner.toLowerCase()));
-    return {
-      includeOwners: [...new Set(includeOwners)].sort(),
-      includeRepos: [
-        ...new Set([...(publicProfile?.includeRepos ?? []), ...initialRoute.repos]),
-      ]
-        .filter((repo) => !hiddenRepos.has(repo.toLowerCase()))
-        .sort(),
-    };
-  }
-
-  function mergedHiddenOwners(): string[] {
-    return [...new Set([...(publicProfile?.hiddenOwners ?? []), ...hiddenOwners])].sort();
-  }
-
-  function mergedHiddenRepos(): string[] {
-    return [...new Set([...(publicProfile?.hiddenRepos ?? []), ...hiddenRepos])].sort();
-  }
-
-  async function savePublicDefault(): Promise<void> {
-    if (!initialRoute.owner || !canEditPublicDefault) return;
-    profileSaving = true;
-    profileMessage = "";
-    const { includeOwners, includeRepos } = mergedProfileSources();
-    try {
-      const response = await fetch(`/api/profile/${encodeURIComponent(initialRoute.owner)}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          includeOwners,
-          includeRepos,
-          hiddenOwners: mergedHiddenOwners(),
-          hiddenRepos: mergedHiddenRepos(),
-        }),
-      });
-      if (!response.ok) {
-        const body = (await response.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error ?? `save failed: ${response.status}`);
-      }
-      location.assign(`/${encodeURIComponent(initialRoute.owner)}?rdRefresh=${Date.now()}`);
-    } catch (error) {
-      profileMessage = error instanceof Error ? error.message : String(error);
-    } finally {
-      profileSaving = false;
-    }
-  }
-
-  async function resetPublicDefault(): Promise<void> {
-    if (!initialRoute.owner || !canEditPublicDefault) return;
-    profileSaving = true;
-    profileMessage = "";
-    try {
-      const response = await fetch(`/api/profile/${encodeURIComponent(initialRoute.owner)}`, {
-        method: "DELETE",
-      });
-      if (!response.ok) {
-        const body = (await response.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error ?? `reset failed: ${response.status}`);
-      }
-      location.assign(`/${encodeURIComponent(initialRoute.owner)}?rdRefresh=${Date.now()}`);
-    } catch (error) {
-      profileMessage = error instanceof Error ? error.message : String(error);
-    } finally {
-      profileSaving = false;
-    }
-  }
-
-  function openOwner(owner: string): void {
-    location.assign(ownerDashboardPath(owner));
-  }
-
-  function openSignedInUserDashboard(): void {
-    if (auth?.user) openOwner(auth.user.login);
-  }
-
-  function toggleSet(set: Set<string>, key: string, visible: boolean): Set<string> {
-    const next = new Set(set);
-    if (visible) {
-      next.delete(key);
-    } else {
-      next.add(key);
-    }
-    return next;
-  }
-
-  function toggleOwner(owner: string, visible: boolean): void {
-    hiddenOwners = toggleSet(hiddenOwners, owner, visible);
-    persistVisibility(hiddenOwners, hiddenRepos);
-  }
-
-  function toggleRepo(repo: string, visible: boolean): void {
-    hiddenRepos = toggleSet(hiddenRepos, repo.toLowerCase(), visible);
-    persistVisibility(hiddenOwners, hiddenRepos);
-  }
-
-  function resetHidden(): void {
-    hiddenOwners = new Set();
-    hiddenRepos = new Set();
-    persistVisibility(hiddenOwners, hiddenRepos);
-  }
-
-  function currentReturnTo(): string {
-    return `${location.pathname}${location.search}${location.hash}`;
-  }
-
-  function login(): void {
-    const loginUrl = new URL(auth?.loginUrl ?? "/api/auth/login", location.origin);
-    loginUrl.searchParams.set("returnTo", currentReturnTo());
-    location.assign(loginUrl.toString());
-  }
-
-  function installApp(): void {
-    const installUrl = new URL(auth?.installUrl ?? "/api/auth/install", location.origin);
-    installUrl.searchParams.set("returnTo", currentReturnTo());
-    location.assign(installUrl.toString());
-  }
-
-  function primaryAuthAction(): void {
-    if (!auth?.configured && !auth?.quotaConfigured) return;
-    if (adminRoute || !auth?.quotaConfigured) {
-      login();
-      return;
-    }
-    installApp();
-  }
+  const ownerAvatarUrl = githubOwnerAvatar;
+  const projectOwnerAvatarUrl = (project: Project): string =>
+    githubProjectOwnerAvatar(project, data);
 
   // Keep auth explicit so Svelte tracks async auth updates in template helper calls.
-  function primaryAuthLabel(authPayload: AuthPayload | null, short = false): string {
-    if (!authPayload?.configured && !authPayload?.quotaConfigured) {
-      return short ? "Login" : "Login Unavailable";
-    }
-    if (adminRoute || !authPayload.quotaConfigured) return short ? "Connect" : "Connect GitHub";
-    return short ? "Install" : "Install GitHub App";
-  }
-
-  function primaryAuthTitle(authPayload: AuthPayload | null): string {
-    if (!authPayload?.configured && !authPayload?.quotaConfigured) {
-      return "GitHub connection unavailable";
-    }
-    if (adminRoute || !authPayload.quotaConfigured) return "Connect GitHub";
-    return "Install GitHub App";
-  }
-
-  function logout(): void {
-    const logoutUrl = new URL(auth?.logoutUrl ?? "/api/auth/logout", location.origin);
-    logoutUrl.searchParams.set("returnTo", currentReturnTo());
-    location.assign(logoutUrl.toString());
-  }
-
-  function authStatus(authPayload: AuthPayload | null): string {
-    if (!authPayload?.configured) return "GitHub connection is not configured.";
-    if (authPayload.user) {
-      return (
-        authPayload.installReason ??
-        (authPayload.quotaConfigured
-          ? `${authPayload.installations.length === 0 ? "Signed in." : `Connected to ${numberFormat.format(authPayload.installations.length)} GitHub App installation${authPayload.installations.length === 1 ? "" : "s"}.`}`
-          : "Signed in. Dedicated app quota is not configured on this deployment.")
-      );
-    }
-    return authPayload.quotaConfigured
-      ? "Install the GitHub App for dedicated API quota. ReleaseBar only reads public metadata."
-      : "Connect GitHub to manage dashboard access.";
-  }
 
   function setSort(key: SortKey): void {
     if (isDevSortKey(key) && !devMode) {
@@ -828,13 +333,12 @@
     }
   }
 
-  function sortDirectionGlyph(direction: SortDirection): string {
-    return direction === "asc" ? "↑" : "↓";
+  function setFilter(value: DashboardFilter): void {
+    filter = value;
   }
 
-  function sortButtonLabel(key: SortKey): string {
-    const label = sortLabel(key);
-    return sortKey === key ? `Sort by ${label}, ${sortDirection === "asc" ? "ascending" : "descending"}` : `Sort by ${label}`;
+  function openSettings(): void {
+    settingsOpen = true;
   }
 
   function applyTheme(next: "dark" | "light"): void {
@@ -906,66 +410,6 @@
     history.replaceState(history.state, "", nextUrl);
   }
 
-  function ciLabel(project: Project): string {
-    if (project.ciState === "unknown") return "no ci";
-    if (project.ciState === "failure") return "fail";
-    return project.ciState;
-  }
-
-  function quotaLabel(quota: ApiQuota | undefined): string {
-    if (!quota) return "";
-    const source =
-      quota.source === "app"
-        ? `app quota${quota.account ? ` @${quota.account}` : ""}`
-        : quota.source === "shared"
-          ? "shared quota"
-          : "anonymous quota";
-    const remaining =
-      quota.remaining === null ? "" : `${numberFormat.format(quota.remaining)} left`;
-    const resetAt = quota.resetAt ? relativeReset(quota.resetAt) : "";
-    const reset = resetAt ? `reset ${resetAt}` : "";
-    return [source, remaining, reset].filter(Boolean).join(" · ");
-  }
-
-  function updateStatus(): void {
-    if (!data) return;
-    const cacheState = data.cache?.state;
-    const stale = data.cache?.stale && cacheState !== "stale" ? "stale" : "";
-    const capped = data.cache?.capped
-      ? `capped at ${numberFormat.format(data.cache.repoLimit ?? data.projects.length)}`
-      : "";
-    const quota = quotaLabel(data.cache?.quota);
-    const freshness = [
-      data.cache?.countsUpdatedAt
-        ? `counts ${relativeDate(data.cache.countsUpdatedAt)}`
-        : "",
-      data.cache?.releasesUpdatedAt
-        ? `releases ${relativeDate(data.cache.releasesUpdatedAt)}`
-        : "",
-      data.cache?.ciUpdatedAt ? `CI ${relativeDate(data.cache.ciUpdatedAt)}` : "",
-    ].filter(Boolean);
-    generatedLabel =
-      cacheState === "partial"
-        ? `updating · cached ${relativeDate(data.generatedAt)}`
-        : `updated ${relativeDate(data.generatedAt)}`;
-    generatedDetail = [cacheState, stale, capped, ...freshness, quota, data.cache?.message ?? ""]
-      .filter(Boolean)
-      .join(" · ");
-    noteGitHubRateLimit(null, data.cache?.message);
-  }
-
-  function updateRepoDetailStatus(): void {
-    if (!repoDetail) return;
-    const cacheState = repoDetail.cache.state;
-    const quota = quotaLabel(repoDetail.cache.quota);
-    generatedLabel =
-      cacheState === "warming"
-        ? `warming stats · cached ${relativeDate(repoDetail.generatedAt)}`
-        : `updated ${relativeDate(repoDetail.generatedAt)}`;
-    generatedDetail = [cacheState, quota, repoDetail.cache.message ?? ""].filter(Boolean).join(" · ");
-    noteGitHubRateLimit(null, repoDetail.cache.message);
-  }
-
   function noteGitHubRateLimit(
     status: number | null,
     ...messages: Array<string | null | undefined>
@@ -975,1080 +419,266 @@
     }
   }
 
-  async function fetchPayload(apiPath: string, bypassCache = false): Promise<Response> {
-    const response = !bypassCache
-      ? await fetch(apiPath)
-      : await fetch(`${apiPath}${apiPath.includes("?") ? "&" : "?"}v=${Date.now()}`, {
-          cache: "no-store",
-        });
-    noteGitHubRateLimit(response.status);
-    return response;
-  }
+  const activityControllerContext: ActivityControllerContext = {
+    initialRoute,
+    activityPageRoute,
+    repoRoute,
+    get showOwnerActivity() {
+      return showOwnerActivity;
+    },
+    get showTrustProfile() {
+      return showTrustProfile;
+    },
+    get activityRange() {
+      return activityRange;
+    },
+    set activityRange(value) {
+      activityRange = value;
+    },
+    get activity() {
+      return activity;
+    },
+    set activity(value) {
+      activity = value;
+    },
+    get activityLoading() {
+      return activityLoading;
+    },
+    set activityLoading(value) {
+      activityLoading = value;
+    },
+    get activityError() {
+      return activityError;
+    },
+    set activityError(value) {
+      activityError = value;
+    },
+    get repoSummaryRange() {
+      return repoSummaryRange;
+    },
+    set repoSummaryRange(value) {
+      repoSummaryRange = value;
+    },
+    get repoActivity() {
+      return repoActivity;
+    },
+    set repoActivity(value) {
+      repoActivity = value;
+    },
+    get repoActivityLoading() {
+      return repoActivityLoading;
+    },
+    set repoActivityLoading(value) {
+      repoActivityLoading = value;
+    },
+    get repoActivityError() {
+      return repoActivityError;
+    },
+    set repoActivityError(value) {
+      repoActivityError = value;
+    },
+    get trustProfile() {
+      return trustProfile;
+    },
+    set trustProfile(value) {
+      trustProfile = value;
+    },
+    get trustProfileLoading() {
+      return trustProfileLoading;
+    },
+    set trustProfileLoading(value) {
+      trustProfileLoading = value;
+    },
+    get trustProfileError() {
+      return trustProfileError;
+    },
+    set trustProfileError(value) {
+      trustProfileError = value;
+    },
+    get audienceRange() {
+      return audienceRange;
+    },
+    set audienceRange(value) {
+      audienceRange = value;
+    },
+    get audience() {
+      return audience;
+    },
+    set audience(value) {
+      audience = value;
+    },
+    get audienceLoading() {
+      return audienceLoading;
+    },
+    set audienceLoading(value) {
+      audienceLoading = value;
+    },
+    get audienceError() {
+      return audienceError;
+    },
+    set audienceError(value) {
+      audienceError = value;
+    },
+    get audienceBackfillLoading() {
+      return audienceBackfillLoading;
+    },
+    set audienceBackfillLoading(value) {
+      audienceBackfillLoading = value;
+    },
+    get audienceBackfillMessage() {
+      return audienceBackfillMessage;
+    },
+    set audienceBackfillMessage(value) {
+      audienceBackfillMessage = value;
+    },
+    get generatedLabel() {
+      return generatedLabel;
+    },
+    set generatedLabel(value) {
+      generatedLabel = value;
+    },
+    get generatedDetail() {
+      return generatedDetail;
+    },
+    set generatedDetail(value) {
+      generatedDetail = value;
+    },
+    noteGitHubRateLimit,
+  };
+  const activityController = createActivityController(activityControllerContext);
+  const {
+    loadOwnerActivity,
+    loadTrustProfile,
+    loadRepoAudience,
+    backfillRepoAudience,
+    setActivityRange,
+    setAudienceRange,
+    loadRepoActivity,
+    setRepoSummaryRange,
+  } = activityController;
 
-  function clearDashboardRefreshParam(): void {
-    const params = new URLSearchParams(location.search);
-    if (!params.has("rdRefresh")) return;
-    params.delete("rdRefresh");
-    const nextSearch = params.toString();
-    history.replaceState(
-      history.state,
-      "",
-      `${location.pathname}${nextSearch ? `?${nextSearch}` : ""}${location.hash}`,
-    );
-  }
-
-  async function readDashboardResponse(
-    response: Response,
-  ): Promise<DashboardPayload | { error?: string } | null> {
-    return (await response.json().catch(() => null)) as DashboardPayload | { error?: string } | null;
-  }
-
-  function shouldAutoRefresh(payload: DashboardPayload): boolean {
-    return (
-      payload.cache?.state === "rebuilding" ||
-      payload.cache?.state === "partial" ||
-      payload.cache?.state === "stale"
-    );
-  }
-
-  function scheduleDashboardRefresh(attempt: number): void {
-    if (dashboardRefreshTimer !== null) {
-      globalThis.clearTimeout(dashboardRefreshTimer);
-    }
-    if (attempt >= 60) return;
-    const delay = attempt < 24 ? 5000 : 15000;
-    dashboardRefreshTimer = globalThis.setTimeout(() => {
-      dashboardRefreshTimer = null;
-      if (document.hidden) {
-        scheduleDashboardRefresh(attempt);
-        return;
-      }
-      void loadDashboard(attempt + 1).catch(() => undefined);
-    }, delay);
-  }
-
-  function scheduleRepoDetailRefresh(attempt: number): void {
-    if (!repoRoute) return;
-    if (repoDetailRefreshTimer !== null) {
-      globalThis.clearTimeout(repoDetailRefreshTimer);
-    }
-    if (attempt >= 36) return;
-    const delay = attempt < 8 ? 5000 : 15000;
-    repoDetailRefreshTimer = globalThis.setTimeout(() => {
-      repoDetailRefreshTimer = null;
-      if (document.hidden) {
-        scheduleRepoDetailRefresh(attempt);
-        return;
-      }
-      void loadRepoDetail(attempt + 1).catch(() => undefined);
-    }, delay);
-  }
-
-  function scheduleActivityRefresh(attempt: number): void {
-    if (!showOwnerActivity) return;
-    if (activityRefreshTimer !== null) {
-      globalThis.clearTimeout(activityRefreshTimer);
-    }
-    if (attempt >= 8) return;
-    const delay = attempt < 3 ? 5000 : 15000;
-    activityRefreshTimer = globalThis.setTimeout(() => {
-      activityRefreshTimer = null;
-      if (document.hidden) {
-        scheduleActivityRefresh(attempt);
-        return;
-      }
-      void loadOwnerActivity(attempt + 1).catch(() => undefined);
-    }, delay);
-  }
-
-  function scheduleAudienceRefresh(attempt: number): void {
-    if (!repoRoute) return;
-    if (audienceRefreshTimer !== null) {
-      globalThis.clearTimeout(audienceRefreshTimer);
-    }
-    if (attempt >= 8) return;
-    const delay = attempt < 3 ? 5000 : 15000;
-    audienceRefreshTimer = globalThis.setTimeout(() => {
-      audienceRefreshTimer = null;
-      if (document.hidden) {
-        scheduleAudienceRefresh(attempt);
-        return;
-      }
-      void loadRepoAudience(attempt + 1).catch(() => undefined);
-    }, delay);
-  }
-
-  function scheduleRepoActivityRefresh(attempt: number): void {
-    if (!repoRoute || repoSummaryRange === "release") return;
-    if (repoActivityRefreshTimer !== null) {
-      globalThis.clearTimeout(repoActivityRefreshTimer);
-    }
-    if (attempt >= 8) return;
-    const delay = attempt < 3 ? 5000 : 15000;
-    repoActivityRefreshTimer = globalThis.setTimeout(() => {
-      repoActivityRefreshTimer = null;
-      if (document.hidden) {
-        scheduleRepoActivityRefresh(attempt);
-        return;
-      }
-      void loadRepoActivity(attempt + 1).catch(() => undefined);
-    }, delay);
-  }
-
-  function activityApiPaths(): string[] {
-    const owner = activityPageRoute?.owner ?? initialRoute.owner;
-    if (!owner) return [];
-    const path = `/api/${encodeURIComponent(owner)}/activity`;
-    const url = new URL(path, location.origin);
-    url.searchParams.set("range", activityRange);
-    const urls = [url.toString()];
-    if (activityPageRoute?.fallbackApiPath || initialRoute.fallbackApiPath) {
-      const fallback = new URL(path, fallbackApiOrigin());
-      fallback.searchParams.set("range", activityRange);
-      urls.push(fallback.toString());
-    }
-    return urls;
-  }
-
-  function trustProfileApiPaths(): string[] {
-    if (!initialRoute.owner) return [];
-    const path = `/api/users/${encodeURIComponent(initialRoute.owner)}/trust`;
-    const urls = [new URL(path, location.origin).toString()];
-    if (initialRoute.fallbackApiPath) {
-      urls.push(new URL(path, fallbackApiOrigin()).toString());
-    }
-    return urls;
-  }
-
-  function audienceApiPath(apiPath: string): string {
-    const url = new URL(apiPath, location.origin);
-    url.pathname = `${url.pathname.replace(/\/$/, "")}/audience`;
-    url.searchParams.set("range", audienceRange);
-    return url.toString();
-  }
-
-  function audienceApiPaths(): string[] {
-    if (!repoRoute) return [];
-    const urls = [audienceApiPath(repoRoute.apiPath)];
-    if (repoRoute.fallbackApiPath) {
-      urls.push(audienceApiPath(repoRoute.fallbackApiPath));
-    }
-    return urls;
-  }
-
-  function isRepoAudiencePayload(body: unknown): body is RepoAudiencePayload {
-    if (!body || typeof body !== "object") return false;
-    const payload = body as {
-      cache?: { state?: unknown };
-      fullName?: unknown;
-      users?: unknown;
-    };
-    return (
-      typeof payload.fullName === "string" &&
-      Array.isArray(payload.users) &&
-      typeof payload.cache?.state === "string"
-    );
-  }
-
-  function audienceBackfillApiPath(apiPath: string): string {
-    const url = new URL(apiPath, location.origin);
-    url.pathname = `${url.pathname.replace(/\/$/, "")}/audience/backfill`;
-    return url.toString();
-  }
-
-  function audienceBackfillApiPaths(): string[] {
-    if (!repoRoute) return [];
-    const urls = [audienceBackfillApiPath(repoRoute.apiPath)];
-    if (repoRoute.fallbackApiPath) {
-      urls.push(audienceBackfillApiPath(repoRoute.fallbackApiPath));
-    }
-    return urls;
-  }
-
-  function repoActivityApiPaths(): string[] {
-    if (!repoRoute || repoSummaryRange === "release") return [];
-    const appendActivity = (apiPath: string): string => {
-      const url = new URL(`${apiPath.replace(/\/$/, "")}/activity`, location.origin);
-      url.searchParams.set("range", repoSummaryRange);
-      return url.toString();
-    };
-    const urls = [appendActivity(repoRoute.apiPath)];
-    if (repoRoute.fallbackApiPath) {
-      const fallback = new URL(`${repoRoute.fallbackApiPath.replace(/\/$/, "")}/activity`, fallbackApiOrigin());
-      fallback.searchParams.set("range", repoSummaryRange);
-      urls.push(fallback.toString());
-    }
-    return urls;
-  }
-
-  async function loadOwnerActivity(attempt = 0): Promise<void> {
-    if (!showOwnerActivity) return;
-    const paths = activityApiPaths();
-    if (paths.length === 0) return;
-    const requestedRange = activityRange;
-    let lastError = "";
-    activityLoading = attempt === 0 && !activity;
-    activityError = "";
-    try {
-      for (const path of paths) {
-        const response = await fetch(path, {
-          cache: attempt > 0 ? "no-store" : "default",
-        });
-        const body = (await response.json().catch(() => null)) as
-          | OwnerActivityPayload
-          | { error?: string }
-          | null;
-        noteGitHubRateLimit(
-          response.status,
-          body && "error" in body ? body.error : undefined,
-          body && "events" in body ? body.cache.message : undefined,
-        );
-        if (body && "events" in body) {
-          if (requestedRange !== activityRange) return;
-          activity = body;
-          if (activityPageRoute) {
-            updateActivityStatus(body);
-          }
-          if (body.summary?.state === "warming" || body.cache.state === "stale") {
-            scheduleActivityRefresh(attempt);
-          }
-          return;
-        }
-        lastError =
-          body && "error" in body ? (body.error ?? "") : `activity fetch failed: ${response.status}`;
-      }
-      if (requestedRange !== activityRange) return;
-      activityError = lastError;
-      if (activityPageRoute && !activity) {
-        generatedLabel = "activity unavailable";
-        generatedDetail = lastError;
-      }
-    } catch (error) {
-      if (requestedRange !== activityRange) return;
-      activityError = error instanceof Error ? error.message : String(error);
-      if (activityPageRoute && !activity) {
-        generatedLabel = "activity unavailable";
-        generatedDetail = activityError;
-      }
-    } finally {
-      if (requestedRange === activityRange) {
-        activityLoading = false;
-      }
-    }
-  }
-
-  async function loadTrustProfile(): Promise<void> {
-    if (!showTrustProfile) return;
-    const paths = trustProfileApiPaths();
-    if (paths.length === 0) return;
-    trustProfileLoading = !trustProfile;
-    trustProfileError = "";
-    try {
-      for (const path of paths) {
-        const response = await fetch(path);
-        const body = (await response.json().catch(() => null)) as
-          | TrustProfilePayload
-          | { error?: string; cache?: { message?: string } }
-          | null;
-        noteGitHubRateLimit(
-          response.status,
-          body && "error" in body ? body.error : undefined,
-          body && "cache" in body ? body.cache?.message : undefined,
-        );
-        if (body && "score" in body) {
-          trustProfile = body;
-          trustProfileError = "";
-          return;
-        }
-        trustProfileError =
-          body && "error" in body
-            ? (body.error ?? "")
-            : body?.cache?.message || `trust profile failed: ${response.status}`;
-      }
-    } catch (error) {
-      trustProfileError = error instanceof Error ? error.message : String(error);
-    } finally {
-      trustProfileLoading = false;
-    }
-  }
-
-  async function loadRepoAudience(attempt = 0, bypassCache = false): Promise<void> {
-    if (!repoRoute) return;
-    const paths = audienceApiPaths();
-    if (paths.length === 0) return;
-    const requestedRange = audienceRange;
-    audienceLoading = attempt === 0 && !audience;
-    audienceError = "";
-    try {
-      for (const path of paths) {
-        const response = await fetchPayload(path, bypassCache || attempt > 0);
-        const body = (await response.json().catch(() => null)) as
-          | RepoAudiencePayload
-          | { error?: string; cache?: { message?: string } }
-          | null;
-        noteGitHubRateLimit(
-          response.status,
-          body && "error" in body ? body.error : undefined,
-          body && "cache" in body ? body.cache?.message : undefined,
-        );
-        if (isRepoAudiencePayload(body)) {
-          if (requestedRange !== audienceRange) return;
-          audience = body;
-          audienceError = "";
-          if (body.cache.state === "stale" || body.cache.state === "warming") {
-            scheduleAudienceRefresh(attempt);
-          }
-          return;
-        }
-        audienceError =
-          body && "error" in body
-            ? (body.error ?? "")
-            : body?.cache?.message || `audience fetch failed: ${response.status}`;
-      }
-    } catch (error) {
-      audienceError = error instanceof Error ? error.message : String(error);
-    } finally {
-      audienceLoading = false;
-    }
-  }
-
-  async function backfillRepoAudience(): Promise<void> {
-    if (!repoRoute || audienceBackfillLoading) return;
-    const paths = audienceBackfillApiPaths();
-    if (paths.length === 0) return;
-    audienceBackfillLoading = true;
-    audienceBackfillMessage = "";
-    try {
-      for (const path of paths) {
-        const response = await fetch(path, { method: "POST", cache: "no-store" });
-        const body = (await response.json().catch(() => null)) as
-          | RepoAudienceBackfillPayload
-          | { error?: string; message?: string }
-          | null;
-        noteGitHubRateLimit(
-          response.status,
-          body && "error" in body ? body.error : undefined,
-          body && "message" in body ? body.message : undefined,
-        );
-        if (body && "ranges" in body) {
-          audienceBackfillMessage = body.ranges
-            .map((range) => `${range.range} ${range.state}`)
-            .join(" · ");
-          audience = null;
-          await loadRepoAudience(0, true);
-          return;
-        }
-        audienceBackfillMessage =
-          body && "error" in body
-            ? (body.error ?? "")
-            : body?.message || `backfill failed: ${response.status}`;
-      }
-    } catch (error) {
-      audienceBackfillMessage = error instanceof Error ? error.message : String(error);
-    } finally {
-      audienceBackfillLoading = false;
-    }
-  }
-
-  function setActivityRange(range: ActivityRange): void {
-    if (activityRange === range) return;
-    activityRange = range;
-    activity = null;
-    activityError = "";
-    if (activityPageRoute) {
-      generatedLabel = "loading activity";
-      generatedDetail = `${range} range`;
-    }
-    if (activityRefreshTimer !== null) {
-      globalThis.clearTimeout(activityRefreshTimer);
-      activityRefreshTimer = null;
-    }
-    if (activityPageRoute) {
-      const url = new URL(location.href);
-      if (range === "week") {
-        url.searchParams.delete("range");
-      } else {
-        url.searchParams.set("range", range);
-      }
-      history.replaceState(history.state, "", `${url.pathname}${url.search}${url.hash}`);
-    }
-    void loadOwnerActivity();
-  }
-
-  function setAudienceRange(range: AudienceRange): void {
-    if (audienceRange === range) return;
-    audienceRange = range;
-    audience = null;
-    audienceError = "";
-    if (audienceRefreshTimer !== null) {
-      globalThis.clearTimeout(audienceRefreshTimer);
-      audienceRefreshTimer = null;
-    }
-    void loadRepoAudience();
-  }
-
-  async function loadRepoActivity(attempt = 0): Promise<void> {
-    if (!repoRoute || repoSummaryRange === "release") return;
-    const paths = repoActivityApiPaths();
-    if (paths.length === 0) return;
-    const requestedRange = repoSummaryRange;
-    repoActivityLoading = attempt === 0 && !repoActivity;
-    repoActivityError = "";
-    try {
-      for (const path of paths) {
-        const response = await fetch(path, {
-          cache: attempt > 0 ? "no-store" : "default",
-        });
-        const body = (await response.json().catch(() => null)) as
-          | RepoDetailActivityPayload
-          | { error?: string }
-          | null;
-        noteGitHubRateLimit(
-          response.status,
-          body && "error" in body ? body.error : undefined,
-          body && "events" in body ? body.cache.message : undefined,
-        );
-        if (body && "events" in body) {
-          if (requestedRange !== repoSummaryRange) return;
-          repoActivity = body;
-          if (body.summary?.state === "warming" || body.cache.state === "stale") {
-            scheduleRepoActivityRefresh(attempt);
-          }
-          return;
-        }
-        repoActivityError =
-          body && "error" in body
-            ? (body.error ?? "")
-            : `repository activity fetch failed: ${response.status}`;
-      }
-    } catch (error) {
-      repoActivityError = error instanceof Error ? error.message : String(error);
-    } finally {
-      repoActivityLoading = false;
-    }
-  }
-
-  function setRepoSummaryRange(range: RepoActivityRange): void {
-    if (repoSummaryRange === range) return;
-    repoSummaryRange = range;
-    repoActivity = null;
-    repoActivityError = "";
-    if (repoActivityRefreshTimer !== null) {
-      globalThis.clearTimeout(repoActivityRefreshTimer);
-      repoActivityRefreshTimer = null;
-    }
-    if (range !== "release") {
-      void loadRepoActivity();
-    }
-  }
-
-  function activityMeta(payload: OwnerActivityPayload): string {
-    const repoText = `${numberFormat.format(payload.totals.repositories)} repo${payload.totals.repositories === 1 ? "" : "s"}`;
-    const eventText = `${numberFormat.format(payload.totals.events)} public event${payload.totals.events === 1 ? "" : "s"}`;
-    return `${eventText} · ${repoText} · updated ${relativeDate(payload.generatedAt)}`;
-  }
-
-  function updateActivityStatus(payload: OwnerActivityPayload): void {
-    generatedLabel =
-      payload.cache.state === "stale"
-        ? `refreshing · cached ${relativeDate(payload.generatedAt)}`
-        : `updated ${relativeDate(payload.generatedAt)}`;
-    generatedDetail = [
-      payload.cache.state,
-      quotaLabel(payload.cache.quota),
-      payload.cache.message ?? "",
-    ]
-      .filter(Boolean)
-      .join(" · ");
-    noteGitHubRateLimit(null, payload.cache.message);
-  }
-
-  function activityPageHref(range: ActivityRange): string {
-    if (!activityPageRoute) return "#";
-    return ownerActivityPath(activityPageRoute.owner, range);
-  }
-
-  function activityRepositoryEvents(fullName: string): OwnerActivityPayload["events"] {
-    return (activity?.events ?? []).filter((event) => event.repo === fullName);
-  }
-
-  function activityRepositorySummary(fullName: string): string | null {
-    return (
-      activity?.summary?.repositories?.find(
-        (summary) => summary.fullName.toLowerCase() === fullName.toLowerCase(),
-      )?.text ?? null
-    );
-  }
-
-  function activityBreakdown(
-    repo: OwnerActivityPayload["repositories"][number],
-  ): Array<{ label: string; value: number }> {
-    return [
-      { label: "commits", value: repo.commits },
-      { label: "PRs", value: repo.pullRequests },
-      { label: "issues", value: repo.issues },
-      { label: "comments", value: repo.comments },
-      { label: "releases", value: repo.releases },
-    ].filter((item) => item.value > 0);
-  }
-
-  function activityKindLabel(kind: OwnerActivityPayload["events"][number]["kind"]): string {
-    if (kind === "pull_request") return "PR";
-    if (kind === "repository") return "repo";
-    return kind;
-  }
-
-  function audienceMeta(payload: RepoAudiencePayload): string {
-    const total = `${numberFormat.format(audienceTotalStargazers(payload))} total stargazers`;
-    const scored = `${numberFormat.format(payload.totals.stargazersSampled)} scored profiles`;
-    const high = `${audienceShare(payload, payload.totals.highSignal, payload.totals.highSignalPercent)} high-signal`;
-    const quota = quotaLabel(payload.cache.quota);
-    return [total, scored, high, payload.cache.state, quota, `updated ${relativeDate(payload.generatedAt)}`]
-      .filter(Boolean)
-      .join(" · ");
-  }
-
-  function audienceTotalStargazers(payload: RepoAudiencePayload): number {
-    return payload.totals.stargazers ?? payload.totals.stargazersSampled;
-  }
-
-  function audienceShare(payload: RepoAudiencePayload, count: number, percent: number): string {
-    const value = Number.isFinite(percent)
-      ? percent
-      : payload.totals.stargazersSampled > 0
-        ? Math.round((count / payload.totals.stargazersSampled) * 100)
-        : 0;
-    return `${numberFormat.format(value)}%`;
-  }
-
-  function audienceUsersMatching(
-    payload: RepoAudiencePayload,
-    text: string,
-  ): RepoAudiencePayload["users"] {
-    const needle = text.trim().toLowerCase();
-    if (!needle) return payload.users;
-    return payload.users.filter((user) =>
-      [
-        user.login,
-        user.name,
-        user.company,
-        user.bio,
-        user.location,
-        user.tier,
-        ...user.reasons,
-        ...(user.factors ?? []).map((factor) => `${factor.label} ${factor.detail}`),
-        ...user.orgs.map((org) => org.login),
-        ...user.topRepositories.map((repo) => repo.fullName),
-        ...user.topRepositories.map((repo) => repo.language),
-      ]
-        .filter(Boolean)
-        .some((value) => String(value).toLowerCase().includes(needle)),
-    );
-  }
-
-  function audienceReasonText(reasons: string[]): string {
-    return reasons.length > 0 ? reasons.slice(0, 3).join(" · ") : "public profile signal";
-  }
-
-  function trustProfileAge(payload: TrustProfilePayload): string {
-    if (payload.accountAgeDays === null) return "age unknown";
-    const years = payload.accountAgeDays / 365;
-    if (years >= 1) return `${years.toFixed(years >= 10 ? 0 : 1)} years on GitHub`;
-    return `${numberFormat.format(payload.accountAgeDays)} days on GitHub`;
-  }
-
-  function trustProfileMeta(payload: TrustProfilePayload): string {
-    const quota = quotaLabel(payload.cache.quota);
-    return [
-      trustProfileAge(payload),
-      `${numberFormat.format(payload.followers)} followers`,
-      `${numberFormat.format(payload.publicRepos)} repos`,
-      quota,
-      `updated ${relativeDate(payload.generatedAt)}`,
-    ]
-      .filter(Boolean)
-      .join(" · ");
-  }
-
-  function ownerSignalLabel(payload: TrustProfilePayload | null = trustProfile): string {
-    if (payload) return payload.scoreLabel;
-    return ownerHero(data)?.type === "org" ? "org signal" : "trust";
-  }
-
-  function ownerSignalDescription(payload: TrustProfilePayload | null = trustProfile): string {
-    return payload?.type === "org" || (!payload && ownerHero(data)?.type === "org")
-      ? "bounded public GitHub organization signals"
-      : "bounded public GitHub trust signals";
-  }
-
-  function ownerSignalTooltip(payload: TrustProfilePayload | null = trustProfile): string {
-    if (payload?.type === "org" || (!payload && ownerHero(data)?.type === "org")) {
-      return "0–100 bounded public GitHub organization signal from profile, repository footprint, reach, and account safety. Triage context only, not a personal trust score.";
-    }
-    return "0–100 bounded public GitHub signal from account age, profile completeness, public reach, builder history, organizations, and account safety. Triage context only, not identity proof.";
-  }
-
-  function personTrustScoreTooltip(score: number): string {
-    return `Trust score ${numberFormat.format(score)} — bounded public GitHub profile signal; triage context only.`;
-  }
-
-  function ownerSignalTabLabel(payload: TrustProfilePayload | null = trustProfile): string {
-    return payload?.type === "org" || (!payload && ownerHero(data)?.type === "org")
-      ? "org signal"
-      : "trust";
-  }
-
-  function trustDimensionEntries(payload: TrustProfilePayload): Array<[string, number]> {
-    if (payload.type === "org") {
-      return [
-        ["credibility", payload.dimensions.trust],
-        ["repo footprint", payload.dimensions.builder],
-        ["reach", payload.dimensions.influence],
-        ["profile safety", payload.dimensions.risk],
-      ];
-    }
-    return [
-      ["trust", payload.dimensions.trust],
-      ["build", payload.dimensions.builder],
-      ["reach", payload.dimensions.influence],
-      ["account safety", payload.dimensions.risk],
-    ];
-  }
-
-  function trustFactorEntries(payload: TrustProfilePayload): TrustProfilePayload["factors"] {
-    return (payload.factors ?? []).filter((factor) => factor.key !== "recency" || factor.value > 0).slice(0, 8);
-  }
-
-  function setOwnerTab(tab: "overview" | "trust"): void {
-    ownerTab = tab;
-    const url = new URL(location.href);
-    if (tab === "trust") {
-      url.searchParams.set("tab", "trust");
-    } else {
-      url.searchParams.delete("tab");
-    }
-    history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
-  }
-
-  function factorContribution(value: number): string {
-    if (value === 0) return "0.0";
-    return `${value > 0 ? "+" : ""}${value.toFixed(1)}`;
-  }
-
-  function audienceInsightText(user: RepoAudiencePayload["users"][number]): string {
-    const orgs = user.orgs.slice(0, 2).map((org) => `@${org.login}`).join(", ");
-    const topRepo = user.topRepositories[0];
-    return [
-      orgs ? `orgs ${orgs}` : "",
-      topRepo ? `top repo ${topRepo.fullName} · ${numberFormat.format(topRepo.stars)} stars` : "",
-    ]
-      .filter(Boolean)
-      .join(" · ");
-  }
-
-  function closeDashboardStream(): void {
-    dashboardEventSource?.close();
-    dashboardEventSource = null;
-  }
-
-  function dashboardEventsPath(apiPath: string): string | null {
-    const url = new URL(apiPath, location.origin);
-    if (url.pathname === "/api/_hot" || url.pathname === "/api/_discover") return null;
-    url.pathname = `${url.pathname.replace(/\/$/, "")}/events`;
-    return url.toString();
-  }
-
-  function startDashboardStream(attempt: number): boolean {
-    if (typeof EventSource === "undefined") return false;
-    const eventsPath = dashboardEventsPath(initialRoute.apiPath);
-    if (!eventsPath) return false;
-    closeDashboardStream();
-    const startedAt = nowMs();
-    dashboardStreamTimingSent = false;
-    dashboardEventSource = new EventSource(eventsPath);
-    dashboardEventSource.addEventListener("dashboard", (event) => {
-      const receivedAt = nowMs();
-      const next = JSON.parse((event as MessageEvent).data) as DashboardPayload;
-      data = next;
-      updateStatus();
-      if (!dashboardStreamTimingSent) {
-        dashboardStreamTimingSent = true;
-        void reportDashboardTiming(next, {
-          source: "stream",
-          attempt,
-          apiPath: new URL(eventsPath).pathname,
-          streamMs: roundedMs(receivedAt - startedAt),
-          totalMs: roundedMs(nowMs() - startedAt),
-        });
-      }
-      if (!shouldAutoRefresh(next)) {
-        closeDashboardStream();
-      }
-    });
-    dashboardEventSource.onerror = () => {
-      closeDashboardStream();
-      scheduleDashboardRefresh(attempt);
-    };
-    return true;
-  }
-
-  async function loadAuth(): Promise<void> {
-    try {
-      const url = new URL("/api/me", location.origin);
-      url.searchParams.set("returnTo", currentReturnTo());
-      const response = await fetch(url.toString(), { cache: "no-store" });
-      if (response.ok) {
-        auth = (await response.json()) as AuthPayload;
-      }
-    } catch {
-      auth = null;
-    }
-  }
-
-  function emptyGithubAccessSummary(): GitHubAccessSummary {
+  function routeState(): RouteState {
     return {
-      generatedAt: new Date().toISOString(),
-      hours: 24,
-      buckets: 0,
-      total: 0,
-      cooldown: {
-        active: false,
-        resource: null,
-        remaining: null,
-        limit: null,
-        resetAt: null,
-        reason: null,
-      },
-      byArea: [],
-      bySource: [],
-      byStatus: [],
-      topRoutes: [],
+      data,
+      repoDetail,
+      repoSummaryRange,
+      repoActivity,
+      generatedLabel,
+      generatedDetail,
+      errorMessage,
+      manualRefreshLoading,
     };
   }
 
-  function emptyAuthFunnelSummary(): AuthFunnelSummary {
+  function updateRouteState(patch: Partial<RouteState>): void {
+    if ("data" in patch) data = patch.data ?? null;
+    if ("repoDetail" in patch) repoDetail = patch.repoDetail ?? null;
+    if (patch.repoSummaryRange !== undefined) repoSummaryRange = patch.repoSummaryRange;
+    if ("repoActivity" in patch) repoActivity = patch.repoActivity ?? null;
+    if (patch.generatedLabel !== undefined) generatedLabel = patch.generatedLabel;
+    if (patch.generatedDetail !== undefined) generatedDetail = patch.generatedDetail;
+    if (patch.errorMessage !== undefined) errorMessage = patch.errorMessage;
+    if (patch.manualRefreshLoading !== undefined) {
+      manualRefreshLoading = patch.manualRefreshLoading;
+    }
+  }
+
+  const routeController = createRouteController({
+    initialRoute,
+    activityPageRoute,
+    repoRoute,
+    manualRefreshAvailable: () => manualRefreshAvailable,
+    getState: routeState,
+    update: updateRouteState,
+    noteGitHubRateLimit,
+    loadRepoActivity,
+  });
+  const {
+    updateStatus,
+    updateRepoDetailStatus,
+    reportDashboardTiming,
+    shouldAutoRefresh,
+    closeDashboardStream,
+    loadDashboard,
+    manualRefreshDashboard,
+    loadRepoDetail,
+  } = routeController;
+
+  function settingsState(): SettingsState {
     return {
-      generatedAt: new Date().toISOString(),
-      installationCount: 0,
-      installations: [],
-      events: [],
-      counterCount: 0,
-      counts: [],
+      auth,
+      hiddenOwners,
+      hiddenRepos,
+      publicProfile,
+      canEditPublicDefault,
+      profileSaving,
+      profileMessage,
     };
   }
 
-  async function loadAdminSection<T>(path: string): Promise<T | null> {
-    try {
-      const response = await fetch(path, { cache: "no-store" });
-      return response.ok ? ((await response.json()) as T) : null;
-    } catch {
-      return null;
-    }
+  function updateSettingsState(patch: Partial<SettingsState>): void {
+    if ("auth" in patch) auth = patch.auth ?? null;
+    if (patch.hiddenOwners !== undefined) hiddenOwners = patch.hiddenOwners;
+    if (patch.hiddenRepos !== undefined) hiddenRepos = patch.hiddenRepos;
+    if (patch.profileSaving !== undefined) profileSaving = patch.profileSaving;
+    if (patch.profileMessage !== undefined) profileMessage = patch.profileMessage;
   }
 
-  async function loadAdmin(): Promise<void> {
-    if (!adminRoute) return;
-    adminLoading = !admin;
-    adminError = "";
-    try {
-      const [response, accessSummary, authSummary] = await Promise.all([
-        fetch("/api/admin/scheduler", { cache: "no-store" }),
-        loadAdminSection<GitHubAccessSummary>("/api/admin/github-access"),
-        loadAdminSection<AuthFunnelSummary>("/api/admin/installations"),
-      ]);
-      const body = (await response.json().catch(() => null)) as
-        | SchedulerAdminPayload
-        | { error?: string }
-        | null;
-      if (response.ok && body && "status" in body) {
-        const unavailable = [
-          accessSummary ? "" : "GitHub access",
-          authSummary ? "" : "installation",
-        ].filter(Boolean);
-        admin = {
-          ...body,
-          githubAccess: accessSummary ?? admin?.githubAccess ?? emptyGithubAccessSummary(),
-          auth: authSummary ?? admin?.auth ?? emptyAuthFunnelSummary(),
-        };
-        generatedLabel = `scheduler · ${numberFormat.format(body.status.targets)} targets`;
-        generatedDetail = [
-          `${numberFormat.format(body.status.dueTargets)} due in ${numberFormat.format(body.status.scannedTargets)}-target scan`,
-          `${numberFormat.format(body.status.runningJobs)} running`,
-          body.status.queueConfigured ? "queue configured" : "direct fallback",
-          unavailable.length > 0 ? `${unavailable.join(" and ")} data unavailable` : "",
-        ]
-          .filter(Boolean)
-          .join(" · ");
-        return;
-      }
-      throw new Error(
-        body && "error" in body ? (body.error ?? "") : `admin fetch failed: ${response.status}`,
-      );
-    } catch (error) {
-      adminError = error instanceof Error ? error.message : String(error);
-      generatedLabel = "admin unavailable";
-      generatedDetail = adminError;
-    } finally {
-      adminLoading = false;
-    }
-  }
+  const settingsController = createSettingsController({
+    initialRoute,
+    adminRoute,
+    hiddenOwnersKey,
+    hiddenReposKey,
+    getState: settingsState,
+    update: updateSettingsState,
+  });
+  const {
+    currentReturnTo,
+    addSource,
+    savePublicDefault,
+    resetPublicDefault,
+    openOwner,
+    openSignedInUserDashboard,
+    toggleOwner,
+    toggleRepo,
+    resetHidden,
+    login,
+    installApp,
+    primaryAuthAction,
+    primaryAuthLabel,
+    primaryAuthTitle,
+    logout,
+    authStatus,
+  } = settingsController;
 
-  async function runScheduler(): Promise<void> {
-    if (!adminRoute) return;
-    adminActionMessage = "scheduler running";
-    try {
-      const response = await fetch("/api/admin/scheduler/run", {
-        method: "POST",
-        cache: "no-store",
-      });
-      const body = (await response.json().catch(() => null)) as
-        | { ok?: boolean; enqueued?: number; due?: number; considered?: number; error?: string }
-        | null;
-      if (!response.ok || !body?.ok) {
-        throw new Error(body?.error ?? `scheduler failed: ${response.status}`);
-      }
-      adminActionMessage = `${numberFormat.format(body.enqueued ?? 0)} jobs enqueued · ${numberFormat.format(body.due ?? 0)} due`;
-      await loadAdmin();
-    } catch (error) {
-      adminActionMessage = error instanceof Error ? error.message : String(error);
-    }
-  }
-
-  async function syncInstallations(): Promise<void> {
-    if (!adminRoute) return;
-    adminActionMessage = "syncing GitHub App installs";
-    try {
-      const response = await fetch("/api/admin/installations/sync", {
-        method: "POST",
-        cache: "no-store",
-      });
-      const body = (await response.json().catch(() => null)) as
-        | { ok?: boolean; count?: number; error?: string }
-        | null;
-      if (!response.ok || !body?.ok) {
-        throw new Error(body?.error ?? `install sync failed: ${response.status}`);
-      }
-      adminActionMessage = `${numberFormat.format(body.count ?? 0)} GitHub App installs synced`;
-      await loadAdmin();
-    } catch (error) {
-      adminActionMessage = error instanceof Error ? error.message : String(error);
-    }
-  }
-
-  function adminAge(value: string | null): string {
-    return value ? relativeDate(value) : "never";
-  }
-
-  function adminTargetSources(target: RefreshTarget): string {
-    const owners = target.owners.map((owner) => `@${owner}`);
-    return [...owners, ...target.repos].join(", ") || target.owner;
-  }
-
-  function adminJobLabel(job: RefreshJob): string {
-    return [job.status, job.reason, job.durationMs === null ? "" : `${numberFormat.format(job.durationMs)}ms`]
-      .filter(Boolean)
-      .join(" · ");
-  }
-
-  function adminEventLabel(event: SchedulerAuditEvent): string {
-    return [event.status, event.reason, event.account ? `@${event.account}` : "", event.detail]
-      .filter(Boolean)
-      .join(" · ");
-  }
-
-  function adminAccessLabel(row: { source: string; account: string | null; resource: string | null; status: number }): string {
-    return [
-      `${row.source}${row.account ? `:${row.account}` : ""}`,
-      row.resource ?? "unknown",
-      `HTTP ${row.status}`,
-    ].join(" · ");
-  }
-
-  async function loadDashboard(attempt = 0): Promise<void> {
-    const forceRefresh = new URLSearchParams(location.search).has("rdRefresh");
-    const bypassCache = attempt > 0 || forceRefresh;
-    try {
-      const startedAt = nowMs();
-      let response = await fetchPayload(initialRoute.apiPath, bypassCache);
-      const headerAt = nowMs();
-      let body = await readDashboardResponse(response);
-      noteGitHubRateLimit(
-        response.status,
-        body && "error" in body ? body.error : undefined,
-        body && "cache" in body ? body.cache?.message : undefined,
-      );
-      const bodyAt = nowMs();
-      if (response.ok && body && "projects" in body) {
-        data = body;
-        updateStatus();
-        void reportDashboardTiming(body, {
-          source: "fetch",
-          attempt,
-          apiPath: new URL(initialRoute.apiPath, location.origin).pathname,
-          httpStatus: response.status,
-          headerMs: roundedMs(headerAt - startedAt),
-          bodyMs: roundedMs(bodyAt - headerAt),
-          totalMs: roundedMs(bodyAt - startedAt),
-        });
-        if (shouldAutoRefresh(data)) {
-          if (!startDashboardStream(attempt)) {
-            scheduleDashboardRefresh(attempt);
-          }
-        } else {
-          closeDashboardStream();
-        }
-        return;
-      }
-      if (body && "cache" in body) {
-        data = body;
-        updateStatus();
-        errorMessage = body.cache?.message || "dashboard error";
-        return;
-      }
-      if (initialRoute.fallbackApiPath) {
-        const fallbackStartedAt = nowMs();
-        response = await fetchPayload(initialRoute.fallbackApiPath, bypassCache);
-        const fallbackHeaderAt = nowMs();
-        body = await readDashboardResponse(response);
-        noteGitHubRateLimit(
-          response.status,
-          body && "error" in body ? body.error : undefined,
-          body && "cache" in body ? body.cache?.message : undefined,
-        );
-        const fallbackBodyAt = nowMs();
-        if (response.ok && body && "projects" in body) {
-          data = body;
-          updateStatus();
-          void reportDashboardTiming(body, {
-            source: "fetch-fallback",
-            attempt,
-            apiPath: new URL(initialRoute.fallbackApiPath, location.origin).pathname,
-            httpStatus: response.status,
-            headerMs: roundedMs(fallbackHeaderAt - fallbackStartedAt),
-            bodyMs: roundedMs(fallbackBodyAt - fallbackHeaderAt),
-            totalMs: roundedMs(fallbackBodyAt - fallbackStartedAt),
-          });
-          return;
-        }
-      }
-      const message =
-        body && "error" in body ? body.error : `dashboard fetch failed: ${response.status}`;
-      throw new Error(message || `dashboard fetch failed: ${response.status}`);
-    } finally {
-      if (forceRefresh) {
-        clearDashboardRefreshParam();
-      }
-    }
-  }
-
-  async function manualRefreshDashboard(): Promise<void> {
-    if (!manualRefreshAvailable || manualRefreshLoading) return;
-    manualRefreshLoading = true;
-    generatedLabel = "refreshing";
-    generatedDetail = "refreshing issue and PR counts first";
-    errorMessage = "";
-    closeDashboardStream();
-    if (dashboardRefreshTimer !== null) {
-      globalThis.clearTimeout(dashboardRefreshTimer);
-      dashboardRefreshTimer = null;
-    }
-    const read = async (apiPath: string) => {
-      const response = await fetch(apiPath, { method: "POST", cache: "no-store" });
-      const body = await readDashboardResponse(response);
-      noteGitHubRateLimit(
-        response.status,
-        body && "error" in body ? body.error : undefined,
-        body && "cache" in body ? body.cache?.message : undefined,
-      );
-      return { response, body };
+  function adminState(): AdminState {
+    return {
+      auth,
+      admin,
+      adminLoading,
+      adminError,
+      adminActionMessage,
+      generatedLabel,
+      generatedDetail,
     };
-    try {
-      let { response, body } = await read(initialRoute.apiPath);
-      if (
-        initialRoute.fallbackApiPath &&
-        (!response.ok || !body || !("projects" in body))
-      ) {
-        ({ response, body } = await read(initialRoute.fallbackApiPath));
-      }
-      if (response.ok && body && "projects" in body) {
-        data = body;
-        updateStatus();
-        if (shouldAutoRefresh(data)) {
-          if (!startDashboardStream(0)) {
-            scheduleDashboardRefresh(0);
-          }
-        }
-        return;
-      }
-      const message =
-        body && "cache" in body && body.cache?.message
-          ? body.cache.message
-          : body && "error" in body
-            ? body.error
-            : `dashboard refresh failed: ${response.status}`;
-      throw new Error(message || `dashboard refresh failed: ${response.status}`);
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
-      generatedLabel = "refresh failed";
-      generatedDetail = errorMessage;
-    } finally {
-      manualRefreshLoading = false;
-    }
   }
 
-  async function loadRepoDetail(attempt = 0): Promise<void> {
-    if (!repoRoute) return;
-    const bypassCache = attempt > 0;
-    const read = async (apiPath: string) => {
-      const response = await fetchPayload(apiPath, bypassCache);
-      const body = (await response.json().catch(() => null)) as
-        | RepoDetailPayload
-        | { error?: string; cache?: { state?: string; message?: string } }
-        | null;
-      noteGitHubRateLimit(
-        response.status,
-        body && "error" in body ? body.error : undefined,
-        body && "cache" in body ? body.cache?.message : undefined,
-      );
-      return { response, body };
-    };
-    let { response, body } = await read(repoRoute.apiPath);
-    if (
-      repoRoute.fallbackApiPath &&
-      (!response.ok || !body || !("project" in body))
-    ) {
-      ({ response, body } = await read(repoRoute.fallbackApiPath));
-    }
-    if (body && "project" in body) {
-      repoDetail = body;
-      if (!body.project.releaseDate && repoSummaryRange === "release") {
-        repoSummaryRange = "month";
-      }
-      updateRepoDetailStatus();
-      if (
-        body.cache.state === "warming" ||
-        body.cache.state === "stale" ||
-        body.releaseSummary?.state === "warming"
-      ) {
-        scheduleRepoDetailRefresh(attempt);
-      }
-      if (repoSummaryRange !== "release" && !repoActivity) {
-        void loadRepoActivity();
-      }
-      return;
-    }
-    if (response.status === 202 && body?.cache?.state === "warming") {
-      generatedLabel = "warming";
-      generatedDetail = body.cache.message ?? "Repository detail is warming.";
-      scheduleRepoDetailRefresh(attempt);
-      return;
-    }
-    const message =
-      body && "error" in body
-        ? body.error
-        : body?.cache?.message || `repository detail failed: ${response.status}`;
-    throw new Error(message || `repository detail failed: ${response.status}`);
+  function updateAdminState(patch: Partial<AdminState>): void {
+    if ("auth" in patch) auth = patch.auth ?? null;
+    if ("admin" in patch) admin = patch.admin ?? null;
+    if (patch.adminLoading !== undefined) adminLoading = patch.adminLoading;
+    if (patch.adminError !== undefined) adminError = patch.adminError;
+    if (patch.adminActionMessage !== undefined) adminActionMessage = patch.adminActionMessage;
+    if (patch.generatedLabel !== undefined) generatedLabel = patch.generatedLabel;
+    if (patch.generatedDetail !== undefined) generatedDetail = patch.generatedDetail;
   }
+
+  const { loadAuth, loadAdmin, runScheduler, syncInstallations } = createAdminController({
+    adminRoute,
+    currentReturnTo,
+    getState: adminState,
+    update: updateAdminState,
+  });
 
   function handleSourceSubmit(event: SubmitEvent): void {
     event.preventDefault();
@@ -2082,336 +712,6 @@
 
   async function copyDashboardUrl(): Promise<void> {
     await navigator.clipboard?.writeText(location.href);
-  }
-
-  function rowActivationTarget(event: Event): HTMLElement | null {
-    return (event.target as HTMLElement | null)?.closest("a, button, input, label") ?? null;
-  }
-
-  function rowClick(event: MouseEvent, fullName: string): void {
-    if (event.defaultPrevented || rowActivationTarget(event)) return;
-    location.assign(repoDetailPath(fullName));
-  }
-
-  function rowKeydown(event: KeyboardEvent, fullName: string): void {
-    if (event.defaultPrevented) return;
-    if (rowActivationTarget(event)) return;
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    location.assign(repoDetailPath(fullName));
-  }
-
-  function setTopicSearch(topic: string): void {
-    query = query.trim().toLowerCase() === topic.toLowerCase() ? "" : topic;
-  }
-
-  function sortCommand(key: SortKey): CommandAction {
-    return {
-      actionId: `sort:${key}`,
-      title: `Sort by ${sortLabel(key)}`,
-      subTitle: sortKey === key ? `currently ${sortDirection}` : "table order",
-      group: "View",
-      keywords: ["order", "table", key, sortLabel(key)],
-      onRun: () => setSort(key),
-    };
-  }
-
-  function filterCommand(value: DashboardFilter): CommandAction {
-    return {
-      actionId: `filter:${value}`,
-      title: `Show ${filterLabel(value)}`,
-      subTitle: filter === value ? "current filter" : "filter dashboard",
-      group: "View",
-      keywords: ["filter", value, filterLabel(value)],
-      onRun: () => {
-        filter = value;
-      },
-    };
-  }
-
-  function languageCommand(language: string): CommandAction {
-    return {
-      actionId: `language:${language.toLowerCase()}`,
-      title: `Show ${language}`,
-      subTitle: activeLanguage(language) ? "current language filter" : "language filter",
-      group: "Languages",
-      keywords: ["language", "tech", "stack", language],
-      onRun: () => setLanguageFilter(language),
-    };
-  }
-
-  function repoCommands(project: Project): CommandAction[] {
-    const topics = project.topics ?? [];
-    const commands: CommandAction[] = [
-      {
-        actionId: `repo:${project.fullName}`,
-        title: project.fullName,
-        subTitle: `${project.version} · ${project.freshness} · ${numberFormat.format(project.stars)} stars`,
-        description: project.description ?? undefined,
-        group: "Repos",
-        keywords: [project.owner, project.name, project.language ?? "", project.version, ...topics],
-        onRun: () => location.assign(repoDetailPath(project.fullName)),
-      },
-      {
-        actionId: `github:${project.fullName}`,
-        title: `Open ${project.fullName} on GitHub`,
-        subTitle: "github.com",
-        group: "Repos",
-        keywords: ["github", "external", project.fullName],
-        onRun: () => openUrl(project.url),
-      },
-      {
-        actionId: `release:${project.fullName}`,
-        title: `Open release ${project.version}`,
-        subTitle: project.fullName,
-        group: "Repos",
-        keywords: ["tag", "version", project.fullName],
-        onRun: () => openUrl(project.releaseUrl),
-      },
-      {
-        actionId: `issues:${project.fullName}`,
-        title: `Open issues`,
-        subTitle: `${project.fullName} · ${countLabel(project.openIssues)}`,
-        group: "Repos",
-        keywords: ["bugs", "issues", project.fullName],
-        onRun: () => openUrl(project.issuesUrl),
-      },
-      {
-        actionId: `prs:${project.fullName}`,
-        title: `Open pull requests`,
-        subTitle: `${project.fullName} · ${countLabel(project.openPullRequests)}`,
-        group: "Repos",
-        keywords: ["prs", "pulls", "pull requests", project.fullName],
-        onRun: () => openUrl(project.pullRequestsUrl),
-      },
-      {
-        actionId: `hide:${project.fullName}`,
-        title: `${hiddenRepos.has(project.fullName.toLowerCase()) ? "Show" : "Hide"} ${project.fullName}`,
-        subTitle: "local visibility",
-        group: "Visibility",
-        keywords: ["hide", "show", "visible", project.fullName],
-        onRun: () => toggleRepo(project.fullName, hiddenRepos.has(project.fullName.toLowerCase())),
-      },
-    ];
-    if (project.compareUrl) {
-      commands.splice(2, 0, {
-        actionId: `compare:${project.fullName}`,
-        title: `Open compare`,
-        subTitle: `${project.fullName} · ${project.commitsSinceRelease ?? "n/a"} commits`,
-        group: "Repos",
-        keywords: ["compare", "commits", project.fullName],
-        onRun: () => openUrl(project.compareUrl),
-      });
-    }
-    if (project.ciUrl) {
-      commands.push({
-        actionId: `ci:${project.fullName}`,
-        title: `Open CI`,
-        subTitle: `${project.fullName} · ${ciLabel(project)}`,
-        group: "Repos",
-        keywords: ["ci", "checks", "actions", project.fullName],
-        onRun: () => openUrl(project.ciUrl),
-      });
-    }
-    return commands;
-  }
-
-  function isRepositorySearchProject(project: Project): boolean {
-    return (
-      project.version === "repo search" &&
-      project.releaseDate === null &&
-      project.commitsSinceRelease === null &&
-      project.compareUrl === null
-    );
-  }
-
-  function repositorySearchStatus(): string {
-    if (data?.cache?.progress?.done === false) return "release scan queued";
-    if (data?.cache?.message?.startsWith("release scan skipped")) return "release scan skipped";
-    if (data?.cache?.progress?.done === true) return "outside hot scan batch";
-    return "release not scanned";
-  }
-
-  function buildCommands(
-    projects: Project[],
-    owners: string[],
-    languages: string[],
-    typedText: string,
-    hiddenOwnerSet: Set<string>,
-    hiddenRepoSet: Set<string>,
-    authPayload: AuthPayload | null,
-    devEnabled: boolean,
-    activeSortKey: SortKey,
-    activeSortDirection: SortDirection,
-    activeFilter: DashboardFilter,
-    currentSettingsSummary: string,
-  ): CommandAction[] {
-    const rawTyped = typedText.trim();
-    const typed = rawTyped.replace(/^@/, "").toLowerCase();
-    const typedCommands: CommandAction[] = [];
-    if (rawTyped.startsWith("@") && /^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?$/i.test(typed)) {
-      typedCommands.push({
-        actionId: `typed-owner:${typed}`,
-        title: `Open @${typed}`,
-        subTitle: "public dashboard",
-        group: "Dashboards",
-        keywords: ["owner", "org", typed],
-        onRun: () => openOwner(typed),
-      });
-    }
-    if (validRepoSlug(typed)) {
-      typedCommands.push({
-        actionId: `typed-repo:${typed}`,
-        title: `Add ${typed}`,
-        subTitle: "explicit public repo source",
-        group: "Dashboards",
-        keywords: ["repo", "source", typed],
-        onRun: () => addSource(typed),
-      });
-    }
-
-    const ownerCommands = owners.map((owner) => ({
-      actionId: `owner:${owner}`,
-      title: `Open @${owner}`,
-      subTitle: hiddenOwnerSet.has(owner) ? "hidden locally" : "owner dashboard",
-      group: "Dashboards",
-      keywords: ["owner", "dashboard", owner],
-      onRun: () => openOwner(owner),
-    }));
-    const authLogin = authPayload?.user?.login ?? null;
-    const accountDashboardCommands: CommandAction[] = authLogin
-      ? [
-          {
-            actionId: "account:dashboard",
-            title: "Open my dashboard",
-            subTitle: `@${authLogin}`,
-            group: "Account",
-            keywords: ["me", "account", "dashboard", authLogin],
-            onRun: () => openOwner(authLogin),
-          },
-        ]
-      : [];
-
-    return [
-      ...typedCommands,
-      {
-        actionId: "dashboard:home",
-        title: "Open GitHub Hot",
-        subTitle: "root dashboard",
-        group: "Dashboards",
-        keywords: ["home", "root", "hot", "discover", "trending"],
-        onRun: () => location.assign("/"),
-      },
-      ...discoverPeriods.map((period) => ({
-        actionId: `dashboard:discover:${period.value}`,
-        title: `Open ${period.label}`,
-        subTitle: period.value === "releasebar" ? "cached ReleaseBar dashboards" : "GitHub Hot",
-        group: "Dashboards",
-        keywords: ["hot", "discover", "trending", period.value, period.label],
-        onRun: () => location.assign(discoverHref(period.value)),
-      })),
-      {
-        actionId: "dashboard:releasebar",
-        title: "Open ReleaseBar Hot",
-        subTitle: "cached dashboards",
-        group: "Dashboards",
-        keywords: ["home", "root", "releasebar", "cache"],
-        onRun: () => location.assign(discoverHref("releasebar")),
-      },
-      ...ownerCommands,
-      ...languages.map(languageCommand),
-      ...projects.flatMap(repoCommands).slice(0, 420),
-      ...filterOptions.map(filterCommand),
-      ...sortOptions.map(sortCommand),
-      ...(devEnabled ? devSortOptions.map(sortCommand) : []),
-      {
-        actionId: "view:search",
-        title: "Focus search",
-        subTitle: "filter visible rows",
-        group: "View",
-        keywords: ["search", "find", "filter"],
-        onRun: focusSearch,
-      },
-      {
-        actionId: "view:copy-url",
-        title: "Copy dashboard URL",
-        subTitle: "share current filters",
-        group: "View",
-        keywords: ["copy", "share", "url", "link"],
-        onRun: () => void copyDashboardUrl(),
-      },
-      {
-        actionId: "view:dev",
-        title: `${devEnabled ? "Disable" : "Enable"} dev columns`,
-        subTitle: "issues, PRs, CI",
-        group: "View",
-        keywords: ["dev", "issues", "prs", "ci"],
-        onRun: () => setDevMode(!devEnabled),
-      },
-      {
-        actionId: "view:settings",
-        title: "Open settings",
-        subTitle: currentSettingsSummary,
-        group: "View",
-        keywords: ["settings", "sources", "visibility"],
-        onRun: () => {
-          settingsOpen = true;
-        },
-      },
-      {
-        actionId: "visibility:reset",
-        title: "Show all hidden items",
-        subTitle: currentSettingsSummary,
-        group: "Visibility",
-        keywords: ["reset", "hidden", "visibility"],
-        onRun: resetHidden,
-      },
-      ...owners.map((owner) => ({
-        actionId: `visibility:owner:${owner}`,
-        title: `${hiddenOwnerSet.has(owner) ? "Show" : "Hide"} @${owner}`,
-        subTitle: "local visibility",
-        group: "Visibility",
-        keywords: ["hide", "show", "owner", owner],
-        onRun: () => toggleOwner(owner, hiddenOwnerSet.has(owner)),
-      })),
-      ...((authPayload?.configured || authPayload?.quotaConfigured) && !authPayload.user
-        ? [
-            {
-              actionId: "auth:login",
-              title: authPayload?.quotaConfigured && !adminRoute ? "Install GitHub App" : "Connect GitHub",
-              subTitle: "dedicated API quota",
-              group: "Account",
-              keywords: ["login", "github", "quota"],
-              onRun: primaryAuthAction,
-            },
-          ]
-        : []),
-      ...(authPayload?.user
-        ? [
-            ...accountDashboardCommands,
-            ...(authPayload.installNeeded
-              ? [
-                  {
-                    actionId: "auth:install",
-                    title: "Install GitHub App",
-                    subTitle: authPayload.installReason ?? "dedicated API quota",
-                    group: "Account",
-                    keywords: ["install", "github", "app"],
-                    onRun: installApp,
-                  },
-                ]
-              : []),
-            {
-              actionId: "auth:logout",
-              title: "Log out",
-              subTitle: `@${authPayload.user.login}`,
-              group: "Account",
-              keywords: ["logout", "sign out", authPayload.user.login],
-              onRun: logout,
-            },
-          ]
-        : []),
-    ];
   }
 
   onMount(() => {
@@ -2451,7 +751,7 @@
         void reportDashboardTiming(data, {
           source: "embedded",
           attempt: 0,
-          totalMs: roundedMs(nowMs()),
+          totalMs: Math.round(performance.now()),
         });
         if (new URLSearchParams(location.search).has("rdRefresh")) {
           return loadDashboard();
@@ -2480,1665 +780,165 @@
   });
 
   onDestroy(() => {
-    if (dashboardRefreshTimer !== null) {
-      globalThis.clearTimeout(dashboardRefreshTimer);
-    }
-    if (repoDetailRefreshTimer !== null) {
-      globalThis.clearTimeout(repoDetailRefreshTimer);
-    }
-    if (activityRefreshTimer !== null) {
-      globalThis.clearTimeout(activityRefreshTimer);
-    }
-    if (audienceRefreshTimer !== null) {
-      globalThis.clearTimeout(audienceRefreshTimer);
-    }
-    if (repoActivityRefreshTimer !== null) {
-      globalThis.clearTimeout(repoActivityRefreshTimer);
-    }
+    routeController.destroy();
+    activityController.destroy();
     closeDashboardStream();
     document.body.classList.remove("dev-mode");
   });
 </script>
 
 <main class="shell">
-  <header class="topline">
-    <div class="hero-copy">
-      <nav class="eyebrow-nav" aria-label="Page navigation">
-        <a class="eyebrow brand" href="/">release.bar</a>
-        {#if repoRoute}
-          <span aria-hidden="true">/</span>
-          <a class="eyebrow eyebrow-back" href={ownerDashboardPath(repoRoute.owner)}>
-            <span aria-hidden="true">←</span>
-            @{repoRoute.owner}
-          </a>
-        {:else if activityPageRoute}
-          <span aria-hidden="true">/</span>
-          <a class="eyebrow eyebrow-back" href={ownerDashboardPath(activityPageRoute.owner)}>
-            <span aria-hidden="true">←</span>
-            dashboard
-          </a>
-        {/if}
-      </nav>
-      <h1>
-        {#if heroOwner}
-          <span class="hero-owner-title">
-            <a class="hero-owner-link" href={ownerDashboardPath(heroOwner.login)}>
-              <img
-                class="hero-owner-avatar"
-                src={ownerAvatarUrl(heroOwner)}
-                alt=""
-                width="88"
-                height="88"
-                loading="eager"
-              />
-              <span>@{heroOwner.login}</span>
-            </a>
-            {#if heroExtraCount > 0}
-              <span>+{heroExtraCount}</span>
-            {/if}
-            {#if activityPageRoute}
-              <span class="hero-section-label">activity</span>
-            {/if}
-          </span>
-        {:else if repoRoute && repoDetail}
-          <span class="repo-hero-title">
-            <a
-              class="repo-title-avatar-link"
-              href={ownerDashboardPath(repoDetail.project.owner)}
-              aria-label={`Open @${repoDetail.project.owner} dashboard`}
-            >
-              <img
-                class="repo-title-avatar"
-                src={projectOwnerAvatarUrl(repoDetail.project)}
-                alt=""
-                width="88"
-                height="88"
-                loading="eager"
-              />
-            </a>
-            <span class="repo-title-text" title={label}>
-              <span class="repo-title-name">{repoDetail.project.name}</span>
-            </span>
-          </span>
-        {:else}
-          {label}
-        {/if}
-      </h1>
-      <p class="subtitle">
-        {#if subtitleOwner}
-          Release freshness for
-          <a class="subtitle-link" href={ownerDashboardPath(subtitleOwner)}>
-            @{subtitleOwner}</a
-          >.
-        {:else}
-          {subtitle}
-        {/if}
-      </p>
-      {#if repoActionUrl}
-        <nav class="repo-actions" aria-label="Repository links">
-          <a class="external-link" href={repoActionUrl} target="_blank" rel="noreferrer">GitHub</a>
-          <a class="external-link" href={`${repoActionUrl}/releases`} target="_blank" rel="noreferrer">Releases</a>
-          <a class="external-link" href={repoDetail?.project.issuesUrl ?? `${repoActionUrl}/issues`} target="_blank" rel="noreferrer">Issues</a>
-          <a class="external-link" href={repoDetail?.project.pullRequestsUrl ?? `${repoActionUrl}/pulls`} target="_blank" rel="noreferrer">PRs</a>
-        </nav>
-      {/if}
-    </div>
-    <div class="top-actions">
-      <button
-        type="button"
-        class="status"
-        aria-live="polite"
-        aria-label={generatedDetail ? `${generatedLabel} · ${generatedDetail}` : generatedLabel}
-        data-tooltip={generatedDetail || undefined}
-        tabindex={generatedDetail ? 0 : undefined}
-      >
-        <span class="pulse"></span>
-        <span>{generatedLabel}</span>
-      </button>
+  <AppHeader
+    {repoRoute}
+    {activityPageRoute}
+    {repoDetail}
+    {heroOwner}
+    {heroExtraCount}
+    {label}
+    {subtitleOwner}
+    {subtitle}
+    {repoActionUrl}
+    {generatedLabel}
+    {generatedDetail}
+    {manualRefreshAvailable}
+    {manualRefreshLoading}
+    {manualRefreshDashboard}
+    {theme}
+    {toggleTheme}
+    {auth}
+    bind:settingsOpen
+    {rateLimitHit}
+    {adminRoute}
+    {ownerAvatarUrl}
+    {projectOwnerAvatarUrl}
+    {openSignedInUserDashboard}
+    {installApp}
+    {logout}
+    {primaryAuthAction}
+    {primaryAuthTitle}
+    {primaryAuthLabel}
+  />
 
-      {#if manualRefreshAvailable}
-        <button
-          type="button"
-          class="refresh-toggle"
-          disabled={manualRefreshLoading}
-          onclick={manualRefreshDashboard}
-          aria-label="Refresh dashboard"
-          title="Refresh dashboard"
-        >
-          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 12a9 9 0 0 1-15.2 6.5" />
-            <path d="M3 12A9 9 0 0 1 18.2 5.5" />
-            <path d="M18 2v4h-4" />
-            <path d="M6 22v-4h4" />
-          </svg>
-        </button>
-      {/if}
-
-      <button
-        type="button"
-        class="theme-toggle"
-        onclick={toggleTheme}
-        aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-        title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-      >
-        {#if theme === "dark"}
-          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79Z" />
-          </svg>
-        {:else}
-          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="4" />
-            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
-          </svg>
-        {/if}
-      </button>
-
-      {#if auth?.user}
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger class="account-button">
-            <img class="account-avatar" src={auth.user.avatarUrl} alt="" width="24" height="24" loading="lazy" />
-            <span class="account-label">@{auth.user.login}</span>
-            <span class="account-caret" aria-hidden="true"></span>
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Content class="account-dropdown" align="end" sideOffset={8} loop>
-            <DropdownMenu.Item class="menu-action" onSelect={openSignedInUserDashboard}>
-              My Dashboard
-            </DropdownMenu.Item>
-            {#if !repoRoute && !activityPageRoute}
-              <DropdownMenu.Item class="menu-action" onSelect={() => (settingsOpen = !settingsOpen)}>
-                Settings
-              </DropdownMenu.Item>
-            {/if}
-            {#if auth.installNeeded}
-              <DropdownMenu.Item class="menu-action" onSelect={installApp}>
-                Install App
-              </DropdownMenu.Item>
-            {/if}
-            <DropdownMenu.Item class="menu-action" onSelect={logout}>Log Out</DropdownMenu.Item>
-          </DropdownMenu.Content>
-        </DropdownMenu.Root>
-      {:else}
-        <button
-          class="account-button"
-          type="button"
-          disabled={!auth?.configured && !auth?.quotaConfigured}
-          onclick={primaryAuthAction}
-          title={primaryAuthTitle(auth)}
-        >
-          <span class="account-label account-label-full">{primaryAuthLabel(auth)}</span>
-          <span class="account-label account-label-short">{primaryAuthLabel(auth, true)}</span>
-          {#if auth?.configured || auth?.quotaConfigured}
-            <span class="account-caret" aria-hidden="true"></span>
-          {/if}
-        </button>
-      {/if}
-    </div>
-  </header>
-
-  {#if rateLimitHit && !adminRoute}
-    <aside class="quota-install-callout" role="alert" aria-live="assertive">
-      <div>
-        <span>GitHub rate limit</span>
-        <strong>Switch this dashboard to dedicated GitHub App quota.</strong>
-        <small>Install or update ReleaseBar access for the GitHub account you are viewing.</small>
-      </div>
-      <button type="button" onclick={installApp}>Install GitHub App</button>
-    </aside>
-  {/if}
-
-  {#if !repoRoute && initialRoute.isDefault}
-    <nav class="discover-nav" aria-label="Discover GitHub repositories">
-      <div class="discover-group" aria-label="Time range">
-        {#each discoverPeriods as period}
-          <a
-            class:active={activeDiscoverPeriod === period.value}
-            href={discoverHref(period.value)}
-            aria-current={activeDiscoverPeriod === period.value ? "page" : undefined}
-          >
-            {period.label}
-          </a>
-        {/each}
-      </div>
-      {#if activeDiscoverPeriod !== "releasebar"}
-        <div class="discover-group" aria-label="Language">
-          <a
-            class:active={!activeDiscoverLanguage}
-            href={discoverHref(activeDiscoverPeriod, "")}
-            aria-current={!activeDiscoverLanguage ? "page" : undefined}
-          >
-            all
-          </a>
-          {#each discoverLanguages as discoverLanguage}
-            <a
-              class:active={discoverLanguageActive(discoverLanguage)}
-              href={discoverLanguageHref(discoverLanguage)}
-              aria-current={discoverLanguageActive(discoverLanguage) ? "page" : undefined}
-            >
-              {discoverLanguage}
-            </a>
-          {/each}
-        </div>
-      {/if}
-    </nav>
-  {/if}
-
-  {#if settingsOpen && !repoRoute && !activityPageRoute}
-    <div class="settings-panel" aria-label="Dashboard settings" data-open>
-      <button
-        class="settings-close"
-        type="button"
-        aria-label="Close settings"
-        onclick={() => (settingsOpen = false)}
-      >
-        <span aria-hidden="true">×</span>
-      </button>
-      <div>
-        <strong>dashboard</strong>
-        <p>{settingsSummary}</p>
-        <p class="profile-badge">
-          {publicProfile
-            ? `public profile config · saved by @${publicProfile.updatedBy}`
-            : canEditPublicDefault
-              ? "public profile config · not saved yet"
-              : "local view settings"}
-        </p>
-        <p class="public-note">Only public GitHub repositories are listed, stored, and selectable.</p>
-        <p class="connection-status">{connectionStatus}</p>
-        {#if isAdminUser}
-          <a class="settings-admin-link" href="/_admin">Admin</a>
-        {/if}
-        <form class="source-form" onsubmit={handleSourceSubmit}>
-          <input
-            bind:value={sourceInput}
-            type="text"
-            autocomplete="off"
-            spellcheck="false"
-            placeholder="@owner or owner/repo"
-          />
-          <button type="submit">add</button>
-        </form>
-        {#if canEditPublicDefault}
-          <div class="profile-actions">
-            <button type="button" disabled={profileSaving} onclick={savePublicDefault}>
-              save default
-            </button>
-            <button type="button" disabled={profileSaving} onclick={resetPublicDefault}>
-              reset
-            </button>
-          </div>
-          <p class="profile-status">
-            {profileMessage || "Save custom sources and visibility as the public default for this route."}
-          </p>
-        {/if}
-      </div>
-      <section>
-        <h2>owners</h2>
-        <div class="setting-list">
-          {#each ownerToggles as owner}
-            <label class="setting-check">
-              <input
-                type="checkbox"
-                checked={!hiddenOwners.has(owner)}
-                onchange={(event) =>
-                  toggleOwner(owner, (event.currentTarget as HTMLInputElement).checked)}
-              />
-              <span>@{owner}</span>
-            </label>
-          {/each}
-        </div>
-      </section>
-      <section>
-        <h2>repos</h2>
-        <div class="setting-list repo-settings">
-          {#each data?.projects ?? [] as project (project.fullName)}
-            <label class="setting-check">
-              <input
-                type="checkbox"
-                checked={!hiddenRepos.has(project.fullName.toLowerCase())}
-                onchange={(event) =>
-                  toggleRepo(project.fullName, (event.currentTarget as HTMLInputElement).checked)}
-              />
-              <span>{project.fullName}</span>
-            </label>
-          {/each}
-        </div>
-      </section>
-    </div>
-  {/if}
+  <DashboardControls
+    {repoRoute}
+    {activityPageRoute}
+    isDefault={initialRoute.isDefault}
+    {discoverPeriods}
+    {activeDiscoverPeriod}
+    {activeDiscoverLanguage}
+    {discoverLanguages}
+    {discoverHref}
+    {discoverLanguageHref}
+    {discoverLanguageActive}
+    bind:settingsOpen
+    {settingsSummary}
+    {publicProfile}
+    {canEditPublicDefault}
+    {connectionStatus}
+    {isAdminUser}
+    bind:sourceInput
+    {handleSourceSubmit}
+    {profileSaving}
+    {savePublicDefault}
+    {resetPublicDefault}
+    {profileMessage}
+    {ownerToggles}
+    {hiddenOwners}
+    {hiddenRepos}
+    {data}
+    {toggleOwner}
+    {toggleRepo}
+  />
 
   {#if adminRoute}
-    <section class="admin-console" aria-label="Scheduler admin">
-      {#if adminError}
-        <div class="error-state">
-          <span class="loading-kicker">admin unavailable</span>
-          <strong>{adminError}</strong>
-          <small>Admin access requires signing in as @steipete.</small>
-          {#if auth?.configured && !auth.user}
-            <button type="button" onclick={login}>Connect GitHub</button>
-          {:else}
-            <button type="button" disabled={adminLoading} onclick={loadAdmin}>retry</button>
-          {/if}
-        </div>
-      {:else if adminLoading && !admin}
-        <div class="loading-state" aria-live="polite">
-          <span class="loading-kicker">scheduler</span>
-          <strong>loading status</strong>
-          <small>Reading refresh targets, recent jobs, and audit events.</small>
-          <div class="loading-bars" aria-hidden="true">
-            <span></span>
-            <span></span>
-            <span></span>
-          </div>
-        </div>
-      {:else if admin}
-        <div class="admin-toolbar">
-          <div>
-            <span class="panel-kicker">scheduler</span>
-            <strong>{admin.status.queueConfigured ? "queue backed" : "direct fallback"}</strong>
-            <small>
-              last tick {adminAge(admin.status.lastTickAt)} · next due {adminAge(admin.status.nextDueAt)}
-            </small>
-          </div>
-          <div class="admin-actions">
-            <button type="button" disabled={adminLoading} onclick={loadAdmin}>refresh</button>
-            <button type="button" disabled={adminLoading} onclick={runScheduler}>run now</button>
-            <button type="button" disabled={adminLoading} onclick={syncInstallations}>sync installs</button>
-          </div>
-        </div>
-        {#if adminActionMessage}
-          <p class="admin-message">{adminActionMessage}</p>
-        {/if}
-        <div class="admin-metrics">
-          <div>
-            <span>targets</span>
-            <strong>{numberFormat.format(admin.status.targets)}</strong>
-          </div>
-          <div>
-            <span>due in scan</span>
-            <strong>{numberFormat.format(admin.status.dueTargets)}</strong>
-          </div>
-          <div>
-            <span>queued</span>
-            <strong>{numberFormat.format(admin.status.queuedJobs)}</strong>
-          </div>
-          <div>
-            <span>running</span>
-            <strong>{numberFormat.format(admin.status.runningJobs)}</strong>
-          </div>
-          <div>
-            <span>failed</span>
-            <strong>{numberFormat.format(admin.status.failedJobs)}</strong>
-          </div>
-          <div>
-            <span>GitHub calls</span>
-            <strong>{numberFormat.format(admin.githubAccess.total)}</strong>
-          </div>
-          <div>
-            <span>shared pause</span>
-            <strong>{admin.githubAccess.cooldown.active ? "on" : "off"}</strong>
-          </div>
-          <div>
-            <span>installs</span>
-            <strong>{numberFormat.format(admin.auth.installationCount)}</strong>
-          </div>
-          <div>
-            <span>auth events</span>
-            <strong>{numberFormat.format(admin.auth.events.length)}</strong>
-          </div>
-        </div>
-        <div class="admin-grid">
-          <section class="admin-panel admin-wide">
-            <div class="panel-heading">
-              <div>
-                <span class="panel-kicker">GitHub App installs</span>
-                <h2>sync coverage</h2>
-              </div>
-              <strong>
-                {numberFormat.format(admin.auth.installations.length)} of {numberFormat.format(admin.auth.installationCount)}
-              </strong>
-            </div>
-            <div class="admin-list compact">
-              {#each admin.auth.installations as installation}
-                <div class="admin-row">
-                  <span>
-                    <strong>@{installation.accountLogin}</strong>
-                    <small>
-                      {installation.accountType} · {installation.repositorySelection === "all" ? "all repos" : `${numberFormat.format(installation.repositories.length)} public repos`}
-                    </small>
-                  </span>
-                  <span>
-                    <strong>{installation.repositorySelection}</strong>
-                    <small>updated {adminAge(installation.updatedAt)}</small>
-                  </span>
-                </div>
-              {/each}
-              {#if admin.auth.installations.length === 0}
-                <p class="detail-empty">No GitHub App installations recorded yet. Use sync installs to read GitHub's current app installation list.</p>
-              {/if}
-            </div>
-          </section>
-
-          <section class="admin-panel admin-wide">
-            <div class="panel-heading">
-              <div>
-                <span class="panel-kicker">auth funnel</span>
-                <h2>recent events</h2>
-              </div>
-              <strong>{numberFormat.format(admin.auth.counterCount)} counters</strong>
-            </div>
-            <div class="admin-list compact token-use">
-              {#each admin.auth.events as event}
-                <div class={`admin-row status-${event.status === "error" ? "failed" : "succeeded"}`}>
-                  <span>
-                    <strong>{event.event}{event.account ? ` · @${event.account}` : ""}</strong>
-                    <small>{event.detail ?? event.status ?? "recorded"}</small>
-                  </span>
-                  <span>
-                    <strong>{event.repositorySelection ?? event.status ?? "event"}</strong>
-                    <small>{adminAge(event.at)}</small>
-                  </span>
-                </div>
-              {/each}
-              {#if admin.auth.events.length === 0}
-                <p class="detail-empty">No auth or install funnel events recorded yet.</p>
-              {/if}
-            </div>
-          </section>
-
-          <section class="admin-panel admin-wide">
-            <div class="panel-heading">
-              <div>
-                <span class="panel-kicker">GitHub token use</span>
-                <h2>{admin.githubAccess.hours}h window</h2>
-              </div>
-              <strong>{numberFormat.format(admin.githubAccess.buckets)} buckets</strong>
-            </div>
-            {#if admin.githubAccess.cooldown.active}
-              <p class="admin-message inline">
-                shared quota paused · {admin.githubAccess.cooldown.reason ?? "budget guard"} · resets {adminAge(admin.githubAccess.cooldown.resetAt)}
-              </p>
-            {/if}
-            <div class="admin-list compact token-use">
-              {#each admin.githubAccess.topRoutes as route}
-                <div class={`admin-row status-${route.status >= 400 ? "failed" : "succeeded"}`}>
-                  <span>
-                    <strong>{route.area} · {route.route}</strong>
-                    <small>{adminAccessLabel(route)}</small>
-                  </span>
-                  <span>
-                    <strong>{numberFormat.format(route.count)}</strong>
-                    <small>{route.lastAt ? `last ${adminAge(route.lastAt)}` : (route.lastPath ?? route.key)}</small>
-                  </span>
-                </div>
-              {/each}
-              {#if admin.githubAccess.topRoutes.length === 0}
-                <p class="detail-empty">No GitHub token counters in the current window.</p>
-              {/if}
-            </div>
-          </section>
-
-          <section class="admin-panel admin-wide">
-            <div class="panel-heading">
-              <div>
-                <span class="panel-kicker">refresh targets</span>
-                <h2>stale first</h2>
-              </div>
-              <strong>{numberFormat.format(admin.targets.length)}</strong>
-            </div>
-            <div class="admin-list">
-              {#each admin.targets as target}
-                <div class="admin-row">
-                  <span>
-                    <strong>{adminTargetSources(target)}</strong>
-                    <small>
-                      {target.includeReleaseData ? "release data" : "metadata"} · seen {adminAge(target.lastSeenAt)}
-                    </small>
-                  </span>
-                  <span>
-                    <strong>due {adminAge(target.nextDueAt)}</strong>
-                    <small>
-                      success {adminAge(target.lastSuccessAt)} · failures {numberFormat.format(target.failureCount)}
-                    </small>
-                  </span>
-                </div>
-              {/each}
-              {#if admin.targets.length === 0}
-                <p class="detail-empty">No refresh targets recorded yet. Open an owner dashboard to seed one.</p>
-              {/if}
-            </div>
-          </section>
-
-          <section class="admin-panel">
-            <div class="panel-heading">
-              <div>
-                <span class="panel-kicker">jobs</span>
-                <h2>recent</h2>
-              </div>
-            </div>
-            <div class="admin-list compact">
-              {#each admin.jobs as job}
-                <div class={`admin-row status-${job.status}`}>
-                  <span>
-                    <strong>{job.targetKey.replace(/^dashboard:v\d+:/, "")}</strong>
-                    <small>{adminJobLabel(job)}</small>
-                  </span>
-                  <span>
-                    <strong>{adminAge(job.updatedAt)}</strong>
-                    <small>{job.error ?? `attempts ${numberFormat.format(job.attempts)}`}</small>
-                  </span>
-                </div>
-              {/each}
-              {#if admin.jobs.length === 0}
-                <p class="detail-empty">No refresh jobs yet.</p>
-              {/if}
-            </div>
-          </section>
-
-          <section class="admin-panel">
-            <div class="panel-heading">
-              <div>
-                <span class="panel-kicker">audit</span>
-                <h2>events</h2>
-              </div>
-            </div>
-            <div class="admin-list compact">
-              {#each admin.events as event}
-                <div class="admin-row">
-                  <span>
-                    <strong>{event.event}</strong>
-                    <small>{adminEventLabel(event) || event.targetKey || event.jobId || "scheduler"}</small>
-                  </span>
-                  <span>
-                    <strong>{adminAge(event.at)}</strong>
-                    <small>{event.jobId ?? event.targetKey ?? event.id}</small>
-                  </span>
-                </div>
-              {/each}
-              {#if admin.events.length === 0}
-                <p class="detail-empty">No audit events yet.</p>
-              {/if}
-            </div>
-          </section>
-        </div>
-      {/if}
-    </section>
+    <AdminConsole
+      {adminError}
+      {auth}
+      {adminLoading}
+      {admin}
+      {adminActionMessage}
+      {login}
+      {loadAdmin}
+      {runScheduler}
+      {syncInstallations}
+    />
   {:else if activityPageRoute}
-    <section class="activity-page" aria-label={`Recent activity for @${activityPageRoute.owner}`}>
-      <section class="activity-page-summary">
-        <div class="activity-page-heading">
-          <div>
-            <span class="panel-kicker">working log</span>
-            <h2>{activityRange === "day" ? "last day" : activityRange === "week" ? "last week" : "last month"}</h2>
-          </div>
-          <nav class="range-toggle" aria-label="Activity range">
-            {#each activityRanges as range}
-              <a
-                class:active={activityRange === range.value}
-                href={activityPageHref(range.value)}
-                aria-current={activityRange === range.value ? "page" : undefined}
-                onclick={(event) => {
-                  event.preventDefault();
-                  setActivityRange(range.value);
-                }}
-              >
-                {range.label}
-              </a>
-            {/each}
-          </nav>
-        </div>
-
-        {#if activityLoading}
-          <div class="activity-page-loading">
-            <span class="loading-kicker">collecting public work</span>
-            <strong>grouping repositories</strong>
-            <div class="loading-bars" aria-hidden="true"><span></span><span></span><span></span></div>
-          </div>
-        {:else if activityError && !activity}
-          <div class="error-state">
-            <span class="loading-kicker">activity unavailable</span>
-            <strong>{activityError}</strong>
-          </div>
-        {:else if activity}
-          <div class="activity-overview-copy">
-            <span class="activity-overview-index">00</span>
-            <div>
-              <span class="panel-kicker">AI overview</span>
-              {#if activity.summary?.state === "ready" && activity.summary.text}
-                <p>{activity.summary.text}</p>
-              {:else if activity.summary?.state === "warming"}
-                <p class="muted">Summarizing work across repositories.</p>
-              {:else}
-                <p class="muted">{activity.summary?.message ?? "Not enough recent work to summarize."}</p>
-              {/if}
-            </div>
-          </div>
-
-          <div class="activity-overview-metrics" aria-label="Activity totals">
-            <div><strong>{numberFormat.format(activity.totals.repositories)}</strong><span>repositories</span></div>
-            <div><strong>{numberFormat.format(activity.totals.commits)}</strong><span>commits</span></div>
-            <div><strong>{numberFormat.format(activity.totals.pullRequests)}</strong><span>pull requests</span></div>
-            <div><strong>{numberFormat.format(activity.totals.issues)}</strong><span>issues</span></div>
-            <div><strong>{numberFormat.format(activity.totals.comments)}</strong><span>comments</span></div>
-            <div><strong>{numberFormat.format(activity.totals.releases)}</strong><span>releases</span></div>
-          </div>
-          <small class="activity-meta">{activityMeta(activity)}</small>
-          {#if activityError}
-            <small class="activity-meta">Refresh failed: {activityError}</small>
-          {/if}
-        {/if}
-      </section>
-
-      {#if activity && activity.repositories.length > 0}
-        <div class="activity-repository-list">
-          {#each activity.repositories as repo, index (repo.fullName)}
-            <article class="activity-repository-card">
-              <div class="activity-rank" aria-label={`Rank ${index + 1}`}>
-                {String(index + 1).padStart(2, "0")}
-              </div>
-              <div class="activity-repository-main">
-                <header>
-                  <div>
-                    <a class="activity-repository-name" href={repoDetailPath(repo.fullName)}>
-                      {repo.fullName}
-                    </a>
-                    <span
-                      >{numberFormat.format(repo.events)} activity {repo.events === 1
-                        ? "item"
-                        : "items"} · last active {relativeDate(repo.lastActiveAt)}</span
-                    >
-                  </div>
-                  <a class="activity-repository-open" href={repo.url} target="_blank" rel="noreferrer">
-                    GitHub ↗
-                  </a>
-                </header>
-
-                <div class="activity-weight" aria-hidden="true">
-                  <i style={`width: ${percent(repo.events, activityMaxRepoEvents)}%`}></i>
-                </div>
-
-                <div class="activity-repository-breakdown">
-                  {#each activityBreakdown(repo) as item}
-                    <span><strong>{numberFormat.format(item.value)}</strong> {item.label}</span>
-                  {/each}
-                </div>
-
-                <div class="activity-repository-summary">
-                  <span class="panel-kicker">AI summary</span>
-                  {#if activityRepositorySummary(repo.fullName)}
-                    <p>{activityRepositorySummary(repo.fullName)}</p>
-                  {:else if activity.summary?.state === "warming"}
-                    <p class="muted">Summarizing this repository.</p>
-                  {:else}
-                    <p class="muted">No repository summary available.</p>
-                  {/if}
-                </div>
-
-                <details class="activity-event-details">
-                  <summary>
-                    <span>event log</span>
-                    <small>{activityRepositoryEvents(repo.fullName).length} grouped entries</small>
-                  </summary>
-                  <div class="activity-event-list">
-                    {#each activityRepositoryEvents(repo.fullName) as event (event.id)}
-                      {#if event.url}
-                        <a href={event.url} target="_blank" rel="noreferrer">
-                          <span class={`activity-kind kind-${event.kind}`}>{activityKindLabel(event.kind)}</span>
-                          <strong>{event.title}</strong>
-                          {#if event.count > 1}<small>×{event.count}</small>{/if}
-                          <time datetime={event.createdAt}>{relativeDate(event.createdAt)}</time>
-                        </a>
-                      {:else}
-                        <div>
-                          <span class={`activity-kind kind-${event.kind}`}>{activityKindLabel(event.kind)}</span>
-                          <strong>{event.title}</strong>
-                          {#if event.count > 1}<small>×{event.count}</small>{/if}
-                          <time datetime={event.createdAt}>{relativeDate(event.createdAt)}</time>
-                        </div>
-                      {/if}
-                    {/each}
-                  </div>
-                </details>
-              </div>
-            </article>
-          {/each}
-        </div>
-      {:else if activity && !activityLoading}
-        <div class="loading-state empty-state">
-          <span class="loading-kicker">quiet range</span>
-          <strong>no public work found</strong>
-          <small>Try a longer time range.</small>
-        </div>
-      {/if}
-    </section>
+    <OwnerActivityPage
+      {activityPageRoute}
+      {activityRange}
+      {activityRanges}
+      {activityLoading}
+      {activityError}
+      {activity}
+      {setActivityRange}
+    />
   {:else if repoRoute}
-    <section class="repo-detail" aria-label="Repository detail">
-      {#if errorMessage}
-        <div class="error-state">
-          <span class="loading-kicker">repository unavailable</span>
-          <strong>{errorMessage}</strong>
-          <small>ReleaseBar only reads public GitHub metadata. Connected GitHub App quota can make public repo refreshes more reliable.</small>
-          {#if !rateLimitHit && (auth?.configured || auth?.quotaConfigured) && !auth.user}
-            <button type="button" onclick={primaryAuthAction}>{primaryAuthLabel(auth)}</button>
-          {/if}
-        </div>
-      {:else if !repoDetail}
-        <div class="loading-state" aria-live="polite">
-          <span class="loading-kicker">fetching repository</span>
-          <strong>loading stats</strong>
-          <small>GitHub release and activity data is being cached.</small>
-          <div class="loading-bars" aria-hidden="true">
-            <span></span>
-            <span></span>
-            <span></span>
-          </div>
-        </div>
-      {:else}
-        {#if repoDetail.cache.state === "warming" || repoDetail.cache.state === "stale"}
-          <div class="partial-state" aria-live="polite">
-            <span>{repoDetail.cache.state === "warming" ? "stats warming" : "cached stats visible"}</span>
-            <strong>{repoDetail.cache.message ?? "Repository statistics are refreshing."}</strong>
-          </div>
-        {/if}
-        <div class="detail-grid">
-          <section class="detail-panel detail-overview">
-            <div>
-              <span class="panel-kicker">release</span>
-              <strong
-                style={detailValueStyle(repoDetail.project.version)}
-                title={repoDetail.project.version}
-                use:fitDetailValue={repoDetail.project.version}
-              >
-                {repoDetail.project.version}
-              </strong>
-              <small>{shortDate(repoDetail.project.releaseDate)} · {relativeDate(repoDetail.project.releaseDate)}</small>
-            </div>
-            <div>
-              <span class="panel-kicker">commits since</span>
-              <strong
-                style={detailValueStyle(repoDetail.project.commitsSinceRelease ?? "n/a")}
-                use:fitDetailValue={repoDetail.project.commitsSinceRelease ?? "n/a"}
-              >
-                {repoDetail.project.commitsSinceRelease ?? "n/a"}
-              </strong>
-              <small>{repoDetail.project.freshness}</small>
-            </div>
-            <div>
-              <span class="panel-kicker">stars</span>
-              <strong
-                style={detailValueStyle(numberFormat.format(repoDetail.project.stars))}
-                use:fitDetailValue={numberFormat.format(repoDetail.project.stars)}
-              >
-                {numberFormat.format(repoDetail.project.stars)}
-              </strong>
-              <small>{numberFormat.format(repoDetail.project.forks)} forks</small>
-            </div>
-            <div>
-              <span class="panel-kicker">open work</span>
-              <strong
-                style={detailValueStyle(countLabel(openWorkCount(repoDetail.project)))}
-                use:fitDetailValue={countLabel(openWorkCount(repoDetail.project))}
-              >
-                {countLabel(openWorkCount(repoDetail.project))}
-              </strong>
-              <small>{countLabel(repoDetail.project.openIssues)} issues · {countLabel(repoDetail.project.openPullRequests)} PRs</small>
-            </div>
-            <div>
-              <span class="panel-kicker">cadence</span>
-              <strong
-                style={detailValueStyle(formatDays(releaseCadence.medianDays))}
-                use:fitDetailValue={formatDays(releaseCadence.medianDays)}
-              >
-                {formatDays(releaseCadence.medianDays)}
-              </strong>
-              <small>median release gap · {releaseCadence.releaseCount} recent releases</small>
-            </div>
-          </section>
-
-          <section class="detail-panel detail-wide">
-            <div class="panel-heading">
-              <div>
-                <span class="panel-kicker">commit graph</span>
-                <h2>last year</h2>
-              </div>
-              <strong>{numberFormat.format(commitTotal())} commits</strong>
-            </div>
-            {#if repoDetail.commitActivity.length > 0}
-              <div class="spark-bars" aria-label="Weekly commits">
-                {#each repoDetail.commitActivity as week}
-                  <button
-                    type="button"
-                    aria-label={`${shortDate(week.week)} · ${numberFormat.format(week.total)} commits`}
-                    data-tooltip={`${shortDate(week.week)} · ${numberFormat.format(week.total)} commits`}
-                    style={`height: ${percent(week.total, detailMaxCommits)}%`}
-                  ></button>
-                {/each}
-              </div>
-            {:else}
-              <p class="detail-empty">Commit activity is still warming or unavailable.</p>
-            {/if}
-          </section>
-
-          <section class="detail-panel detail-wide release-summary">
-            <div class="panel-heading">
-              <div>
-                <span class="panel-kicker">AI summary</span>
-                <h2>{repoSummaryRange === "release" ? "since last release" : "recent work"}</h2>
-              </div>
-              <div class="range-toggle" aria-label="Repository summary range">
-                {#each repoSummaryRanges as range}
-                  <button
-                    class:active={repoSummaryRange === range.value}
-                    type="button"
-                    aria-pressed={repoSummaryRange === range.value}
-                    onclick={() => setRepoSummaryRange(range.value)}
-                  >
-                    {range.label}
-                  </button>
-                {/each}
-              </div>
-            </div>
-            {#if repoSummaryRange === "release"}
-              {#if repoDetail.releaseSummary?.state === "ready" && repoDetail.releaseSummary.text}
-                <p>{repoDetail.releaseSummary.text}</p>
-                <small>{releaseSummaryMeta(repoDetail.releaseSummary)}</small>
-              {:else if repoDetail.releaseSummary?.state === "warming"}
-                <p>Summarizing commit titles since the latest release.</p>
-                <small>{releaseSummaryMeta(repoDetail.releaseSummary)}</small>
-              {:else if repoDetail.releaseSummary?.message}
-                <p class="detail-empty">{repoDetail.releaseSummary.message}</p>
-              {:else}
-                <p class="detail-empty">No release summary is available yet.</p>
-              {/if}
-            {:else if repoActivityLoading}
-              <p>Loading recent work.</p>
-            {:else if repoActivity?.summary?.state === "ready" && repoActivity.summary.text}
-              <p>{repoActivity.summary.text}</p>
-              <small>{repoActivityMeta(repoActivity)}</small>
-            {:else if repoActivity?.summary?.state === "warming"}
-              <p>Summarizing recent work.</p>
-              <small>{repoActivityMeta(repoActivity)}</small>
-            {:else if repoActivity?.summary?.message}
-              <p class="detail-empty">{repoActivity.summary.message}</p>
-            {:else if repoActivityError}
-              <p class="detail-empty">{repoActivityError}</p>
-            {:else}
-              <p class="detail-empty">Recent work will appear here when GitHub returns enough signal.</p>
-            {/if}
-          </section>
-
-          <section class="detail-panel">
-            <div class="panel-heading">
-              <div>
-                <span class="panel-kicker">contributors</span>
-                <h2>top committers</h2>
-              </div>
-            </div>
-            <div class="contributor-list">
-              {#each repoDetail.contributors as contributor}
-                <a
-                  class="contributor-row"
-                  href={contributor.url ? ownerDashboardPath(contributor.login) : repoDetailPath(repoDetail.fullName)}
-                >
-                  {#if contributor.avatarUrl}
-                    <img src={contributor.avatarUrl} alt="" width="26" height="26" loading="lazy" />
-                  {:else}
-                    <span class="avatar-fallback" aria-hidden="true"></span>
-                  {/if}
-                  <span class="contributor-name">
-                    <span>{contributor.login}</span>
-                    {#if contributor.trustScore !== undefined}
-                      <small
-                        class={`person-score-pill tier-${contributor.trustTier ?? "low"}`}
-                        title={personTrustScoreTooltip(contributor.trustScore)}
-                        aria-label={personTrustScoreTooltip(contributor.trustScore)}
-                      >
-                        {numberFormat.format(contributor.trustScore)}
-                      </small>
-                    {/if}
-                  </span>
-                  <strong>{numberFormat.format(contributor.commits)}</strong>
-                  <i style={`width: ${percent(contributor.commits, detailMaxContributorCommits)}%`}></i>
-                </a>
-              {/each}
-            </div>
-          </section>
-
-          <section class="detail-panel">
-            <div class="panel-heading">
-              <div>
-                <span class="panel-kicker">releases</span>
-                <h2>latest versions</h2>
-              </div>
-              <strong>{formatDays(releaseCadence.latestGapDays)}</strong>
-            </div>
-            <div class="release-groups">
-              {#if stableReleases.length > 0}
-                <div class="release-group">
-                  <span class="release-group-label">stable</span>
-                  <div class="release-list">
-                    {#each stableReleases as release}
-                      <a class="external-link" href={release.url} target="_blank" rel="noreferrer">
-                        <strong>{release.tagName}</strong>
-                        <span>{shortDate(release.publishedAt)} · {relativeDate(release.publishedAt)}</span>
-                      </a>
-                    {/each}
-                  </div>
-                </div>
-              {/if}
-              {#if preReleases.length > 0}
-                <div class="release-group">
-                  <span class="release-group-label">pre</span>
-                  <div class="release-list">
-                    {#each preReleases as release}
-                      <a class="external-link" href={release.url} target="_blank" rel="noreferrer">
-                        <strong>{release.tagName}</strong>
-                        <span>{shortDate(release.publishedAt)} · {relativeDate(release.publishedAt)}</span>
-                      </a>
-                    {/each}
-                  </div>
-                </div>
-              {/if}
-              {#if stableReleases.length === 0 && preReleases.length === 0}
-                <p class="detail-empty">Release history is unavailable.</p>
-              {/if}
-            </div>
-          </section>
-
-          <section class="detail-panel">
-            <div class="panel-heading">
-              <div>
-                <span class="panel-kicker">open work trend</span>
-                <h2>last 30 days</h2>
-              </div>
-            </div>
-            {#if workTrend}
-              <div class="work-trend">
-                <div>
-                  <span>issues opened</span>
-                  <strong>{numberFormat.format(workTrend.issuesOpened30d)}</strong>
-                  <i style={`width: ${percent(workTrend.issuesOpened30d, Math.max(workTrend.issuesOpened30d, workTrend.issuesClosed30d, 1))}%`}></i>
-                </div>
-                <div>
-                  <span>issues closed</span>
-                  <strong>{numberFormat.format(workTrend.issuesClosed30d)}</strong>
-                  <i style={`width: ${percent(workTrend.issuesClosed30d, Math.max(workTrend.issuesOpened30d, workTrend.issuesClosed30d, 1))}%`}></i>
-                </div>
-                <div>
-                  <span>PRs opened</span>
-                  <strong>{numberFormat.format(workTrend.pullRequestsOpened30d)}</strong>
-                  <i style={`width: ${percent(workTrend.pullRequestsOpened30d, Math.max(workTrend.pullRequestsOpened30d, workTrend.pullRequestsClosed30d, 1))}%`}></i>
-                </div>
-                <div>
-                  <span>PRs merged/closed</span>
-                  <strong>{numberFormat.format(workTrend.pullRequestsClosed30d)}</strong>
-                  <i style={`width: ${percent(workTrend.pullRequestsClosed30d, Math.max(workTrend.pullRequestsOpened30d, workTrend.pullRequestsClosed30d, 1))}%`}></i>
-                </div>
-              </div>
-            {:else}
-              <p class="detail-empty">Issue and PR trend data is warming or unavailable.</p>
-            {/if}
-          </section>
-
-          <section class="detail-panel">
-            <div class="panel-heading">
-              <div>
-                <span class="panel-kicker">languages</span>
-                <h2>repo mix</h2>
-              </div>
-            </div>
-            <div class="language-bars">
-              {#each repoDetail.languages.slice(0, 6) as repoLanguage}
-                <div>
-                  <span>{repoLanguage.name}</span>
-                  <strong>{percentOfTotal(repoLanguage.bytes, detailLanguageTotal)}%</strong>
-                  <i style={`width: ${percentOfTotal(repoLanguage.bytes, detailLanguageTotal)}%`}></i>
-                </div>
-              {/each}
-            </div>
-          </section>
-
-          <section class="detail-panel detail-wide audience-panel" aria-label="Recent stargazer audience">
-            <div class="panel-heading audience-heading">
-              <div>
-                <span class="panel-kicker">audience</span>
-                <h2>new stargazers</h2>
-              </div>
-              <div class="range-toggle" aria-label="Audience range">
-                {#each audienceRanges as range}
-                  <button
-                    class:active={audienceRange === range.value}
-                    type="button"
-                    aria-pressed={audienceRange === range.value}
-                    onclick={() => setAudienceRange(range.value)}
-                  >
-                    {range.label}
-                  </button>
-                {/each}
-                <button type="button" disabled={audienceBackfillLoading} onclick={backfillRepoAudience}>
-                  {audienceBackfillLoading ? "backfilling" : "backfill"}
-                </button>
-              </div>
-            </div>
-            {#if audienceBackfillMessage}
-              <p class="detail-empty audience-backfill-message">{audienceBackfillMessage}</p>
-            {/if}
-            {#if audienceLoading}
-              <p class="detail-empty">Scoring recent public stargazer profiles.</p>
-            {:else if audienceError}
-              <p class="detail-empty">{audienceError}</p>
-            {:else if audience}
-              <div class="audience-summary" aria-label={audienceMeta(audience)}>
-                <div>
-                  <span>stargazers</span>
-                  <strong>{numberFormat.format(audienceTotalStargazers(audience))}</strong>
-                </div>
-                <div>
-                  <span>high</span>
-                  <strong>{audienceShare(audience, audience.totals.highSignal, audience.totals.highSignalPercent)}</strong>
-                </div>
-                <div>
-                  <span>medium</span>
-                  <strong>{audienceShare(audience, audience.totals.mediumSignal, audience.totals.mediumSignalPercent)}</strong>
-                </div>
-                <div>
-                  <span>bots</span>
-                  <strong>{audienceShare(audience, audience.totals.bots, audience.totals.botPercent)}</strong>
-                </div>
-              </div>
-              {#if audience.users.length > 0}
-                <div class="audience-tools">
-                  <input
-                    bind:value={audienceQuery}
-                    type="search"
-                    autocomplete="off"
-                    spellcheck="false"
-                    placeholder="find people, orgs, companies, repos"
-                    aria-label="Find stargazers"
-                  />
-                  <span>
-                    {numberFormat.format(filteredAudienceUsers.length)} / {numberFormat.format(audience.users.length)}
-                  </span>
-                </div>
-                <div class="audience-list">
-                  {#each filteredAudienceUsers as user}
-                    <a class="audience-row" href={ownerDashboardPath(user.login)}>
-                      <img src={user.avatarUrl} alt="" width="34" height="34" loading="lazy" />
-                      <span class="audience-user">
-                        <strong>
-                          <span>{user.login}</span>
-                          {#if user.trustScore !== undefined}
-                            <small
-                              class={`person-score-pill tier-${user.trustTier ?? "low"}`}
-                              title={personTrustScoreTooltip(user.trustScore)}
-                              aria-label={personTrustScoreTooltip(user.trustScore)}
-                            >
-                              {numberFormat.format(user.trustScore)}
-                            </small>
-                          {/if}
-                        </strong>
-                        <small>{user.name || user.company || audienceReasonText(user.reasons)}</small>
-                        {#if audienceInsightText(user)}
-                          <small>{audienceInsightText(user)}</small>
-                        {/if}
-                      </span>
-                      <span class="audience-score">
-                        <span class={`audience-tier tier-${user.tier}`}>{user.tier}</span>
-                        <strong>{numberFormat.format(user.score)}</strong>
-                        <small>{numberFormat.format(user.followers)} followers · {numberFormat.format(user.publicRepos)} repos</small>
-                      </span>
-                    </a>
-                  {/each}
-                </div>
-                <small class="audience-note">{audienceMeta(audience)} · public stargazer profile signals only</small>
-                {#if filteredAudienceUsers.length === 0}
-                  <p class="detail-empty">No stargazers match that search.</p>
-                {/if}
-              {:else}
-                <p class="detail-empty">No recent public stargazers in this range.</p>
-              {/if}
-            {:else}
-              <p class="detail-empty">Audience signals are warming.</p>
-            {/if}
-          </section>
-
-          {#if showCodeChurn(repoDetail)}
-            <section class="detail-panel detail-tail">
-              <div class="panel-heading">
-                <div>
-                  <span class="panel-kicker">code churn</span>
-                  <h2>last year</h2>
-                </div>
-              </div>
-              {#if repoDetail.codeFrequency.length > 0}
-                <div class="churn-meter">
-                  <div>
-                    <span>additions</span>
-                    <strong>{numberFormat.format(codeTotal("additions"))}</strong>
-                  </div>
-                  <div>
-                    <span>deletions</span>
-                    <strong>{numberFormat.format(codeTotal("deletions"))}</strong>
-                  </div>
-                </div>
-              {:else}
-                <p class="detail-empty">GitHub is preparing code-frequency stats. ReleaseBar will refresh this panel.</p>
-              {/if}
-            </section>
-          {/if}
-        </div>
-      {/if}
-    </section>
+    <RepoDetail
+      {errorMessage}
+      {rateLimitHit}
+      {auth}
+      {primaryAuthAction}
+      {primaryAuthLabel}
+      {repoDetail}
+      {repoSummaryRange}
+      {repoSummaryRanges}
+      {repoActivity}
+      {repoActivityLoading}
+      {repoActivityError}
+      {setRepoSummaryRange}
+      {audienceRange}
+      {audienceRanges}
+      bind:audienceQuery
+      {audience}
+      {audienceLoading}
+      {audienceError}
+      {audienceBackfillLoading}
+      {audienceBackfillMessage}
+      {setAudienceRange}
+      {backfillRepoAudience}
+    />
   {:else}
-  {#if showTrustProfile && ownerTab === "overview"}
-    <section class="trust-snapshot" aria-label={`${ownerSignalLabel()} summary`}>
-      {#if trustProfileLoading}
-        <span class="panel-kicker">{ownerSignalTabLabel()}</span>
-        <strong>loading</strong>
-        <small>{ownerSignalDescription()}</small>
-      {:else if trustProfileError}
-        <span class="panel-kicker">{ownerSignalTabLabel()}</span>
-        <strong>unavailable</strong>
-        <small>{trustProfileError}</small>
-      {:else if trustProfile}
-        <div class="trust-snapshot-score" title={ownerSignalTooltip(trustProfile)} aria-label={`${ownerSignalLabel(trustProfile)} ${trustProfile.score}: ${ownerSignalTooltip(trustProfile)}`}>
-          <span class="panel-kicker">{ownerSignalLabel(trustProfile)}</span>
-          <strong>{trustProfile.score}</strong>
-          <small class={`audience-tier tier-${trustProfile.tier}`}>{trustProfile.tier}</small>
-        </div>
-        <div>
-          <span>GitHub age</span>
-          <strong>{trustProfileAge(trustProfile)}</strong>
-        </div>
-        <div>
-          <span>reach</span>
-          <strong>{numberFormat.format(trustProfile.followers)} followers</strong>
-        </div>
-        <div>
-          <span>{trustProfile.type === "org" ? "footprint" : "builder"}</span>
-          <strong>{numberFormat.format(trustProfile.stats.activeRepositories)} active repos</strong>
-        </div>
-        <button type="button" onclick={() => setOwnerTab("trust")}>factors</button>
-      {:else}
-        <span class="panel-kicker">{ownerSignalTabLabel()}</span>
-        <strong>pending</strong>
-        <small>{ownerSignalDescription()} will appear here.</small>
-      {/if}
-    </section>
-  {/if}
-
-  {#if showTrustProfile && ownerTab === "trust"}
-    <section class="trust-panel" aria-label={`GitHub ${ownerSignalLabel()} profile`}>
-      <div class="panel-heading">
-        <div title={ownerSignalTooltip(trustProfile)} aria-label={trustProfile ? `${ownerSignalLabel(trustProfile)} ${trustProfile.score}: ${ownerSignalTooltip(trustProfile)}` : ownerSignalTooltip(trustProfile)}>
-          <span class="panel-kicker">{ownerSignalTabLabel()}</span>
-          <h2>{trustProfile ? `${trustProfile.score}` : "loading"}</h2>
-        </div>
-        <div class="trust-panel-actions">
-          {#if trustProfile}
-            <span class={`audience-tier tier-${trustProfile.tier}`}>{trustProfile.tier}</span>
-          {/if}
-          <button type="button" onclick={() => setOwnerTab("overview")}>overview</button>
-        </div>
-      </div>
-
-      {#if trustProfileLoading}
-        <p class="activity-text">Loading {ownerSignalDescription()}.</p>
-      {:else if trustProfileError}
-        <p class="activity-text muted">{trustProfileError}</p>
-      {:else if trustProfile}
-        <div class="trust-summary" aria-label={trustProfileMeta(trustProfile)}>
-          <div>
-            <span>GitHub age</span>
-            <strong>{trustProfileAge(trustProfile)}</strong>
-          </div>
-          <div>
-            <span>public reach</span>
-            <strong>{numberFormat.format(trustProfile.followers)} followers</strong>
-          </div>
-          <div>
-            <span>{trustProfile.type === "org" ? "repo footprint" : "builder proof"}</span>
-            <strong>{numberFormat.format(trustProfile.stats.activeRepositories)} active repos</strong>
-          </div>
-          <div>
-            <span>repo stars</span>
-            <strong>{numberFormat.format(trustProfile.stats.totalStars)}</strong>
-          </div>
-        </div>
-
-        <div class="trust-dimensions" aria-label={`${ownerSignalLabel(trustProfile)} dimensions`}>
-          {#each trustDimensionEntries(trustProfile) as [label, value]}
-            <span>
-              <small>{label}</small>
-              <strong>{value}</strong>
-            </span>
-          {/each}
-        </div>
-
-        {#if trustFactorEntries(trustProfile).length > 0}
-          <div class="trust-factors" aria-label={`${ownerSignalLabel(trustProfile)} factors`}>
-            {#each trustFactorEntries(trustProfile) as factor}
-              <div class:negative={factor.sentiment === "negative"}>
-                <span>
-                  <strong>{factor.label}</strong>
-                  <small>{factor.detail}</small>
-                </span>
-                <span class="factor-value">{factor.value}/{factor.maxValue}</span>
-                <b style={`--factor-width: ${Math.min(100, Math.round((factor.value / Math.max(1, factor.maxValue)) * 100))}%`}></b>
-                <em class="factor-impact">{factorContribution(factor.weightedValue)}</em>
-              </div>
-            {/each}
-          </div>
-        {/if}
-
-        <p class="trust-reasons">{audienceReasonText(trustProfile.reasons)}</p>
-
-        {#if trustProfile.topRepositories.length > 0}
-          <div class="trust-table" aria-label="Repository evidence">
-            {#each trustProfile.topRepositories as repo}
-              <a href={repoDetailPath(repo.fullName)}>
-                <span>
-                  <strong>{repo.fullName}</strong>
-                  <small>{repo.language || repo.topics.slice(0, 2).join(", ") || "public repo"}</small>
-                </span>
-                <span>{numberFormat.format(repo.stars)} stars</span>
-              </a>
-            {/each}
-          </div>
-        {/if}
-
-        <div class="trust-tags" aria-label="Profile signals">
-          {#each trustProfile.stats.languages as item}
-            <span>{item.name} × {item.count}</span>
-          {/each}
-          {#each trustProfile.stats.topics.slice(0, 4) as item}
-            <span>{item.name} × {item.count}</span>
-          {/each}
-          {#each trustProfile.orgs.slice(0, 4) as org}
-            <span>@{org.login}</span>
-          {/each}
-        </div>
-        <small class="activity-meta">{trustProfileMeta(trustProfile)} · public {trustProfile.type === "org" ? "organization" : "profile"} signals only</small>
-      {:else}
-        <p class="activity-text muted">{ownerSignalDescription()} will appear here when available.</p>
-      {/if}
-    </section>
-  {/if}
-
-  {#if showOwnerActivity && ownerTab === "overview"}
-    <section class="activity-panel" aria-label="Recent public activity">
-      <div class="panel-heading">
-        <div>
-          <span class="panel-kicker">working on</span>
-        </div>
-        <div class="range-toggle" aria-label="Activity range">
-          {#each activityRanges as range}
-            <button
-              class:active={activityRange === range.value}
-              type="button"
-              aria-pressed={activityRange === range.value}
-              onclick={() => setActivityRange(range.value)}
-            >
-              {range.label}
-            </button>
-          {/each}
-        </div>
-      </div>
-
-      {#if activityLoading}
-        <p class="activity-text">Loading recent work.</p>
-      {:else if activity?.summary?.state === "ready" && activity.summary.text}
-        <p class="activity-text">{activity.summary.text}</p>
-      {:else if activity?.summary?.state === "warming"}
-        <p class="activity-text">Summarizing recent work.</p>
-      {:else if activity?.summary?.message}
-        <p class="activity-text muted">{activity.summary.message}</p>
-      {:else if activityError}
-        <p class="activity-text muted">{activityError}</p>
-      {:else}
-        <p class="activity-text muted">Recent work will appear here when GitHub returns enough signal.</p>
-      {/if}
-
-      {#if activity}
-        <div class="activity-digest">
-          <div class="activity-stats" aria-label="Activity totals">
-            <span><strong>{numberFormat.format(activity.totals.commits)}</strong><small>commits</small></span>
-            <span><strong>{numberFormat.format(activity.totals.pullRequests)}</strong><small>PRs</small></span>
-            <span><strong>{numberFormat.format(activity.totals.issues)}</strong><small>issues</small></span>
-            <span><strong>{numberFormat.format(activity.totals.comments)}</strong><small>comments</small></span>
-          </div>
-          {#if activity.repositories.length > 0}
-            <div class="activity-repos" aria-label="Most active repositories">
-              {#each activity.repositories.slice(0, 5) as repo, index}
-                <a href={repoDetailPath(repo.fullName)}>
-                  <span>{repo.fullName}</span>
-                  <small aria-label={`${numberFormat.format(repo.events)} activity items`}>
-                    {numberFormat.format(repo.events)}
-                  </small>
-                  <span class="activity-repo-rank" aria-hidden="true">{index + 1}</span>
-                </a>
-              {/each}
-            </div>
-          {/if}
-        </div>
-        <div class="activity-footer">
-          <small class="activity-meta">
-            {activityMeta(activity)}
-            {#if activity.cache.state === "stale"}
-              · refreshing
-            {/if}
-          </small>
-          {#if initialRoute.owner}
-            <a class="activity-drilldown" href={ownerActivityPath(initialRoute.owner, activityRange)}>
-              view grouped activity <span aria-hidden="true">→</span>
-            </a>
-          {/if}
-        </div>
-      {/if}
-    </section>
-  {/if}
-
-  {#if !showTrustProfile || ownerTab === "overview"}
-  <section class="console" aria-label="Project search and metrics">
-    <div class="prompt">
-      <span class="mark">$</span>
-      <input
-        bind:value={query}
-        type="search"
-        autocomplete="off"
-        spellcheck="false"
-        placeholder="search repos, languages, owners, versions"
+    <OwnerOverview
+      {showTrustProfile}
+      bind:ownerTab
+      {trustProfileLoading}
+      {trustProfileError}
+      {trustProfile}
+      ownerType={heroOwner?.type ?? null}
+      {showOwnerActivity}
+      {activityRanges}
+      {activityRange}
+      {activityLoading}
+      {activityError}
+      {activity}
+      owner={initialRoute.owner}
+      {setActivityRange}
+    />
+    {#if !showTrustProfile || ownerTab === "overview"}
+      <ProjectTable
+        bind:query
+        bind:language
+        bind:filter
+        {sortKey}
+        {sortDirection}
+        {devMode}
+        {visibleProjects}
+        {filteredProjects}
+        {errorMessage}
+        {dashboardFetching}
+        {dashboardUpdating}
+        {data}
+        {rateLimitHit}
+        {auth}
+        {showProjectOwnerAvatars}
+        {setSort}
+        {setDevMode}
+        {toggleLanguageFilter}
+        {primaryAuthAction}
+        {primaryAuthLabel}
+        {projectOwnerAvatarUrl}
       />
-      <button
-        class="quick-jump"
-        type="button"
-        aria-label="Open command palette"
-        onclick={() => paletteStore.update((s: PaletteStoreParams) => ({ ...s, isVisible: true }))}
-      >
-        <span aria-hidden="true">⌘</span>
-        <span aria-hidden="true">K</span>
-      </button>
-    </div>
-    <div class="metrics">
-      <button
-        class="metric-action"
-        class:active={sortKey === "repo"}
-        type="button"
-        aria-pressed={sortKey === "repo"}
-        onclick={() => setSort("repo")}
-      >
-        <span>{numberFormat.format(visibleProjects.length)}</span>
-        <small>repos</small>
-      </button>
-      <button
-        class="metric-action"
-        class:active={sortKey === "release"}
-        type="button"
-        aria-pressed={sortKey === "release"}
-        onclick={() => setSort("release")}
-      >
-        <span>{numberFormat.format(visibleProjects.filter((project) => project.releaseDate).length)}</span>
-        <small>released</small>
-      </button>
-      <button
-        class="metric-action"
-        class:active={sortKey === "since"}
-        type="button"
-        aria-pressed={sortKey === "since"}
-        onclick={() => setSort("since")}
-      >
-        <span>
-          {numberFormat.format(
-            visibleProjects.reduce((sum, project) => sum + (project.commitsSinceRelease || 0), 0),
-          )}
-        </span>
-        <small>commits since release</small>
-      </button>
-      <button
-        class="metric-action"
-        class:active={filter === "attention"}
-        type="button"
-        aria-pressed={filter === "attention"}
-        title="Show repositories with unreleased commits, stale releases, failed CI, or open-work pressure"
-        onclick={() => (filter = filter === "attention" ? "all" : "attention")}
-      >
-        <span>{numberFormat.format(visibleProjects.filter(needsAttention).length)}</span>
-        <small>need attention</small>
-      </button>
-    </div>
-  </section>
-
-  <nav class="filters" aria-label="Filters">
-    {#each filterOptions as option}
-      <button class:active={filter === option} type="button" onclick={() => (filter = option)}>
-        {filterLabel(option)}
-      </button>
-    {/each}
-    <label class="dev-toggle">
-      <input type="checkbox" checked={devMode} onchange={(event) => setDevMode((event.currentTarget as HTMLInputElement).checked)} />
-      <span>dev</span>
-    </label>
-  </nav>
-
-  <section class="table-wrap" aria-label="Repositories">
-    <div class="table-head">
-      {#each [...sortOptions, ...devSortOptions] as key}
-        <button
-          class:dev-only={devSortOptions.includes(key)}
-          class:since-heading={key === "since"}
-          type="button"
-          aria-label={sortButtonLabel(key)}
-          aria-current={sortKey === key ? "true" : undefined}
-          data-direction={sortKey === key ? sortDirection : ""}
-          data-sort-symbol={sortKey === key ? sortDirectionGlyph(sortDirection) : ""}
-          onclick={() => setSort(key)}
-        >
-          {#if key === "since"}
-            <span class="label-full">commits since</span>
-            <span class="label-compact">since</span>
-          {:else}
-            {sortLabel(key)}
-          {/if}
-        </button>
-      {/each}
-    </div>
-    <div class="projects">
-      {#if errorMessage}
-        <div class="error-state">
-          <span class="loading-kicker">dashboard unavailable</span>
-          <strong>{errorMessage}</strong>
-          <small>Unknown owners, cold caches, and GitHub rate limits can all land here. Connecting GitHub gives ReleaseBar dedicated App quota for dashboards you can access.</small>
-          {#if !rateLimitHit && (auth?.configured || auth?.quotaConfigured) && !auth.user}
-            <button type="button" onclick={primaryAuthAction}>{primaryAuthLabel(auth)}</button>
-          {/if}
-        </div>
-      {:else if dashboardFetching}
-        <div class="loading-state" aria-live="polite">
-          <span class="loading-kicker">fetching dashboard</span>
-          <strong>{data?.cache?.message ?? "building release data"}</strong>
-          <small>GitHub data is being cached. This dashboard will refresh automatically.</small>
-          <div class="loading-bars" aria-hidden="true">
-            <span></span>
-            <span></span>
-            <span></span>
-          </div>
-        </div>
-      {:else if filteredProjects.length === 0}
-        <div class="loading-state empty-state">
-          <span class="loading-kicker">no matching repos</span>
-          <strong>nothing visible here</strong>
-          <small>Adjust search, filters, or dashboard settings.</small>
-        </div>
-      {:else}
-        {#if dashboardUpdating}
-          <div class="partial-state" aria-live="polite">
-            <span>cached rows visible · background update running</span>
-            <strong>{data?.cache?.message ?? "combined dashboard updating"}</strong>
-            {#if data?.cache?.progress}
-              <div
-                class="scan-meter"
-                aria-label={`Scanned ${data.cache.progress.scanned} of ${data.cache.progress.limit ?? data.cache.repoLimit ?? data.cache.progress.scanned} repositories`}
-              >
-                <i
-                  style={`width: ${percent(
-                    data.cache.progress.scanned,
-                    data.cache.progress.limit ?? data.cache.repoLimit ?? data.cache.progress.scanned,
-                  )}%`}
-                ></i>
-              </div>
-              <small>
-                scanned {numberFormat.format(data.cache.progress.scanned)}
-                {#if data.cache.progress.limit}
-                  /{numberFormat.format(data.cache.progress.limit)}
-                {/if}
-                repositories; rows update automatically as GitHub responds
-              </small>
-            {/if}
-          </div>
-          {/if}
-        {#each filteredProjects as project (project.fullName)}
-        <div
-          class="project"
-          data-freshness={project.freshness}
-          role="link"
-          tabindex="0"
-          aria-label={`${project.fullName}: ${attentionText(project)}`}
-          onclick={(event) => rowClick(event, project.fullName)}
-          onkeydown={(event) => rowKeydown(event, project.fullName)}
-        >
-          <div class="repo-cell">
-            <div class="repo-title">
-              {#if showProjectOwnerAvatars}
-                <a
-                  class="row-owner-avatar-link"
-                  href={ownerDashboardPath(project.owner)}
-                  title={`Open @${project.owner} dashboard`}
-                  aria-label={`Open @${project.owner} dashboard`}
-                >
-                  <img
-                    class="row-owner-avatar"
-                    src={projectOwnerAvatarUrl(project)}
-                    alt=""
-                    width="28"
-                    height="28"
-                    loading="lazy"
-                  />
-                </a>
-              {/if}
-              <span class="repo-name-line">
-                <a class="owner-link" href={ownerDashboardPath(project.owner)} title={`Open @${project.owner} dashboard`}>
-                  {project.owner}
-                </a>
-                <span class="repo-separator" aria-hidden="true">/</span>
-                <a class="repo-link" href={repoDetailPath(project.fullName)} title="Open repo detail">
-                  {project.name}
-                </a>
-              </span>
-            </div>
-            <p class="description">{project.description || "no description"}</p>
-            <div class="tags">
-              {#if project.language}
-                <button
-                  class="tag tag-button"
-                  class:active={activeLanguage(project.language)}
-                  type="button"
-                  aria-pressed={activeLanguage(project.language)}
-                  title={`Filter by ${project.language}`}
-                  onclick={() => toggleLanguageFilter(project.language ?? "")}
-                >
-                  {project.language}
-                </button>
-              {/if}
-              {#each (project.topics ?? []).slice(0, 4) as topic}
-                <button
-                  class="tag tag-button"
-                  class:active={query.trim().toLowerCase() === topic.toLowerCase()}
-                  type="button"
-                  aria-pressed={query.trim().toLowerCase() === topic.toLowerCase()}
-                  title={`Search ${topic}`}
-                  onclick={() => setTopicSearch(topic)}
-                >
-                  {topic}
-                </button>
-              {/each}
-              {#if project.archived}<span class="tag muted">archived</span>{/if}
-              <span class="tag">{project.freshness}</span>
-            </div>
-            {#if releaseDebtText(project)}
-              <p class="attention-reasons">
-                <span>needs attention</span>
-                {releaseDebtText(project)}
-              </p>
-            {/if}
-          </div>
-          <div class="stars-cell">
-            <strong>{numberFormat.format(project.stars)}</strong>
-          </div>
-          <div class="release-cell">
-            {#if isRepositorySearchProject(project)}
-              <strong>repo search</strong>
-              <a class="release-version" href={repoDetailPath(project.fullName)}>
-                open repo
-              </a>
-              <span class:scan-pending={data?.cache?.progress?.done === false}>
-                {repositorySearchStatus()}
-              </span>
-            {:else}
-              <strong>{absoluteDate(project.releaseDate)}</strong>
-              {#if project.releaseDate}
-                <a
-                  class="release-version external-link"
-                  href={project.releaseUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  title={`Open release ${project.version}`}
-                >
-                  {project.version}
-                </a>
-              {:else}
-                <a class="release-version" href={repoDetailPath(project.fullName)} title="Open repo detail">
-                  open repo
-                </a>
-              {/if}
-              <span>{relativeDate(project.releaseDate)}</span>
-            {/if}
-          </div>
-          <div class="since-cell" class:muted={!project.compareUrl || project.commitsSinceRelease === null}>
-            {#if project.compareUrl && project.commitsSinceRelease !== null}
-              <a class="external-link" href={project.compareUrl} target="_blank" rel="noreferrer">
-                {project.commitsSinceRelease}
-              </a>
-            {:else}
-              n/a
-            {/if}
-          </div>
-          <div class="activity-cell">
-            <strong>{relativeDate(project.latestCommitDate || project.pushedAt)}</strong>
-            <span>{project.latestCommitSha || project.defaultBranch}</span>
-          </div>
-          <div class="issues-cell dev-only">
-            <a class="external-link" href={project.issuesUrl} target="_blank" rel="noreferrer">{countLabel(project.openIssues)}</a>
-          </div>
-          <div class="prs-cell dev-only">
-            <a class="external-link" href={project.pullRequestsUrl} target="_blank" rel="noreferrer">
-              {countLabel(project.openPullRequests)}
-            </a>
-          </div>
-          <div class="ci-cell dev-only" data-ci={project.ciState}>
-            {#if project.ciUrl}
-              <a class="external-link" href={project.ciUrl} target="_blank" rel="noreferrer">{ciLabel(project)}</a>
-            {:else}
-              {ciLabel(project)}
-            {/if}
-            {#if project.ciWorkflow || project.ciRunDate}
-              <span>{project.ciWorkflow || relativeDate(project.ciRunDate)}</span>
-            {/if}
-          </div>
-        </div>
-        {/each}
-      {/if}
-    </div>
-  </section>
-  {/if}
+    {/if}
   {/if}
 </main>
 

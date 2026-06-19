@@ -1,5 +1,7 @@
 # Changelog
 
+## 0.2.2 - Unreleased
+
 ## 0.2.1 - 2026-06-19
 
 - Made anonymous GitHub actions log in first, then detect existing App installations before offering installation for uncovered dashboards.

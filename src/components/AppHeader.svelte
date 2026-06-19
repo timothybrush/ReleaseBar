@@ -214,9 +214,16 @@
     <div>
       <span>GitHub rate limit</span>
       <strong>Switch this dashboard to dedicated GitHub App quota.</strong>
-      <small>Install or update ReleaseBar access for the GitHub account you are viewing.</small>
+      <small>
+        {auth?.user
+          ? auth.installNeeded
+            ? "Install or update ReleaseBar access for the GitHub account you are viewing."
+            : "ReleaseBar already detected your GitHub App access."
+          : "Log in so ReleaseBar can detect your existing GitHub App installations."}
+      </small>
     </div>
-    <button type="button" onclick={installApp}>Install GitHub App</button>
+    {#if auth && (!auth.user || auth.installNeeded)}
+      <button type="button" onclick={primaryAuthAction}>{primaryAuthLabel(auth)}</button>
+    {/if}
   </aside>
 {/if}
-

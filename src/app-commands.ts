@@ -1,4 +1,5 @@
 import { ciLabel, countLabel, numberFormat } from "./app-format.js";
+import { primaryAuthLabelFor } from "./auth-ui.js";
 import {
   devSortOptions,
   filterLabel,
@@ -281,13 +282,10 @@ export function buildCommands(state: CommandState, actions: CommandActions): Com
       ? [
           {
             actionId: "auth:login",
-            title:
-              state.auth.quotaConfigured && !state.adminRoute
-                ? "Install GitHub App"
-                : "Connect GitHub",
-            subTitle: "dedicated API quota",
+            title: primaryAuthLabelFor(state.auth, state.adminRoute),
+            subTitle: "detect existing App installations",
             group: "Account",
-            keywords: ["login", "github", "quota"],
+            keywords: ["login", "sign in", "github", "quota"],
             onRun: actions.primaryAuthAction,
           },
         ]

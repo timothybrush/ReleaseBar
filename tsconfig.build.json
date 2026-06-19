@@ -10,6 +10,7 @@
   },
   "include": [
     "scripts/**/*.ts",
+    "src/auth-ui.ts",
     "src/dashboard-view.ts",
     "src/rate-limit.ts",
     "src/routing.ts",

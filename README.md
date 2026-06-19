@@ -37,7 +37,7 @@ Set `GITHUB_TOKEN` for higher API limits. GitHub Actions uses the built-in token
 - custom URLs are capped at 8 added public sources
 - settings can hide visible owners or repos locally without changing the shared cache
 - GitHub App login uses `/api/auth/login`, `/api/auth/callback`, `/api/auth/install`, `/api/auth/logout`, and `/api/me`
-- `Connect GitHub` signs the user in, checks GitHub App installations, and sends them to install the app when the current dashboard source is not covered
+- `Log in with GitHub` signs the user in, detects existing GitHub App installations, and only offers installation when the current dashboard source is not covered
 - GitHub App installation gives ReleaseBar dedicated GitHub API quota for the selected account/repositories; public unsynced dashboards stay metadata-only and skip release hydration
 - repository audience backfill is GitHub App-only and warms bounded week/month stargazer trust caches for covered repositories
 - once an account installation is known, public refreshes for that account can use its app quota even for anonymous viewers; mixed-owner dashboards partition work across each source account's installation instead of forcing the whole dashboard onto shared quota

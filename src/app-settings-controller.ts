@@ -1,4 +1,5 @@
 import { numberFormat } from "./app-format.js";
+import { primaryAuthActionFor, primaryAuthLabelFor, primaryAuthTitleFor } from "./auth-ui.js";
 import { ownerDashboardPath, validRepoSlug } from "./routing.js";
 import type { DashboardRoute } from "./routing.js";
 import type { AuthPayload, DashboardPayload } from "./types.js";
@@ -170,21 +171,17 @@ export function createSettingsController(context: SettingsContext) {
 
   function primaryAuthAction(): void {
     const auth = context.getState().auth;
-    if (!auth?.configured && !auth?.quotaConfigured) return;
-    if (context.adminRoute || !auth?.quotaConfigured) login();
-    else installApp();
+    const action = primaryAuthActionFor(auth, context.adminRoute);
+    if (action === "login") login();
+    else if (action === "install") installApp();
   }
 
   function primaryAuthLabel(auth: AuthPayload | null, short = false): string {
-    if (!auth?.configured && !auth?.quotaConfigured) return short ? "Login" : "Login Unavailable";
-    if (context.adminRoute || !auth.quotaConfigured) return short ? "Connect" : "Connect GitHub";
-    return short ? "Install" : "Install GitHub App";
+    return primaryAuthLabelFor(auth, context.adminRoute, short);
   }
 
   function primaryAuthTitle(auth: AuthPayload | null): string {
-    if (!auth?.configured && !auth?.quotaConfigured) return "GitHub connection unavailable";
-    if (context.adminRoute || !auth.quotaConfigured) return "Connect GitHub";
-    return "Install GitHub App";
+    return primaryAuthTitleFor(auth, context.adminRoute);
   }
 
   function authStatus(auth: AuthPayload | null): string {
@@ -198,8 +195,8 @@ export function createSettingsController(context: SettingsContext) {
       );
     }
     return auth.quotaConfigured
-      ? "Install the GitHub App for dedicated API quota. ReleaseBar only reads public metadata."
-      : "Connect GitHub to manage dashboard access.";
+      ? "Log in with GitHub to detect existing App installations and use dedicated quota."
+      : "Log in with GitHub to manage dashboard access.";
   }
 
   return {

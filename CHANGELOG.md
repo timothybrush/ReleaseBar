@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1 - Unreleased
+## 0.2.1 - 2026-06-19
 
 - Made anonymous GitHub actions log in first, then detect existing App installations before offering installation for uncovered dashboards.
 - Split the Worker, frontend, dashboard library, styles, and tests into bounded domain modules and added a CI guard that keeps maintained files below 1,000 lines.
